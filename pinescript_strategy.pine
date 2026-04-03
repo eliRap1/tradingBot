@@ -1,0 +1,351 @@
+// ═══════════════════════════════════════════════════════════════════════
+// Multi-Strategy Trading Bot — Pine Script v5
+// Matches the Python bot's logic: 5 strategies + confluence + regime filter
+//
+// HOW TO USE:
+//   1. Open TradingView → Pine Editor → paste this script
+//   2. Add to chart (works on any timeframe, best on Daily)
+//   3. Green triangle = BUY signal, red = EXIT
+//   4. Table shows confluence score, regime, and active strategies
+//   5. Set alerts on "Buy Signal" and "Exit Signal" conditions
+// ═══════════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator("Multi-Strategy Bot", overlay=true, max_labels_count=50)
+
+// ── INPUTS ──────────────────────────────────────────────────────────
+grp_st    = "SuperTrend"
+st_period = input.int(10,    "ATR Period",   group=grp_st)
+st_mult   = input.float(3.0, "Multiplier",   group=grp_st)
+
+grp_mom   = "Momentum"
+ema_fast  = input.int(8,   "Fast EMA",      group=grp_mom)
+ema_slow  = input.int(21,  "Slow EMA",      group=grp_mom)
+rsi_len   = input.int(14,  "RSI Period",    group=grp_mom)
+roc_len   = input.int(10,  "ROC Period",    group=grp_mom)
+
+grp_mr    = "Mean Reversion"
+bb_len    = input.int(20,   "BB Period",    group=grp_mr)
+bb_mult   = input.float(2.0,"BB StdDev",    group=grp_mr)
+
+grp_brk   = "Breakout"
+brk_look  = input.int(20,  "Lookback",      group=grp_brk)
+brk_vol   = input.float(1.5,"Vol Multiplier",group=grp_brk)
+
+grp_srsi  = "Stochastic RSI"
+srsi_rsi  = input.int(14,  "RSI Period",    group=grp_srsi)
+srsi_stch = input.int(14,  "Stoch Period",  group=grp_srsi)
+srsi_k    = input.int(3,   "K Smooth",      group=grp_srsi)
+srsi_d    = input.int(3,   "D Smooth",      group=grp_srsi)
+
+grp_filt  = "Filters"
+min_confluence = input.int(3, "Min Strategies Agreeing (1-5)", minval=1, maxval=5, group=grp_filt)
+use_regime     = input.bool(true, "Use SPY Regime Filter", group=grp_filt)
+use_confirm    = input.bool(true, "Require Confirmation Bar", group=grp_filt)
+gap_filter_pct = input.float(2.0, "Max Gap % (0=off)", group=grp_filt)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATEGY 1: SuperTrend
+// ═══════════════════════════════════════════════════════════════════════
+[st_line, st_dir] = ta.supertrend(st_mult, st_period)
+
+st_flip_bull = st_dir == -1 and st_dir[1] == 1
+st_flip_bear = st_dir == 1 and st_dir[1] == -1
+st_recent_flip = st_flip_bull or (st_dir == -1 and st_dir[2] == 1) or (st_dir == -1 and st_dir[3] == 1)
+st_is_bull = st_dir == -1
+
+// Score
+ema200_val = ta.ema(close, 200)
+st_score = 0.0
+st_score := st_flip_bull ? 0.4 : st_recent_flip and st_is_bull ? 0.2 : st_is_bull ? 0.05 : 0.0
+st_score := close > ema200_val ? st_score + 0.1 : st_score * 0.5
+st_score := volume > ta.sma(volume, 20) * 1.3 ? st_score * 1.15 : st_score
+
+st_bullish = st_score > 0.1
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATEGY 2: Momentum (EMA Cross + RSI + MACD)
+// ═══════════════════════════════════════════════════════════════════════
+ema_f = ta.ema(close, ema_fast)
+ema_s = ta.ema(close, ema_slow)
+rsi_val = ta.rsi(close, rsi_len)
+roc_val = ta.roc(close, roc_len)
+[macd_line, signal_line, hist] = ta.macd(close, 12, 26, 9)
+
+ema_cross_up = ta.crossover(ema_f, ema_s)
+ema_recent_cross = ema_cross_up or (ema_f > ema_s and ema_f[2] <= ema_s[2])
+ema_bullish = ema_f > ema_s
+
+mom_score = 0.0
+mom_score := ema_cross_up ? 0.35 : ema_recent_cross and ema_bullish ? 0.2 : ema_bullish ? 0.1 : 0.0
+mom_score := rsi_val >= 40 and rsi_val <= 65 ? mom_score + 0.15 : rsi_val < 30 and rsi_val > rsi_val[1] ? mom_score + 0.2 : rsi_val > 70 ? mom_score - 0.3 : mom_score
+mom_score := hist > 0 and hist > hist[1] ? mom_score + 0.15 : hist > hist[1] ? mom_score + 0.08 : mom_score
+mom_score := roc_val > 2 ? mom_score + 0.1 : roc_val < -5 ? mom_score - 0.15 : mom_score
+mom_score := close > ema200_val ? mom_score * 1.1 : mom_score
+
+mom_bullish = mom_score > 0.1
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATEGY 3: Mean Reversion (Bollinger Bands + Z-Score)
+// ═══════════════════════════════════════════════════════════════════════
+[bb_mid, bb_up, bb_lo] = ta.bb(close, bb_len, bb_mult)
+bb_pctb = (close - bb_lo) / (bb_up - bb_lo)
+
+rolling_mean = ta.sma(close, bb_len)
+rolling_std  = ta.stdev(close, bb_len)
+zscore = rolling_std > 0 ? (close - rolling_mean) / rolling_std : 0.0
+
+// ADX for trend filter (don't mean-revert in strong trends)
+[diplus, diminus, adx_val] = ta.dmi(14, 14)
+
+mr_score = 0.0
+// Block in strong trends
+mr_active = adx_val < 40
+mr_score := mr_active and close < bb_lo ? 0.25 : mr_active and bb_pctb < 0.2 ? 0.1 : 0.0
+mr_score := mr_active and close < bb_lo and zscore < -1.5 ? mr_score + 0.15 : mr_score
+mr_score := rsi_val < 30 ? mr_score + 0.15 : rsi_val < 35 and rsi_val > rsi_val[1] ? mr_score + 0.2 : mr_score
+mr_score := adx_val > 25 ? mr_score * 0.6 : mr_score
+
+mr_bullish = mr_score > 0.1
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATEGY 4: Breakout (Pivot Points + Volume)
+// ═══════════════════════════════════════════════════════════════════════
+resistance = ta.highest(high, brk_look)[1]  // highest high, excluding current bar
+support    = ta.lowest(low, brk_look)[1]
+avg_vol    = ta.sma(volume, brk_look)
+vol_ratio  = avg_vol > 0 ? volume / avg_vol : 0.0
+
+// ATR for magnitude check
+atr_val = ta.atr(14)
+
+// Consolidation detection (range compression)
+recent_range   = (ta.highest(high, 5) - ta.lowest(low, 5)) / close
+lookback_range = (ta.highest(high, brk_look) - ta.lowest(low, brk_look)) / close
+consolidation  = recent_range < lookback_range * 0.5
+
+// Candle quality
+candle_body = math.abs(close - open)
+candle_range = high - low
+body_ratio = candle_range > 0 ? candle_body / candle_range : 0.0
+close_near_high = candle_range > 0 ? (high - close) / candle_range < 0.2 : false
+strong_candle = body_ratio > 0.6 and close_near_high
+
+brk_score = 0.0
+brk_above = close > resistance
+brk_score := brk_above ? 0.25 : 0.0
+brk_score := brk_above and vol_ratio >= brk_vol ? brk_score + 0.25 : brk_above and vol_ratio >= 1.2 ? brk_score + 0.08 : brk_above ? brk_score * 0.3 : brk_score
+brk_score := brk_above and consolidation ? brk_score + 0.15 : brk_score
+brk_score := brk_above and strong_candle ? brk_score + 0.15 : brk_score
+brk_score := brk_above and adx_val > 20 and diplus > diminus ? brk_score + 0.1 : brk_score
+
+brk_bullish = brk_score > 0.1
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATEGY 5: Stochastic RSI
+// ═══════════════════════════════════════════════════════════════════════
+rsi_for_stoch = ta.rsi(close, srsi_rsi)
+stoch_raw = ta.stoch(rsi_for_stoch, rsi_for_stoch, rsi_for_stoch, srsi_stch)
+srsi_k_val = ta.sma(stoch_raw, srsi_k)
+srsi_d_val = ta.sma(srsi_k_val, srsi_d)
+
+srsi_cross_up = ta.crossover(srsi_k_val, srsi_d_val)
+srsi_was_oversold = ta.lowest(srsi_k_val, 3) < 20
+
+ema50 = ta.ema(close, 50)
+above_ema50 = close > ema50
+
+srsi_score = 0.0
+srsi_score := srsi_cross_up and srsi_was_oversold and above_ema50 ? 0.4 : srsi_cross_up and srsi_k_val < 40 and above_ema50 ? 0.15 : 0.0
+srsi_score := above_ema50 and diplus > diminus ? srsi_score + 0.15 : srsi_score
+srsi_score := rsi_val >= 35 and rsi_val <= 60 ? srsi_score + 0.1 : rsi_val > 70 ? srsi_score - 0.2 : srsi_score
+srsi_score := close > ema200_val ? srsi_score + 0.05 : srsi_score
+
+srsi_bullish = srsi_score > 0.1
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// CANDLESTICK PATTERN DETECTION
+// ═══════════════════════════════════════════════════════════════════════
+body = math.abs(close - open)
+upper_wick = high - math.max(close, open)
+lower_wick = math.min(close, open) - low
+cr = high - low
+is_bull_candle = close > open
+is_bear_candle = close < open
+
+// Hammer (bullish reversal)
+hammer = cr > 0 and body > 0 and lower_wick >= body * 2 and upper_wick <= body * 0.5 and body / cr >= 0.1
+
+// Bullish engulfing
+bull_engulf = is_bear_candle[1] and is_bull_candle and open <= close[1] and close >= open[1]
+
+// Shooting star (bearish reversal)
+shoot_star = cr > 0 and body > 0 and upper_wick >= body * 2 and lower_wick <= body * 0.5
+
+// Bearish engulfing
+bear_engulf = is_bull_candle[1] and is_bear_candle and open >= close[1] and close <= open[1]
+
+// Morning star
+ms_body1 = math.abs(close[2] - open[2])
+ms_body2 = math.abs(close[1] - open[1])
+ms_mid1 = (open[2] + close[2]) / 2
+morning_star = is_bear_candle[2] and ms_body2 < ms_body1 * 0.5 and is_bull_candle and close > ms_mid1
+
+candle_bullish = hammer or bull_engulf or morning_star
+candle_bearish = shoot_star or bear_engulf
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// CONFLUENCE SCORING
+// ═══════════════════════════════════════════════════════════════════════
+num_agreeing = (st_bullish ? 1 : 0) + (mom_bullish ? 1 : 0) + (mr_bullish ? 1 : 0) + (brk_bullish ? 1 : 0) + (srsi_bullish ? 1 : 0)
+
+// Weighted composite score
+total_weight = 0.25 + 0.25 + 0.15 + 0.20 + 0.15
+composite = (st_score * 0.25 + mom_score * 0.25 + mr_score * 0.15 + brk_score * 0.20 + srsi_score * 0.15) / total_weight
+
+confluence_pass = num_agreeing >= min_confluence and composite >= 0.25
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// MARKET REGIME FILTER (SPY)
+// ═══════════════════════════════════════════════════════════════════════
+spy_close  = request.security("SPY", "D", close)
+spy_ema50  = request.security("SPY", "D", ta.ema(close, 50))
+spy_ema200 = request.security("SPY", "D", ta.ema(close, 200))
+spy_rsi    = request.security("SPY", "D", ta.rsi(close, 14))
+
+spy_bull = spy_close > spy_ema200 and spy_ema50 > spy_ema200
+spy_bear = spy_close < spy_ema200 and spy_ema50 < spy_ema200
+
+regime_ok = use_regime ? not spy_bear : true
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// GAP FILTER
+// ═══════════════════════════════════════════════════════════════════════
+gap_pct = close[1] != 0 ? math.abs(open - close[1]) / close[1] * 100 : 0.0
+gap_ok = gap_filter_pct == 0 ? true : gap_pct <= gap_filter_pct
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// CONFIRMATION BAR FILTER
+// ═══════════════════════════════════════════════════════════════════════
+// Signal must be present on current AND previous bar
+prev_confluence = (st_score[1] > 0.1 ? 1 : 0) + (mom_score[1] > 0.1 ? 1 : 0) + (mr_score[1] > 0.1 ? 1 : 0) + (brk_score[1] > 0.1 ? 1 : 0) + (srsi_score[1] > 0.1 ? 1 : 0)
+prev_signal = prev_confluence >= min_confluence
+
+confirm_ok = use_confirm ? prev_signal : true
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FINAL SIGNAL
+// ═══════════════════════════════════════════════════════════════════════
+buy_signal  = confluence_pass and regime_ok and gap_ok and confirm_ok and not candle_bearish
+exit_signal = st_flip_bear or (ta.crossunder(ema_f, ema_s) and rsi_val > 60) or candle_bearish and rsi_val > 70
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// PLOTTING
+// ═══════════════════════════════════════════════════════════════════════
+
+// SuperTrend line
+st_color = st_dir == -1 ? color.new(color.green, 40) : color.new(color.red, 40)
+plot(st_line, "SuperTrend", color=st_color, linewidth=2)
+
+// EMAs
+plot(ema_f, "EMA Fast", color=color.new(color.blue, 60), linewidth=1)
+plot(ema_s, "EMA Slow", color=color.new(color.orange, 60), linewidth=1)
+plot(ema200_val, "EMA 200", color=color.new(color.white, 70), linewidth=1)
+
+// Bollinger Bands
+p_bb_up = plot(bb_up, "BB Upper", color=color.new(color.gray, 70))
+p_bb_lo = plot(bb_lo, "BB Lower", color=color.new(color.gray, 70))
+fill(p_bb_up, p_bb_lo, color=color.new(color.gray, 92))
+
+// Resistance / Support
+plot(resistance, "Resistance", color=color.new(color.red, 60), style=plot.style_stepline)
+plot(support, "Support", color=color.new(color.green, 60), style=plot.style_stepline)
+
+// Buy / Exit signals
+plotshape(buy_signal, "BUY", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.normal)
+plotshape(exit_signal, "EXIT", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+
+// Candle patterns
+plotshape(hammer, "Hammer", shape.diamond, location.belowbar, color.new(color.lime, 30), size=size.tiny)
+plotshape(bull_engulf, "Bull Engulf", shape.diamond, location.belowbar, color.new(color.lime, 30), size=size.tiny)
+plotshape(shoot_star, "Shoot Star", shape.diamond, location.abovebar, color.new(color.fuchsia, 30), size=size.tiny)
+plotshape(bear_engulf, "Bear Engulf", shape.diamond, location.abovebar, color.new(color.fuchsia, 30), size=size.tiny)
+
+// Background color for regime
+bgcolor(spy_bear and use_regime ? color.new(color.red, 95) : spy_bull and use_regime ? color.new(color.green, 97) : na)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// INFO TABLE
+// ═══════════════════════════════════════════════════════════════════════
+var table info = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 30), border_width=1)
+
+if barstate.islast
+    regime_str = spy_bull ? "BULL 🟢" : spy_bear ? "BEAR 🔴" : "CHOP 🟡"
+
+    table.cell(info, 0, 0, "Confluence",   text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 0, str.tostring(num_agreeing) + "/5",
+               text_color=num_agreeing >= min_confluence ? color.green : color.red,
+               text_size=size.small)
+
+    table.cell(info, 0, 1, "Composite",    text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(composite, "#.###"),
+               text_color=composite >= 0.25 ? color.green : color.gray,
+               text_size=size.small)
+
+    table.cell(info, 0, 2, "Regime",       text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 2, regime_str,     text_size=size.small)
+
+    table.cell(info, 0, 3, "SuperTrend",   text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(st_score, "#.##"),
+               text_color=st_bullish ? color.green : color.gray, text_size=size.small)
+
+    table.cell(info, 0, 4, "Momentum",     text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(mom_score, "#.##"),
+               text_color=mom_bullish ? color.green : color.gray, text_size=size.small)
+
+    table.cell(info, 0, 5, "MeanRev",      text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 5, str.tostring(mr_score, "#.##"),
+               text_color=mr_bullish ? color.green : color.gray, text_size=size.small)
+
+    table.cell(info, 0, 6, "Breakout",     text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 6, str.tostring(brk_score, "#.##"),
+               text_color=brk_bullish ? color.green : color.gray, text_size=size.small)
+
+    table.cell(info, 0, 7, "StochRSI",     text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 7, str.tostring(srsi_score, "#.##"),
+               text_color=srsi_bullish ? color.green : color.gray, text_size=size.small)
+
+    table.cell(info, 0, 8, "ADX",          text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 8, str.tostring(adx_val, "#.#"),
+               text_color=adx_val > 25 ? color.yellow : color.gray, text_size=size.small)
+
+    table.cell(info, 0, 9, "RSI",          text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 9, str.tostring(rsi_val, "#.#"),
+               text_color=rsi_val < 30 ? color.green : rsi_val > 70 ? color.red : color.gray,
+               text_size=size.small)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════
+alertcondition(buy_signal, "Buy Signal",
+     "BUY: {{ticker}} | Confluence {{plot_0}}/5 | Score {{plot_1}}")
+alertcondition(exit_signal, "Exit Signal",
+     "EXIT: {{ticker}} | SuperTrend flipped or bearish divergence")
+alertcondition(st_flip_bull, "SuperTrend Flip Bullish",
+     "SuperTrend flipped BULLISH on {{ticker}}")
+alertcondition(st_flip_bear, "SuperTrend Flip Bearish",
+     "SuperTrend flipped BEARISH on {{ticker}}")

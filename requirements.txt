@@ -1,0 +1,7 @@
+alpaca-trade-api>=3.0.0
+pandas>=2.0
+numpy>=1.24
+ta>=0.11.0
+pyyaml>=6.0
+python-dotenv>=1.0
+flask>=3.0

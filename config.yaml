@@ -1,0 +1,109 @@
+alpaca:
+  paper_url: "https://paper-api.alpaca.markets"
+  live_url: "https://api.alpaca.markets"
+  data_url: "https://data.alpaca.markets"
+
+screener:
+  min_price: 10.0
+  max_price: 1000.0
+  min_avg_volume: 500000
+  # Top liquid stocks - the bot will also filter dynamically
+  universe:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - META
+    - TSLA
+    - AMD
+    - NFLX
+    - JPM
+    - V
+    - MA
+    - UNH
+    - HD
+    - DIS
+    - PYPL
+    - CRM
+    - ADBE
+    - INTC
+    - CSCO
+    - PEP
+    - KO
+    - COST
+    - AVGO
+    - QCOM
+    - TXN
+    - MU
+    - AMAT
+    - LRCX
+    - KLAC
+    - MRVL
+    - PANW
+    - NOW
+    - UBER
+    - ABNB
+    - SQ
+    - SHOP
+    - SNOW
+    - COIN
+    - PLTR
+
+strategies:
+  momentum:
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+    roc_period: 10
+    ema_fast: 8
+    ema_slow: 21
+    weight: 0.25
+
+  mean_reversion:
+    bb_period: 20
+    bb_std: 2.0
+    zscore_threshold: 1.5
+    rsi_period: 14
+    weight: 0.15
+
+  breakout:
+    volume_multiplier: 1.5
+    atr_period: 14
+    lookback_days: 20
+    weight: 0.2
+
+  supertrend:
+    atr_period: 10
+    multiplier: 3.0
+    weight: 0.25
+
+  stoch_rsi:
+    rsi_period: 14
+    stoch_period: 14
+    k_smooth: 3
+    d_smooth: 3
+    ema_period: 50
+    oversold: 20
+    overbought: 80
+    weight: 0.15
+
+signals:
+  min_composite_score: 0.25
+  max_positions: 8
+  min_agreeing_strategies: 3   # confluence: need 3/5 strategies to agree
+
+risk:
+  max_position_pct: 0.05       # 5% of portfolio per position
+  max_portfolio_risk_pct: 0.01 # 1% risk per trade (pro standard)
+  stop_loss_atr_mult: 2.0      # stop loss at 2x ATR below entry
+  take_profit_atr_mult: 4.0    # take profit at 4x ATR (2:1 R:R on ATR)
+  min_risk_reward: 2.0         # reject trades below 2:1 R:R
+  max_drawdown_pct: 0.10       # 10% drawdown halts trading
+  trailing_stop_pct: 0.03      # 3% trailing stop
+  daily_loss_limit_pct: 0.03   # 3% daily loss limit — stop trading for day
+
+schedule:
+  market_open_delay_min: 15    # skip first 15 min (volatile)
+  cycle_interval_sec: 300      # run every 5 minutes
+  market_close_buffer_min: 15  # stop new trades 15 min before close
