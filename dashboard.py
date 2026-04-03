@@ -89,9 +89,9 @@ def init_connections():
 
 
 def start_watchers():
-    """Start a watcher thread per stock for the dashboard."""
+    """Start a watcher thread per stock + crypto for the dashboard."""
     global _watchers
-    universe = _config["screener"]["universe"]
+    universe = list(_config["screener"]["universe"]) + _config["screener"].get("crypto", [])
 
     for sym in universe:
         if sym not in _watchers:
@@ -212,6 +212,18 @@ def api_refresh():
 
 @app.route("/chart/<symbol>")
 def chart_page(symbol):
+    # Only show chart for symbols in our universe or with active positions
+    valid_symbols = set(_config["screener"]["universe"])
+    valid_symbols.update(_config["screener"].get("crypto", []))
+    valid_symbols.update(w.symbol for w in _watchers.values())
+    # Also allow position symbols
+    try:
+        for pos in _broker.get_positions():
+            valid_symbols.add(pos.symbol)
+    except Exception:
+        pass
+    if symbol not in valid_symbols:
+        return render_template("dashboard.html"), 404
     return render_template("chart.html", symbol=symbol)
 
 
@@ -265,16 +277,16 @@ def api_chart(symbol):
     # SuperTrend overlay
     st_line = []
     if len(df) >= 20:
-        st_df = supertrend(df, period=10, multiplier=3.0)
-        for ts, row in st_df.iterrows():
+        st_values, st_direction = supertrend(df, period=10, multiplier=3.0)
+        for i, ts in enumerate(df.index):
             t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
-            val = float(row.get("supertrend", 0))
-            direction = int(row.get("supertrend_direction", 0))
+            val = float(st_values.iloc[i])
+            dirn = int(st_direction.iloc[i])
             if val > 0:
                 st_line.append({
                     "time": t,
                     "value": round(val, 2),
-                    "color": "#22c55e" if direction == 1 else "#ef4444",
+                    "color": "#22c55e" if dirn == 1 else "#ef4444",
                 })
 
     # EMAs (20, 50, 200)

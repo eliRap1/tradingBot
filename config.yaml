@@ -97,6 +97,8 @@ signals:
   max_positions: 9
   min_agreeing_strategies: 3   # confluence: need 3/5 strategies to agree
   max_crypto_positions: 2      # separate slots for BTC/USD + ETH/USD
+  min_crypto_agreeing: 2       # crypto needs only 2/5 strategies (24/7 market behaves differently)
+  min_crypto_score: 0.15       # lower score threshold for crypto entries
   allow_shorts_in_bull: false  # block shorts in bull regime by default
   entry_timeframe: "5Min"      # 5-min candles for entries
   trend_timeframe: "1Day"      # daily candles for trend context

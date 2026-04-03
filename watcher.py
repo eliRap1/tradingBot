@@ -193,8 +193,13 @@ class StockWatcher:
         self.state.score = round(float(composite), 3)
 
         # 6. Decision: LONG, SHORT, or NONE
-        min_agreeing = self.config["signals"].get("min_agreeing_strategies", 3)
-        min_score = self.config["signals"]["min_composite_score"]
+        from data import CRYPTO_SYMBOLS
+        is_crypto = self.symbol in CRYPTO_SYMBOLS
+        # Crypto needs only 2/5 strategies (fewer patterns in 24/7 markets)
+        min_agreeing = self.config["signals"].get("min_crypto_agreeing", 2) if is_crypto \
+            else self.config["signals"].get("min_agreeing_strategies", 3)
+        min_score = self.config["signals"].get("min_crypto_score", 0.15) if is_crypto \
+            else self.config["signals"]["min_composite_score"]
 
         # Check for LONG signal
         has_long = (num_bullish >= min_agreeing and composite >= min_score)

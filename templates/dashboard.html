@@ -155,6 +155,12 @@
 </div>
 <div class="regime-bar" id="regime-bar"></div>
 
+<!-- Chart nav bar -->
+<div style="background:#111827;padding:6px 24px;border-bottom:1px solid #1f2937;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span style="font-size:11px;color:#6b7280;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-right:4px">Charts:</span>
+    <div id="chart-nav" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+</div>
+
 <!-- Top cards -->
 <div class="grid">
     <div class="card">
@@ -382,6 +388,22 @@ function update(data) {
     ).join('');
 
     $('last-update').textContent = data.last_update||'--';
+
+    // Build chart nav links
+    var chartNav = $('chart-nav');
+    chartNav.textContent = '';
+    var allSyms = new Set();
+    (data.watchers||[]).forEach(function(w){allSyms.add(w.symbol);});
+    (data.positions||[]).forEach(function(p){allSyms.add(p.symbol);});
+    Array.from(allSyms).sort().forEach(function(sym){
+        var a = document.createElement('a');
+        a.href = '/chart/' + encodeURIComponent(sym);
+        a.textContent = sym;
+        a.style.cssText = 'padding:3px 8px;border-radius:4px;font-size:11px;background:#1f2937;color:#9ca3af;text-decoration:none;font-weight:500';
+        a.onmouseover = function(){a.style.background='#374151';a.style.color='#f9fafb';};
+        a.onmouseout = function(){a.style.background='#1f2937';a.style.color='#9ca3af';};
+        chartNav.appendChild(a);
+    });
 }
 
 async function fetchState() {
