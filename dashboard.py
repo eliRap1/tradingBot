@@ -470,7 +470,7 @@ def api_refresh():
     return jsonify({"ok": True})
 
 
-@app.route("/chart/<symbol>")
+@app.route("/chart/<path:symbol>")
 def chart_page(symbol):
     # Only show chart for symbols in our universe or with active positions
     valid_symbols = set(_config["screener"]["universe"])
@@ -487,7 +487,7 @@ def chart_page(symbol):
     return render_template("chart.html", symbol=symbol)
 
 
-@app.route("/api/chart/<symbol>")
+@app.route("/api/chart/<path:symbol>")
 def api_chart(symbol):
     """Return OHLCV + indicator data for TradingView lightweight-charts."""
     from indicators import supertrend, stochastic_rsi
@@ -642,6 +642,51 @@ def api_chart(symbol):
             "above_200ema": bool(s.above_200ema),
             "above_vwap": bool(s.above_vwap),
         }
+
+    # Trade history markers (actual buys/sells from tracker)
+    for trade in _tracker.trades:
+        if trade.get("symbol") != symbol:
+            continue
+        # Entry marker
+        entry_time = trade.get("opened_at")
+        if entry_time:
+            try:
+                if isinstance(entry_time, str):
+                    entry_ts = int(pd.Timestamp(entry_time).timestamp())
+                else:
+                    entry_ts = int(entry_time.timestamp())
+                side = trade.get("side", "buy")
+                is_buy = side == "buy"
+                markers.append({
+                    "time": entry_ts,
+                    "position": "belowBar" if is_buy else "aboveBar",
+                    "color": "#22c55e" if is_buy else "#ef4444",
+                    "shape": "arrowUp" if is_buy else "arrowDown",
+                    "text": f"{'BUY' if is_buy else 'SHORT'} @ ${trade.get('entry_price', 0):.2f}",
+                })
+            except Exception:
+                pass
+        # Exit marker
+        exit_time = trade.get("closed_at")
+        if exit_time:
+            try:
+                if isinstance(exit_time, str):
+                    exit_ts = int(pd.Timestamp(exit_time).timestamp())
+                else:
+                    exit_ts = int(exit_time.timestamp())
+                pnl = trade.get("pnl", 0)
+                markers.append({
+                    "time": exit_ts,
+                    "position": "aboveBar" if pnl >= 0 else "belowBar",
+                    "color": "#22c55e" if pnl >= 0 else "#ef4444",
+                    "shape": "circle",
+                    "text": f"EXIT ${pnl:+,.2f} ({trade.get('reason', '')})",
+                })
+            except Exception:
+                pass
+
+    # Sort markers by time (required by lightweight-charts)
+    markers.sort(key=lambda m: m["time"])
 
     # ── Detailed bot analysis (step-by-step reasoning) ──
     analysis = _build_analysis(symbol, df, intraday, trend_ctx)

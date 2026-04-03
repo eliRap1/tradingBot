@@ -112,7 +112,7 @@ class Coordinator:
                 clock = self.broker.get_clock()
 
                 if not clock.is_open:
-                    # Stop stock watchers but keep crypto running
+                    # Stop stock watchers ONCE, keep crypto running
                     has_stock_watchers = any(
                         s not in CRYPTO_SYMBOLS for s in self.watchers
                     )
@@ -130,21 +130,46 @@ class Coordinator:
                     log.info(f"Market closed. Crypto watchers active. "
                              f"Next stock open: {next_open}")
 
-                    # Still run coordinator cycle for crypto signals
-                    self._coordinator_cycle()
-
-                    # Wait a cycle then check again
+                    # Market-closed loop: keep running crypto cycles
                     interval = self.config["schedule"]["cycle_interval_sec"]
-                    time.sleep(interval)
+                    cycle_count = 0
+                    while True:
+                        time.sleep(interval)
+                        cycle_count += 1
 
-                    # Check if market opened
-                    clock = self.broker.get_clock()
-                    if clock.is_open:
-                        equity = self.broker.get_equity()
-                        self.risk.set_starting_equity(equity)
-                        delay = self.config["schedule"]["market_open_delay_min"]
-                        log.info(f"Market opened. Waiting {delay}min...")
-                        time.sleep(delay * 60)
+                        # Check if market opened
+                        clock = self.broker.get_clock()
+                        if clock.is_open:
+                            equity = self.broker.get_equity()
+                            self.risk.set_starting_equity(equity)
+                            delay = self.config["schedule"]["market_open_delay_min"]
+                            log.info(f"Market opened. Waiting {delay}min...")
+                            time.sleep(delay * 60)
+                            break
+
+                        # Run crypto cycle
+                        self._coordinator_cycle()
+
+                        # Hourly status update
+                        if cycle_count % max(1, 3600 // interval) == 0:
+                            hours_until = ""
+                            try:
+                                import datetime as _dt
+                                now = _dt.datetime.now(_dt.timezone.utc)
+                                if hasattr(next_open, 'timestamp'):
+                                    delta = next_open.timestamp() - now.timestamp()
+                                else:
+                                    delta = 0
+                                if delta > 0:
+                                    h = int(delta // 3600)
+                                    m = int((delta % 3600) // 60)
+                                    hours_until = f" ({h}h {m}m until open)"
+                                    log.info(f"Market still closed{hours_until}. "
+                                             f"Crypto watchers running. "
+                                             f"Next open: {next_open}")
+                            except Exception:
+                                log.info(f"Market still closed. Next open: {next_open}")
+
                     continue
 
                 # Check close buffer

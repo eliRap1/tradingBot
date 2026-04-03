@@ -332,7 +332,7 @@ function update(data) {
     $('no-pos').style.display = pos.length?'none':'block';
     $('pos-body').innerHTML = pos.map(p=>`
         <tr>
-            <td><a href="/chart/${encodeURIComponent(p.symbol)}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(p.symbol)}</a></td>
+            <td><a href="/chart/${p.symbol}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(p.symbol)}</a></td>
             <td><span class="badge blue">${p.side}</span></td>
             <td>${p.qty}</td>
             <td>$${fmt(p.entry_price)}</td>
@@ -354,7 +354,7 @@ function update(data) {
             `<span class="badge ${t.regime==='trending'?'cyan':t.regime==='ranging'?'yellow':t.regime==='breakout'?'purple':'gray'}" title="${t.regime_reason}">${t.regime}</span>` : '-';
 
         return `<tr>
-            <td><span class="thread-indicator" style="background:${dotColor}"></span><a href="/chart/${encodeURIComponent(t.symbol)}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(t.symbol)}</a></td>
+            <td><span class="thread-indicator" style="background:${dotColor}"></span><a href="/chart/${t.symbol}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(t.symbol)}</a></td>
             <td>${statusBadge(t.status)}</td>
             <td>$${t.last_price?fmt(t.last_price):'-'}</td>
             <td><span class="score-cell" style="color:${scoreColor(t.score)}">${t.score.toFixed(3)}</span></td>
@@ -397,7 +397,7 @@ function update(data) {
     (data.positions||[]).forEach(function(p){allSyms.add(p.symbol);});
     Array.from(allSyms).sort().forEach(function(sym){
         var a = document.createElement('a');
-        a.href = '/chart/' + encodeURIComponent(sym);
+        a.href = '/chart/' + sym;
         a.textContent = sym;
         a.style.cssText = 'padding:3px 8px;border-radius:4px;font-size:11px;background:#1f2937;color:#9ca3af;text-decoration:none;font-weight:500';
         a.onmouseover = function(){a.style.background='#374151';a.style.color='#f9fafb';};

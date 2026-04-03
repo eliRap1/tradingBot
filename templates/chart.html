@@ -583,7 +583,7 @@ function toggleLayer(name) {
 
 async function loadChart() {
     try {
-        var resp = await fetch('/api/chart/' + encodeURIComponent(SYMBOL));
+        var resp = await fetch('/api/chart/' + SYMBOL);
         if (!resp.ok) return;
         chartData = await resp.json();
         renderChart(chartData);
@@ -603,7 +603,7 @@ async function loadSymbolNav() {
         nav.textContent = '';
         Array.from(allSyms).sort().forEach(function(s) {
             var a = document.createElement('a');
-            a.href = '/chart/' + encodeURIComponent(s);
+            a.href = '/chart/' + s;
             a.textContent = s;
             if (s === SYMBOL) a.className = 'current';
             nav.appendChild(a);
