@@ -10,18 +10,12 @@ log = setup_logger("strategy.mean_reversion")
 
 class MeanReversionStrategy:
     """
-    Mean reversion — like Pine Script Bollinger Band bounce setups.
+    Mean reversion — Bollinger Band bounces for LONG and SHORT.
 
-    Key rule experienced traders follow: NEVER mean-revert in a strong trend.
-    A stock plummeting with ADX > 40 is not "oversold" — it's trending down.
+    LONG: Price at/below lower BB, RSI oversold, bullish reversal candle
+    SHORT: Price at/above upper BB, RSI overbought, bearish reversal candle
 
-    Entry logic:
-    1. Trend filter: ADX < 30 (ranging market — mean reversion works here)
-    2. Price at/below lower Bollinger Band
-    3. RSI oversold or recovering from oversold
-    4. Bullish reversal candle (hammer, engulfing, morning star)
-    5. Volume spike (capitulation selling = near bottom)
-    6. VWAP: price below VWAP (discount to fair value)
+    Key rule: NEVER mean-revert in a strong trend.
     """
 
     def __init__(self, config: dict):
@@ -47,16 +41,13 @@ class MeanReversionStrategy:
         close = df["close"]
         volume = df["volume"]
 
-        # ── Trend context ────────────────────────────────────
         ctx = get_trend_context(df)
 
-        # CRITICAL: Don't mean-revert in strong trends
-        if ctx["strong_trend"] and ctx["direction"] == "down":
-            return 0.0  # Falling knife — stay away
-        if ctx["strong_trend"] and ctx["direction"] == "up":
-            return 0.0  # Strong uptrend — don't try to short
+        # Don't mean-revert in strong trends
+        if ctx["strong_trend"]:
+            return 0.0
 
-        # ── Bollinger Bands ──────────────────────────────────
+        # Bollinger Bands
         bb = ta.volatility.BollingerBands(
             close,
             window=self.cfg["bb_period"],
@@ -68,13 +59,16 @@ class MeanReversionStrategy:
         current_price = close.iloc[-1]
         pct_b = bb.bollinger_pband().iloc[-1]
 
-        # Band width (squeeze detection)
         band_width = (upper - lower) / middle if middle > 0 else 0
         bw_series = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
         bw_avg = bw_series.tail(20).mean()
-        is_squeeze = band_width < bw_avg * 0.7  # Bands tightening
+        is_squeeze = band_width < bw_avg * 0.7
 
-        # ── Z-score ──────────────────────────────────────────
+        # Squeeze = big move coming, don't trade
+        if is_squeeze:
+            return 0.0
+
+        # Z-score
         rolling_mean = close.rolling(self.cfg["bb_period"]).mean()
         rolling_std = close.rolling(self.cfg["bb_period"]).std()
         if rolling_std.iloc[-1] > 0:
@@ -82,74 +76,85 @@ class MeanReversionStrategy:
         else:
             zscore = 0.0
 
-        # ── RSI ──────────────────────────────────────────────
+        # RSI
         rsi = ta.momentum.RSIIndicator(close, window=self.cfg["rsi_period"]).rsi()
         current_rsi = rsi.iloc[-1]
         prev_rsi = rsi.iloc[-2]
         rsi_recovering = current_rsi > prev_rsi and prev_rsi < 35
+        rsi_declining = current_rsi < prev_rsi and prev_rsi > 65
 
-        # ── Candlestick patterns ─────────────────────────────
         patterns = detect_patterns(df)
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
 
-        # ── Volume ───────────────────────────────────────────
         avg_vol = volume.tail(20).mean()
         vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
-        vol_spike = vol_ratio > 1.5  # Capitulation volume
+        vol_spike = vol_ratio > 1.5
 
-        # ── Scoring ──────────────────────────────────────────
-        score = 0.0
-
-        # === BULLISH MEAN REVERSION (buy the dip) ===
-
-        # Price below lower band — core signal
+        # ── LONG: Buy at lower band (oversold bounce) ────────
+        long_score = 0.0
         if current_price < lower:
-            score += 0.25
+            long_score += 0.25
             if zscore < -self.cfg["zscore_threshold"]:
-                score += 0.15  # Extreme deviation — stronger signal
-
+                long_score += 0.15
         elif pct_b < 0.2:
-            score += 0.1  # Near lower band
+            long_score += 0.1
 
-        # RSI confirmation
         if current_rsi < 30:
-            score += 0.15  # Deeply oversold
+            long_score += 0.15
         elif rsi_recovering:
-            score += 0.2   # Recovering from oversold — best signal
+            long_score += 0.2
 
-        # Candle confirmation — this is what separates pros from amateurs
-        # Don't buy just because it's oversold; wait for a REVERSAL CANDLE
-        if score > 0.1:
+        if long_score > 0.1:
             if candle_bull > 0.2:
-                score += candle_bull * 0.25  # Strong candle confirmation
+                long_score += candle_bull * 0.25
             else:
-                score *= 0.6  # No reversal candle = weak signal, discount it
+                long_score *= 0.6  # No reversal candle = weak
 
-        # Volume spike at bottom = capitulation = good entry
-        if score > 0.1 and vol_spike:
-            score += 0.1
+        if long_score > 0.1 and vol_spike:
+            long_score += 0.1
 
-        # Below VWAP = buying at a discount
-        if score > 0 and not ctx["above_vwap"]:
-            score += 0.05
+        if long_score > 0 and not ctx["above_vwap"]:
+            long_score += 0.05
 
-        # Penalty: trending market reduces confidence
         if ctx["trending"]:
-            score *= 0.6  # Mean reversion less reliable in trends
+            long_score *= 0.6
 
-        # === BEARISH (price at upper band — avoid buying) ===
+        # ── SHORT: Sell at upper band (overbought reversal) ──
+        short_score = 0.0
         if current_price > upper:
-            score -= 0.2
+            short_score -= 0.25
             if zscore > self.cfg["zscore_threshold"]:
-                score -= 0.1
-            if current_rsi > 70:
-                score -= 0.15
+                short_score -= 0.15
+        elif pct_b > 0.8:
+            short_score -= 0.1
+
+        if current_rsi > 70:
+            short_score -= 0.15
+        elif rsi_declining:
+            short_score -= 0.2  # Falling from overbought
+
+        # Bearish reversal candle confirmation
+        if short_score < -0.1:
             if candle_bear > 0.2:
-                score -= candle_bear * 0.2
+                short_score -= candle_bear * 0.25
+            else:
+                short_score *= 0.6  # No reversal candle = weak
 
-        # Squeeze — bands tightening means a big move is coming, sit out
-        if is_squeeze:
-            score *= 0.5
+        if short_score < -0.1 and vol_spike:
+            short_score -= 0.1
 
-        return max(-1.0, min(1.0, score))
+        # Above VWAP = overpriced
+        if short_score < 0 and ctx["above_vwap"]:
+            short_score -= 0.05
+
+        if ctx["trending"]:
+            short_score *= 0.6
+
+        # Return the stronger signal
+        if long_score > 0.15 and long_score > abs(short_score):
+            return max(0.0, min(1.0, long_score))
+        elif short_score < -0.15 and abs(short_score) > long_score:
+            return max(-1.0, min(0.0, short_score))
+
+        return 0.0

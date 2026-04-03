@@ -81,13 +81,13 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "trending",
             "strategies": {
-                "supertrend": 0.10,
-                "momentum": 0.10,
-                "stoch_rsi": 0.10,
-                "breakout": 0.00,
-                "mean_reversion": 0.00,
+                "supertrend": 0.35,   # ST flips bearish = strong short signal
+                "momentum": 0.30,     # EMA cross down + MACD negative
+                "stoch_rsi": 0.20,    # Sell rallies in downtrend
+                "breakout": 0.15,     # Breakdown below support
+                "mean_reversion": 0.00,  # Don't mean-revert in strong trends
             },
-            "reason": f"Strong downtrend (ADX={adx:.0f}), minimal exposure",
+            "reason": f"Strong downtrend (ADX={adx:.0f}), short bias active",
         }
 
     # SQUEEZE / PRE-BREAKOUT — favor breakout strategy
@@ -118,6 +118,20 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
             "reason": f"Near 20-day high with volume expansion",
         }
 
+    # NEAR LOWS + VOLUME — breakdown mode (short)
+    if near_low and vol_expanding:
+        return {
+            "regime": "breakdown",
+            "strategies": {
+                "breakout": 0.35,     # Breakdown below support
+                "momentum": 0.25,     # Bearish momentum
+                "supertrend": 0.25,   # ST bearish confirmation
+                "stoch_rsi": 0.15,    # Sell rallies
+                "mean_reversion": 0.00,
+            },
+            "reason": f"Near 20-day low with volume expansion, breakdown setup",
+        }
+
     # RANGING (low ADX, no trend) — mean reversion works here
     if adx < 20 and not trending:
         return {
@@ -144,6 +158,20 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.15,
             },
             "reason": f"Moderate uptrend (ADX={adx:.0f}), balanced approach",
+        }
+
+    # MODERATE DOWNTREND — short bias
+    if trending and direction == "down":
+        return {
+            "regime": "trending",
+            "strategies": {
+                "supertrend": 0.30,
+                "momentum": 0.25,
+                "stoch_rsi": 0.20,
+                "breakout": 0.15,
+                "mean_reversion": 0.10,
+            },
+            "reason": f"Moderate downtrend (ADX={adx:.0f}), short bias",
         }
 
     # DEFAULT — mild bias toward trend

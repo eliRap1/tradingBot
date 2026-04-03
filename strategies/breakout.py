@@ -11,20 +11,10 @@ log = setup_logger("strategy.breakout")
 
 class BreakoutStrategy:
     """
-    Pivot point breakout — like Pine Script ta.pivothigh/ta.pivotlow setups.
+    Pivot point breakout — works for LONG breakouts AND SHORT breakdowns.
 
-    Uses actual swing highs/lows for support/resistance (how real traders
-    draw levels), not just rolling high/low.
-
-    Entry logic:
-    1. Identify resistance from confirmed pivot highs (ta.pivothigh)
-    2. Price closes above last pivot high (not just wick through)
-    3. Volume surge (1.5x+) confirms institutional participation
-    4. Strong breakout candle (big body, close near high)
-    5. Consolidation before breakout (Bollinger squeeze or tight range)
-    6. ADX rising (new trend starting from range)
-
-    Best setup: breakout → pullback to resistance-turned-support → bounce
+    LONG: Price breaks above pivot resistance with volume
+    SHORT: Price breaks below pivot support with volume (breakdown)
     """
 
     def __init__(self, config: dict):
@@ -56,39 +46,40 @@ class BreakoutStrategy:
         current_price = close.iloc[-1]
         current_volume = volume.iloc[-1]
 
-        # ── Pivot-based support/resistance (Pine Script style) ──
+        # Pivot-based support/resistance
         ph = pivot_high(high, left_bars=5, right_bars=5)
         pl = pivot_low(low, left_bars=5, right_bars=5)
 
         resistance = last_pivot_value(ph)
         support = last_pivot_value(pl)
         bars_since_res = bars_since_pivot(ph)
+        bars_since_sup = bars_since_pivot(pl)
 
-        # Fallback to simple high/low if not enough pivots
         if resistance is None:
             resistance = high.iloc[-lookback - 1:-1].max()
         if support is None:
             support = low.iloc[-lookback - 1:-1].min()
 
-        # Second-to-last pivot (for retest detection)
+        # Second pivots for retest detection
         ph_valid = ph.dropna()
+        pl_valid = pl.dropna()
         prev_resistance = ph_valid.iloc[-2] if len(ph_valid) >= 2 else resistance
+        prev_support = pl_valid.iloc[-2] if len(pl_valid) >= 2 else support
 
-        # ── Trend context ────────────────────────────────────
         ctx = get_trend_context(df)
 
-        # ── Volume ───────────────────────────────────────────
+        # Volume
         avg_volume = volume.iloc[-lookback - 1:-1].mean()
         vol_ratio = current_volume / avg_volume if avg_volume > 0 else 0
 
-        # ── ATR ──────────────────────────────────────────────
+        # ATR
         atr = ta.volatility.AverageTrueRange(
             high=high, low=low, close=close,
             window=self.cfg["atr_period"]
         ).average_true_range()
         current_atr = atr.iloc[-1]
 
-        # ── Consolidation detection ──────────────────────────
+        # Consolidation
         recent_range = (high.iloc[-5:].max() - low.iloc[-5:].min()) / current_price
         lookback_range = (high.iloc[-lookback:].max() - low.iloc[-lookback:].min()) / current_price
         range_compressed = recent_range < lookback_range * 0.5
@@ -99,93 +90,141 @@ class BreakoutStrategy:
 
         consolidation = range_compressed or bb_squeeze
 
-        # ── Candle analysis ──────────────────────────────────
         patterns = detect_patterns(df)
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
 
-        # Breakout candle quality (big body closing near high)
+        # Candle quality
         if "open" in df.columns:
             candle_body = abs(close.iloc[-1] - df["open"].iloc[-1])
             candle_range = high.iloc[-1] - low.iloc[-1]
             body_ratio = candle_body / candle_range if candle_range > 0 else 0
             close_near_high = (high.iloc[-1] - current_price) / candle_range < 0.2 if candle_range > 0 else False
-            strong_candle = body_ratio > 0.6 and close_near_high
+            close_near_low = (current_price - low.iloc[-1]) / candle_range < 0.2 if candle_range > 0 else False
+            strong_bull_candle = body_ratio > 0.6 and close_near_high
+            strong_bear_candle = body_ratio > 0.6 and close_near_low
         else:
-            strong_candle = False
-            body_ratio = 0
+            strong_bull_candle = False
+            strong_bear_candle = False
 
-        # ── Scoring ──────────────────────────────────────────
-        score = 0.0
-
-        # === BREAKOUT ABOVE PIVOT RESISTANCE ===
+        # ── LONG: BREAKOUT ABOVE RESISTANCE ──────────────────
         if current_price > resistance:
-            # Close above (not just wick) — critical distinction
+            score = 0.0
+
             if close.iloc[-1] > resistance:
                 score += 0.25
             else:
-                score += 0.05  # Only wick — likely fakeout
+                score += 0.05
 
-            # Freshness: pivot should be recent (not stale level from months ago)
             if bars_since_res < 50:
                 score += 0.05
 
-            # Volume confirmation (most important fakeout filter)
             if vol_ratio >= self.cfg["volume_multiplier"]:
                 score += 0.25
             elif vol_ratio >= 1.2:
                 score += 0.08
             else:
-                score *= 0.3  # No volume = fakeout
+                score *= 0.3
 
-            # Consolidation before breakout (stored energy)
             if consolidation:
                 score += 0.15
 
-            # Strong breakout candle
-            if strong_candle:
+            if strong_bull_candle:
                 score += 0.15
             elif candle_bull > 0.2:
                 score += 0.08
 
-            # ADX: new trend starting
             if ctx["adx"] > 20 and ctx["di_plus"] > ctx["di_minus"]:
                 score += 0.1
-            elif ctx["adx"] < 20:
-                score += 0.05  # Breaking out of range
 
-            # Breakout magnitude (healthy = 0.5-2x ATR)
             if current_atr > 0:
                 atr_mult = (current_price - resistance) / current_atr
                 if 0.5 < atr_mult < 2.0:
                     score += 0.05
                 elif atr_mult > 3.0:
-                    score *= 0.7  # Overextended
+                    score *= 0.7
 
             if ctx["above_vwap"]:
                 score += 0.05
 
-        # === RETEST SETUP (strongest entry) ===
-        # Price broke above resistance earlier, pulled back, now bouncing
+            if candle_bear > 0.3:
+                score *= 0.7
+
+            return max(0.0, min(1.0, score))
+
+        # LONG: Retest setup
         elif (current_price > prev_resistance and
               low.iloc[-1] <= resistance * 1.01 and
               close.iloc[-1] > resistance):
-            score += 0.35  # Retest and hold
+            score = 0.35
             if candle_bull > 0.2:
                 score += 0.15
             if vol_ratio > 1.0:
                 score += 0.1
+            return max(0.0, min(1.0, score))
 
-        # === BREAKDOWN BELOW SUPPORT ===
+        # ── SHORT: BREAKDOWN BELOW SUPPORT ───────────────────
         elif current_price < support:
-            score -= 0.25
+            score = 0.0
+
+            # Close below support (not just wick)
+            if close.iloc[-1] < support:
+                score -= 0.25
+            else:
+                score -= 0.05
+
+            if bars_since_sup < 50:
+                score -= 0.05
+
+            # Volume on breakdown
             if vol_ratio >= self.cfg["volume_multiplier"]:
-                score -= 0.2
-            if candle_bear > 0.2:
+                score -= 0.25
+            elif vol_ratio >= 1.2:
+                score -= 0.08
+            else:
+                score *= 0.3  # No volume = fakeout
+
+            # Consolidation before breakdown (stored energy)
+            if consolidation:
+                score -= 0.15
+
+            # Strong bearish candle
+            if strong_bear_candle:
+                score -= 0.15
+            elif candle_bear > 0.2:
+                score -= 0.08
+
+            # ADX: trend accelerating down
+            if ctx["adx"] > 20 and ctx["di_minus"] > ctx["di_plus"]:
                 score -= 0.1
 
-        # Bearish candle on bullish setup = contradiction
-        if score > 0 and candle_bear > 0.3:
-            score *= 0.7
+            # Breakdown magnitude
+            if current_atr > 0:
+                atr_mult = (support - current_price) / current_atr
+                if 0.5 < atr_mult < 2.0:
+                    score -= 0.05
+                elif atr_mult > 3.0:
+                    score *= 0.7  # Overextended
 
-        return max(-1.0, min(1.0, score))
+            # Below VWAP = selling pressure
+            if not ctx["above_vwap"]:
+                score -= 0.05
+
+            # Bullish candle contradicts breakdown
+            if candle_bull > 0.3:
+                score *= 0.7
+
+            return max(-1.0, min(0.0, score))
+
+        # SHORT: Retest of broken support from below
+        elif (current_price < prev_support and
+              high.iloc[-1] >= support * 0.99 and
+              close.iloc[-1] < support):
+            score = -0.35
+            if candle_bear > 0.2:
+                score -= 0.15
+            if vol_ratio > 1.0:
+                score -= 0.1
+            return max(-1.0, min(0.0, score))
+
+        return 0.0
