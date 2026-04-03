@@ -25,7 +25,9 @@ from regime import RegimeFilter
 from watcher import StockWatcher
 from strategy_selector import select_strategies
 from candles import detect_patterns, bullish_score, bearish_score
-from trend import get_trend_context
+from trend import get_trend_context, get_weekly_trend
+from data import CRYPTO_SYMBOLS
+from strategies import ALL_STRATEGIES
 
 log = setup_logger("dashboard")
 
@@ -189,6 +191,264 @@ def background_refresh():
         except Exception as e:
             _add_log(f"Background error: {e}", "error")
         time.sleep(30)
+
+
+# ── Analysis Engine ──────────────────────────────────────────────
+
+def _build_analysis(symbol: str, daily_df, intraday_df, trend_ctx: dict) -> dict:
+    """Run the bot's full analysis pipeline and return step-by-step reasoning."""
+    steps = []
+    decision = {"action": "HOLD", "reason": "No signal", "score": 0.0, "confluence": 0}
+
+    try:
+        # Step 1: Trend Context (daily)
+        ctx = trend_ctx or {}
+        direction = ctx.get("trend_direction", "unknown")
+        adx = ctx.get("adx", 0)
+        trending = ctx.get("trending", False)
+        strong_trend = ctx.get("strong_trend", False)
+        above_ema200 = ctx.get("above_ema_200", False)
+        above_vwap = ctx.get("above_vwap", False)
+
+        trend_bias = "BULLISH" if direction == "up" and above_ema200 else \
+                     "BEARISH" if direction == "down" and not above_ema200 else "NEUTRAL"
+
+        steps.append({
+            "step": 1,
+            "name": "Daily Trend Context",
+            "status": "bullish" if trend_bias == "BULLISH" else "bearish" if trend_bias == "BEARISH" else "neutral",
+            "details": [
+                {"label": "Trend Direction", "value": direction, "signal": direction == "up"},
+                {"label": "ADX", "value": f"{adx:.1f}", "signal": adx > 25},
+                {"label": "Trending", "value": str(trending), "signal": trending},
+                {"label": "Strong Trend", "value": str(strong_trend), "signal": strong_trend},
+                {"label": "Above 200 EMA", "value": str(above_ema200), "signal": above_ema200},
+                {"label": "Above VWAP", "value": str(above_vwap), "signal": above_vwap},
+            ],
+            "summary": f"Trend is {direction.upper()} (ADX={adx:.0f}) -- Overall bias: {trend_bias}",
+        })
+
+        # Step 2: Weekly Trend
+        try:
+            wk = get_weekly_trend(daily_df)
+            weekly_up = wk.get("weekly_trend_up", False)
+            steps.append({
+                "step": 2,
+                "name": "Weekly Trend Confirmation",
+                "status": "bullish" if weekly_up else "bearish",
+                "details": [
+                    {"label": "Weekly EMA Trend Up", "value": str(weekly_up), "signal": weekly_up},
+                ],
+                "summary": f"Weekly trend {'confirms upside' if weekly_up else 'warns downside'}",
+            })
+        except Exception:
+            steps.append({"step": 2, "name": "Weekly Trend", "status": "neutral",
+                          "details": [], "summary": "Could not compute weekly trend"})
+
+        # Step 3: Candle Patterns (5-min)
+        entry_df = intraday_df if intraday_df is not None and len(intraday_df) >= 10 else daily_df
+        patterns = detect_patterns(entry_df)
+        bullish_pats = [k for k, v in patterns.items() if v and k in
+            ("hammer", "bullish_engulfing", "morning_star", "three_white_soldiers",
+             "dragonfly_doji", "piercing_line", "tweezer_bottom")]
+        bearish_pats = [k for k, v in patterns.items() if v and k in
+            ("shooting_star", "bearish_engulfing", "evening_star", "three_black_crows",
+             "gravestone_doji", "dark_cloud_cover", "tweezer_top")]
+        bull_sc = bullish_score(patterns)
+        bear_sc = bearish_score(patterns)
+
+        pat_status = "bullish" if bull_sc > bear_sc and bull_sc > 0 else \
+                     "bearish" if bear_sc > bull_sc and bear_sc > 0 else "neutral"
+        steps.append({
+            "step": 3,
+            "name": "Candlestick Patterns (Entry TF)",
+            "status": pat_status,
+            "details": [
+                {"label": "Bullish Patterns", "value": ", ".join(bullish_pats) if bullish_pats else "None",
+                 "signal": len(bullish_pats) > 0},
+                {"label": "Bearish Patterns", "value": ", ".join(bearish_pats) if bearish_pats else "None",
+                 "signal": False},
+                {"label": "Bullish Score", "value": str(bull_sc), "signal": bull_sc > 0},
+                {"label": "Bearish Score", "value": str(bear_sc), "signal": False},
+            ],
+            "summary": f"Candles: {len(bullish_pats)} bullish, {len(bearish_pats)} bearish patterns",
+        })
+
+        # Step 4: Regime Classification & Strategy Selection
+        selection = select_strategies(daily_df, symbol)
+        regime = selection["regime"]
+        reason = selection["reason"]
+        strat_weights = selection["strategies"]
+
+        active_strats = {k: v for k, v in strat_weights.items() if v > 0}
+        inactive_strats = {k: v for k, v in strat_weights.items() if v <= 0}
+
+        strat_details = []
+        for name, weight in sorted(strat_weights.items(), key=lambda x: -x[1]):
+            strat_details.append({
+                "label": name.replace("_", " ").title(),
+                "value": f"Weight: {weight*100:.0f}%",
+                "signal": weight > 0,
+            })
+
+        steps.append({
+            "step": 4,
+            "name": "Regime & Strategy Selection",
+            "status": "bullish" if regime in ("trending", "breakout") else "neutral",
+            "details": strat_details,
+            "summary": f"Regime: {regime.upper()} -- {reason}. "
+                       f"Active: {list(active_strats.keys())}"
+                       + (f", OFF: {list(inactive_strats.keys())}" if inactive_strats else ""),
+        })
+
+        # Step 5: Run each strategy and show scores
+        strategies = {name: cls(_config) for name, cls in ALL_STRATEGIES.items()}
+        strat_scores = {}
+        num_bullish = 0
+        num_bearish = 0
+        weighted_sum = 0.0
+        total_weight = 0.0
+        strat_step_details = []
+
+        for name, weight in strat_weights.items():
+            strat = strategies.get(name)
+            if not strat or weight <= 0:
+                strat_step_details.append({
+                    "label": name.replace("_", " ").title(),
+                    "value": "OFF (weight=0)",
+                    "signal": None,
+                })
+                continue
+
+            try:
+                signals = strat.generate_signals({symbol: entry_df})
+                score = signals.get(symbol, 0.0)
+            except Exception as e:
+                score = 0.0
+
+            strat_scores[name] = round(float(score), 4)
+            weighted_sum += score * weight
+            total_weight += weight
+
+            is_bull = score > 0.1
+            is_bear = score < -0.1
+            if is_bull:
+                num_bullish += 1
+            elif is_bear:
+                num_bearish += 1
+
+            verdict = "BULLISH" if is_bull else "BEARISH" if is_bear else "NEUTRAL"
+            strat_step_details.append({
+                "label": f"{name.replace('_', ' ').title()} (wt={weight*100:.0f}%)",
+                "value": f"Score: {score:+.4f} -> {verdict}",
+                "signal": is_bull,
+            })
+
+        composite = weighted_sum / total_weight if total_weight > 0 else 0.0
+        steps.append({
+            "step": 5,
+            "name": "Strategy Signals (Entry TF)",
+            "status": "bullish" if num_bullish >= 2 else "bearish" if num_bearish >= 2 else "neutral",
+            "details": strat_step_details,
+            "summary": f"Composite: {composite:+.4f} | "
+                       f"Bullish: {num_bullish}/5, Bearish: {num_bearish}/5",
+        })
+
+        # Step 6: Confluence Check
+        is_crypto = symbol in CRYPTO_SYMBOLS
+        min_agreeing = _config["signals"].get("min_crypto_agreeing", 2) if is_crypto \
+            else _config["signals"].get("min_agreeing_strategies", 3)
+        min_score = _config["signals"].get("min_crypto_score", 0.15) if is_crypto \
+            else _config["signals"]["min_composite_score"]
+
+        has_long = num_bullish >= min_agreeing and composite >= min_score
+        has_short = num_bearish >= min_agreeing and composite <= -min_score
+
+        confluence_details = [
+            {"label": "Bullish Strategies", "value": f"{num_bullish}/5 (need {min_agreeing})",
+             "signal": num_bullish >= min_agreeing},
+            {"label": "Bearish Strategies", "value": f"{num_bearish}/5 (need {min_agreeing})",
+             "signal": num_bearish >= min_agreeing},
+            {"label": "Composite Score", "value": f"{composite:+.4f} (need {'+' if composite >= 0 else ''}{min_score})",
+             "signal": abs(composite) >= min_score},
+            {"label": "Long Signal", "value": "YES" if has_long else "NO", "signal": has_long},
+            {"label": "Short Signal", "value": "YES" if has_short else "NO", "signal": has_short},
+        ]
+
+        # Check confirmation from watcher
+        confirmed = False
+        pending = False
+        if symbol in _watchers:
+            ws = _watchers[symbol].state
+            confirmed = bool(ws.confirmed)
+            pending = bool(ws.prev_signal) and not confirmed
+            confluence_details.append(
+                {"label": "Confirmation (2 cycles)", "value":
+                 "CONFIRMED" if confirmed else "PENDING (1/2)" if pending else "NOT YET",
+                 "signal": confirmed})
+
+        if has_long:
+            signal_str = "LONG SIGNAL"
+        elif has_short:
+            signal_str = "SHORT SIGNAL"
+        else:
+            blockers = []
+            if num_bullish < min_agreeing and num_bearish < min_agreeing:
+                blockers.append(f"not enough strategies agree (best: {max(num_bullish, num_bearish)}/{min_agreeing})")
+            if abs(composite) < min_score:
+                blockers.append(f"composite score too weak ({composite:+.3f}, need {min_score})")
+            signal_str = "NO SIGNAL -- " + "; ".join(blockers) if blockers else "NO SIGNAL"
+
+        steps.append({
+            "step": 6,
+            "name": "Confluence Filter",
+            "status": "bullish" if has_long else "bearish" if has_short else "blocked",
+            "details": confluence_details,
+            "summary": signal_str + (" -> CONFIRMED" if confirmed else " -> PENDING" if pending and (has_long or has_short) else ""),
+        })
+
+        # Step 7: Final Decision
+        if has_long and confirmed:
+            decision = {"action": "BUY", "reason": f"{num_bullish}/5 agree, score={composite:+.3f}, confirmed",
+                        "score": round(composite, 4), "confluence": num_bullish}
+        elif has_short and confirmed:
+            decision = {"action": "SHORT", "reason": f"{num_bearish}/5 agree, score={composite:+.3f}, confirmed",
+                        "score": round(composite, 4), "confluence": num_bearish}
+        elif has_long or has_short:
+            direction_word = "LONG" if has_long else "SHORT"
+            decision = {"action": "WAIT", "reason": f"{direction_word} signal detected, waiting for confirmation",
+                        "score": round(composite, 4), "confluence": max(num_bullish, num_bearish)}
+        else:
+            decision = {"action": "HOLD", "reason": signal_str,
+                        "score": round(composite, 4), "confluence": max(num_bullish, num_bearish)}
+
+        # Add regime gate info
+        regime_data = _state.get("regime", {})
+        if regime_data:
+            allow_longs = regime_data.get("allow_longs", True)
+            mkt_regime = regime_data.get("regime", "unknown")
+            steps.append({
+                "step": 7,
+                "name": "Market Regime Gate (SPY)",
+                "status": "bullish" if allow_longs else "bearish",
+                "details": [
+                    {"label": "SPY Regime", "value": mkt_regime.upper(), "signal": mkt_regime == "bull"},
+                    {"label": "Longs Allowed", "value": str(allow_longs),
+                     "signal": allow_longs},
+                    {"label": "Crypto Bypass", "value": str(is_crypto),
+                     "signal": is_crypto},
+                ],
+                "summary": f"SPY regime: {mkt_regime.upper()} -- "
+                    + (f"Crypto bypasses SPY gate" if is_crypto else
+                       f"Longs {'ALLOWED' if allow_longs else 'BLOCKED'}")
+            })
+
+    except Exception as e:
+        steps.append({"step": 0, "name": "Error", "status": "error",
+                      "details": [{"label": "Error", "value": str(e), "signal": False}],
+                      "summary": f"Analysis error: {e}"})
+
+    return {"steps": steps, "decision": decision}
 
 
 # ── Routes ───────────────────────────────────────────────────────
@@ -383,7 +643,11 @@ def api_chart(symbol):
             "above_vwap": bool(s.above_vwap),
         }
 
-    return jsonify({
+    # ── Detailed bot analysis (step-by-step reasoning) ──
+    analysis = _build_analysis(symbol, df, intraday, trend_ctx)
+
+    # Use NumpyEncoder to handle numpy types (bool_, int64, float64, etc.)
+    result = {
         "symbol": symbol,
         "candles": candles,
         "volumes": volumes,
@@ -397,7 +661,10 @@ def api_chart(symbol):
         "markers": markers,
         "trend": trend_ctx,
         "watcher": watcher_info,
-    })
+        "analysis": analysis,
+    }
+    safe = json.loads(json.dumps(result, cls=NumpyEncoder))
+    return jsonify(safe)
 
 
 # ── Main ─────────────────────────────────────────────────────────

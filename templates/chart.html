@@ -103,6 +103,60 @@
         }
         .symbol-nav a:hover { background: #374151; color: #f9fafb; }
         .symbol-nav a.current { background: #3b82f6; color: #fff; }
+
+        /* Analysis panel */
+        .analysis-section {
+            padding: 16px 20px; border-top: 2px solid #1f2937;
+        }
+        .analysis-section h2 {
+            font-size: 14px; font-weight: 700; color: #f9fafb; margin-bottom: 12px;
+        }
+        .decision-box {
+            padding: 12px 16px; border-radius: 8px; margin-bottom: 16px;
+            display: flex; align-items: center; gap: 16px;
+        }
+        .decision-box.buy { background: #052e16; border: 1px solid #22c55e44; }
+        .decision-box.short { background: #350a0a; border: 1px solid #ef444444; }
+        .decision-box.hold { background: #1f2937; border: 1px solid #37415144; }
+        .decision-box.wait { background: #351f05; border: 1px solid #eab30844; }
+        .decision-action { font-size: 20px; font-weight: 800; }
+        .decision-reason { font-size: 13px; color: #9ca3af; }
+
+        .step-card {
+            background: #111827; border: 1px solid #1f2937; border-radius: 8px;
+            margin-bottom: 8px; overflow: hidden;
+        }
+        .step-header {
+            padding: 10px 14px; display: flex; justify-content: space-between;
+            align-items: center; cursor: pointer; user-select: none;
+        }
+        .step-header:hover { background: #1f293744; }
+        .step-num {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 22px; height: 22px; border-radius: 50%; font-size: 11px;
+            font-weight: 700; margin-right: 8px;
+        }
+        .step-num.bullish { background: #052e16; color: #22c55e; }
+        .step-num.bearish { background: #350a0a; color: #ef4444; }
+        .step-num.neutral { background: #1f2937; color: #6b7280; }
+        .step-num.blocked { background: #351f05; color: #eab308; }
+        .step-name { font-size: 13px; font-weight: 600; color: #e1e5eb; }
+        .step-summary { font-size: 11px; color: #6b7280; margin-left: 30px; margin-top: 2px; }
+        .step-body {
+            padding: 0 14px 12px 44px; display: none;
+        }
+        .step-body.open { display: block; }
+        .step-detail {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 4px 0; font-size: 12px; border-bottom: 1px solid #1f293733;
+        }
+        .step-detail-label { color: #6b7280; }
+        .step-detail-value { font-weight: 600; font-family: monospace; }
+        .step-detail-value.pass { color: #22c55e; }
+        .step-detail-value.fail { color: #ef4444; }
+        .step-detail-value.off { color: #4b5563; }
+        .step-arrow { color: #4b5563; font-size: 10px; transition: transform 0.2s; }
+        .step-arrow.open { transform: rotate(90deg); }
     </style>
 </head>
 <body>
@@ -137,6 +191,12 @@
 <div id="main-chart"></div>
 <div id="rsi-chart"></div>
 <div id="stoch-chart"></div>
+
+<div class="analysis-section">
+    <h2>How the Bot Sees This Stock</h2>
+    <div id="decision-box"></div>
+    <div id="analysis-steps"></div>
+</div>
 
 <div class="panel-row">
     <div class="panel">
@@ -397,6 +457,117 @@ function updateInfo(data) {
     }
 }
 
+function renderAnalysis(data) {
+    var analysis = data.analysis;
+    if (!analysis) return;
+
+    // Decision box
+    var dec = analysis.decision || {};
+    var decBox = document.getElementById('decision-box');
+    decBox.textContent = '';
+    var actionMap = {BUY: 'buy', SHORT: 'short', HOLD: 'hold', WAIT: 'wait'};
+    var colorMap = {BUY: '#22c55e', SHORT: '#ef4444', HOLD: '#6b7280', WAIT: '#eab308'};
+    decBox.className = 'decision-box ' + (actionMap[dec.action] || 'hold');
+
+    var actionSpan = document.createElement('span');
+    actionSpan.className = 'decision-action';
+    actionSpan.style.color = colorMap[dec.action] || '#6b7280';
+    actionSpan.textContent = (dec.action || 'HOLD');
+    decBox.appendChild(actionSpan);
+
+    var infoDiv = document.createElement('div');
+    var reasonSpan = document.createElement('div');
+    reasonSpan.className = 'decision-reason';
+    reasonSpan.textContent = dec.reason || '';
+    infoDiv.appendChild(reasonSpan);
+
+    if (dec.score !== undefined) {
+        var scoreSpan = document.createElement('div');
+        scoreSpan.style.cssText = 'font-size:12px;color:#9ca3af;margin-top:2px';
+        scoreSpan.textContent = 'Score: ' + (dec.score >= 0 ? '+' : '') + dec.score.toFixed(4) +
+            ' | Confluence: ' + (dec.confluence || 0) + '/5';
+        infoDiv.appendChild(scoreSpan);
+    }
+    decBox.appendChild(infoDiv);
+
+    // Steps
+    var stepsEl = document.getElementById('analysis-steps');
+    stepsEl.textContent = '';
+    var steps = analysis.steps || [];
+
+    steps.forEach(function(step) {
+        var card = document.createElement('div');
+        card.className = 'step-card';
+
+        // Header
+        var header = document.createElement('div');
+        header.className = 'step-header';
+
+        var leftDiv = document.createElement('div');
+        var numSpan = document.createElement('span');
+        numSpan.className = 'step-num ' + (step.status || 'neutral');
+        numSpan.textContent = step.step;
+        leftDiv.appendChild(numSpan);
+
+        var nameSpan = document.createElement('span');
+        nameSpan.className = 'step-name';
+        nameSpan.textContent = step.name || '';
+        leftDiv.appendChild(nameSpan);
+
+        var arrow = document.createElement('span');
+        arrow.className = 'step-arrow';
+        arrow.textContent = '\u25B6';
+
+        header.appendChild(leftDiv);
+        header.appendChild(arrow);
+
+        // Summary under header
+        var summaryDiv = document.createElement('div');
+        summaryDiv.className = 'step-summary';
+        summaryDiv.textContent = step.summary || '';
+
+        var headerWrap = document.createElement('div');
+        headerWrap.appendChild(header);
+        headerWrap.appendChild(summaryDiv);
+
+        // Body (details)
+        var body = document.createElement('div');
+        body.className = 'step-body';
+
+        var details = step.details || [];
+        details.forEach(function(d) {
+            var row = document.createElement('div');
+            row.className = 'step-detail';
+
+            var label = document.createElement('span');
+            label.className = 'step-detail-label';
+            label.textContent = d.label || '';
+
+            var value = document.createElement('span');
+            value.className = 'step-detail-value';
+            if (d.signal === true) value.classList.add('pass');
+            else if (d.signal === false) value.classList.add('fail');
+            else value.classList.add('off');
+            value.textContent = d.value || '';
+
+            row.appendChild(label);
+            row.appendChild(value);
+            body.appendChild(row);
+        });
+
+        // Toggle
+        header.addEventListener('click', function() {
+            var isOpen = body.classList.contains('open');
+            body.classList.toggle('open', !isOpen);
+            arrow.classList.toggle('open', !isOpen);
+        });
+
+        card.appendChild(headerWrap);
+        card.appendChild(body);
+        stepsEl.appendChild(card);
+    });
+}
+
 function switchTF(tf, btn) {
     currentTF = tf;
     document.querySelectorAll('.tf-btn').forEach(function(b) { b.classList.remove('active'); });
@@ -417,6 +588,7 @@ async function loadChart() {
         chartData = await resp.json();
         renderChart(chartData);
         updateInfo(chartData);
+        renderAnalysis(chartData);
     } catch (e) { console.error('Failed to load chart:', e); }
 }
 
