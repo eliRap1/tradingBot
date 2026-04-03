@@ -49,6 +49,10 @@ screener:
     - SNOW
     - COIN
     - PLTR
+  # Crypto (traded 24/7 on Alpaca)
+  crypto:
+    - BTC/USD
+    - ETH/USD
 
 strategies:
   momentum:
@@ -92,6 +96,10 @@ signals:
   min_composite_score: 0.25
   max_positions: 8
   min_agreeing_strategies: 3   # confluence: need 3/5 strategies to agree
+  allow_shorts_in_bull: false  # block shorts in bull regime by default
+  entry_timeframe: "5Min"      # 5-min candles for entries
+  trend_timeframe: "1Day"      # daily candles for trend context
+  intraday_lookback_days: 5    # how many days of 5-min bars to fetch
 
 risk:
   max_position_pct: 0.05       # 5% of portfolio per position
@@ -102,6 +110,38 @@ risk:
   max_drawdown_pct: 0.10       # 10% drawdown halts trading
   trailing_stop_pct: 0.03      # 3% trailing stop
   daily_loss_limit_pct: 0.03   # 3% daily loss limit — stop trading for day
+  sizing_method: "fixed_fractional"  # "fixed_fractional" or "kelly"
+  kelly_fraction: 0.5          # half Kelly (standard practice)
+  kelly_min_trades: 30         # need 30 trades before Kelly activates
+
+execution:
+  smart_orders: false            # set true to use limit orders with fallback
+  limit_offset_pct: 0.0002      # 2 bps better than market
+  limit_timeout_sec: 30          # fall back to market after 30s
+
+filters:
+  max_correlation: 0.70         # block if correlation > 70%
+  correlation_lookback_days: 60
+  correlation_cache_minutes: 30
+
+backtest:
+  slippage_pct: 0.001           # 10 basis points per fill
+  volume_impact: true           # extra slippage on large orders
+  commission_per_share: 0.0     # Alpaca is commission-free
+  initial_equity: 100000
+
+alerts:
+  enabled: true                  # set to false to disable
+  notify_trades: true            # new trade entries/exits
+  notify_drawdown: true          # drawdown warnings
+  notify_daily_summary: true     # end-of-day performance
+
+optimization:
+  train_days: 180
+  test_days: 60
+  step_days: 30
+  metric: "sharpe_ratio"
+  max_param_combinations: 200
 
 schedule:
   market_open_delay_min: 15    # skip first 15 min (volatile)

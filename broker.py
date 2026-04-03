@@ -1,10 +1,14 @@
 import os
+import time
+import threading
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
 from utils import setup_logger
 
 load_dotenv()
 log = setup_logger("broker")
+
+CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
 
 
 class Broker:
@@ -50,7 +54,7 @@ class Broker:
 
     def submit_bracket_order(self, symbol: str, qty: int, side: str,
                               take_profit: float, stop_loss: float):
-        """Submit order with take-profit and stop-loss."""
+        """Submit order with take-profit and stop-loss. Works for both long and short."""
         log.info(f"BRACKET ORDER: {side} {qty} {symbol} | TP={take_profit:.2f} SL={stop_loss:.2f}")
         return self.api.submit_order(
             symbol=symbol,
@@ -63,14 +67,166 @@ class Broker:
             stop_loss={"stop_price": round(stop_loss, 2)}
         )
 
+    def submit_short_bracket(self, symbol: str, qty: int,
+                              take_profit: float, stop_loss: float):
+        """Short sell with bracket order. TP is below entry, SL is above."""
+        log.info(f"SHORT BRACKET: sell {qty} {symbol} | TP={take_profit:.2f} SL={stop_loss:.2f}")
+        return self.api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell",
+            type="market",
+            time_in_force="day",
+            order_class="bracket",
+            take_profit={"limit_price": round(take_profit, 2)},
+            stop_loss={"stop_price": round(stop_loss, 2)}
+        )
+
+    def submit_crypto_order(self, symbol: str, qty: float, side: str,
+                             take_profit: float, stop_loss: float):
+        """Submit crypto order with separate TP/SL (no bracket for crypto).
+        Places a market entry then a limit TP order."""
+        log.info(f"CRYPTO ORDER: {side} {qty} {symbol} | TP={take_profit:.2f} SL={stop_loss:.2f}")
+        # Entry order
+        entry = self.api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type="market",
+            time_in_force="gtc"
+        )
+        # Place take-profit limit order
+        tp_side = "sell" if side == "buy" else "buy"
+        self.api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=tp_side,
+            type="limit",
+            limit_price=round(take_profit, 2),
+            time_in_force="gtc"
+        )
+        return entry
+
+    def get_quote(self, symbol: str):
+        """Get current bid/ask quote."""
+        try:
+            if symbol in CRYPTO_SYMBOLS:
+                return self.api.get_latest_crypto_quote(symbol)
+            return self.api.get_latest_quote(symbol, feed="iex")
+        except Exception as e:
+            log.error(f"Failed to get quote for {symbol}: {e}")
+            return None
+
+    def submit_smart_order(self, symbol: str, qty: int, side: str,
+                           take_profit: float, stop_loss: float,
+                           limit_offset_pct: float = 0.0002,
+                           timeout_sec: int = 30) -> dict:
+        """
+        Smart execution: limit order with timeout fallback to market.
+
+        1. Gets current price and places limit order slightly better
+        2. Waits up to timeout_sec for fill
+        3. If not filled, cancels and sends market bracket order
+        """
+        quote = self.get_quote(symbol)
+        if not quote:
+            # Fallback to immediate bracket order
+            log.info(f"No quote for {symbol}, using market order")
+            if side == "sell":
+                self.submit_short_bracket(symbol, qty, take_profit, stop_loss)
+            else:
+                self.submit_bracket_order(symbol, qty, side, take_profit, stop_loss)
+            return {"method": "market", "symbol": symbol}
+
+        # Calculate limit price (slightly better than market)
+        if side == "buy":
+            ask = float(quote.ap) if hasattr(quote, 'ap') else float(quote.ask_price)
+            limit_price = round(ask * (1 - limit_offset_pct), 2)
+        else:
+            bid = float(quote.bp) if hasattr(quote, 'bp') else float(quote.bid_price)
+            limit_price = round(bid * (1 + limit_offset_pct), 2)
+
+        log.info(f"SMART ORDER: {side} {qty} {symbol} limit=${limit_price:.2f} "
+                 f"(timeout={timeout_sec}s)")
+
+        try:
+            # Place limit order (no bracket yet)
+            order = self.api.submit_order(
+                symbol=symbol, qty=qty, side=side,
+                type="limit", limit_price=limit_price,
+                time_in_force="day"
+            )
+            order_id = order.id
+
+            # Poll for fill
+            filled = False
+            fill_price = limit_price
+            elapsed = 0
+            while elapsed < timeout_sec:
+                time.sleep(2)
+                elapsed += 2
+                status = self.api.get_order(order_id)
+                if status.status == "filled":
+                    filled = True
+                    fill_price = float(status.filled_avg_price)
+                    break
+                elif status.status in ("canceled", "expired", "rejected"):
+                    break
+
+            if filled:
+                log.info(f"LIMIT FILLED: {symbol} @ ${fill_price:.2f}")
+                # Now place bracket stop/TP as OCO
+                tp_side = "sell" if side == "buy" else "buy"
+                try:
+                    self.api.submit_order(
+                        symbol=symbol, qty=qty, side=tp_side,
+                        type="limit", limit_price=round(take_profit, 2),
+                        time_in_force="gtc", order_class="oco",
+                        stop_loss={"stop_price": round(stop_loss, 2)}
+                    )
+                except Exception:
+                    # OCO not available, submit separate orders
+                    self.api.submit_order(
+                        symbol=symbol, qty=qty, side=tp_side,
+                        type="limit", limit_price=round(take_profit, 2),
+                        time_in_force="gtc"
+                    )
+                return {"method": "limit", "fill_price": fill_price, "symbol": symbol}
+            else:
+                # Cancel unfilled limit order
+                try:
+                    self.api.cancel_order(order_id)
+                except Exception:
+                    # May already be canceled/filled
+                    check = self.api.get_order(order_id)
+                    if check.status == "filled":
+                        return {"method": "limit", "fill_price": float(check.filled_avg_price), "symbol": symbol}
+
+                # Fallback to market bracket
+                log.info(f"LIMIT TIMEOUT: {symbol} — falling back to market bracket")
+                if side == "sell":
+                    self.submit_short_bracket(symbol, qty, take_profit, stop_loss)
+                else:
+                    self.submit_bracket_order(symbol, qty, side, take_profit, stop_loss)
+                return {"method": "market_fallback", "symbol": symbol}
+
+        except Exception as e:
+            log.error(f"Smart order failed for {symbol}: {e} — using market")
+            if side == "sell":
+                self.submit_short_bracket(symbol, qty, take_profit, stop_loss)
+            else:
+                self.submit_bracket_order(symbol, qty, side, take_profit, stop_loss)
+            return {"method": "market_error", "symbol": symbol}
+
     def submit_market_order(self, symbol: str, qty: int, side: str):
         log.info(f"MARKET ORDER: {side} {qty} {symbol}")
+        tif = "gtc" if symbol in CRYPTO_SYMBOLS else "day"
         return self.api.submit_order(
             symbol=symbol,
             qty=qty,
             side=side,
             type="market",
-            time_in_force="day"
+            time_in_force=tif
         )
 
     def submit_trailing_stop(self, symbol: str, qty: int, trail_percent: float):

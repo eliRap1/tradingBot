@@ -30,6 +30,7 @@ from utils import setup_logger
 class Action(Enum):
     NONE = "none"
     BUY = "buy"
+    SHORT = "short"
     EXIT = "exit"
 
 
@@ -115,42 +116,55 @@ class StockWatcher:
             self._stop_event.wait(timeout=self.interval)
 
     def _analyze(self):
-        """Full analysis cycle for this stock."""
+        """Full analysis cycle for this stock.
+
+        Multi-timeframe approach:
+          - Daily bars → trend context (200 EMA, ADX, weekly trend)
+          - 5-min bars → entry signals (strategies, candle patterns)
+        """
         self.state.status = "analyzing"
 
-        # 1. Fetch candle data
-        bars = self.data.get_bars([self.symbol], timeframe="1Day", days=250)
-        if self.symbol not in bars or len(bars[self.symbol]) < 30:
+        # 1a. Fetch DAILY bars for trend context
+        daily_bars = self.data.get_bars([self.symbol], timeframe="1Day", days=250)
+        if self.symbol not in daily_bars or len(daily_bars[self.symbol]) < 30:
             self.state.status = "no_data"
             return
 
-        df = bars[self.symbol]
-        self._bars = df
-        self.state.last_price = float(df["close"].iloc[-1])
+        daily_df = daily_bars[self.symbol]
 
-        # 2. Read the chart — what kind of market is this stock in?
-        ctx = get_trend_context(df)
+        # 1b. Fetch 5-MINUTE bars for entry signals
+        intraday_df = self.data.get_intraday_bars(self.symbol, timeframe="5Min", days=5)
+        if intraday_df is None or len(intraday_df) < 30:
+            # Fall back to daily if intraday not available (market closed, etc.)
+            intraday_df = daily_df
+
+        self._bars = intraday_df  # used for order sizing (ATR on entry timeframe)
+        self.state.last_price = float(intraday_df["close"].iloc[-1])
+
+        # 2. Read the chart — DAILY timeframe for trend context
+        ctx = get_trend_context(daily_df)
         self.state.adx = float(round(ctx["adx"], 1))
         self.state.trend_direction = str(ctx["direction"])
         self.state.above_200ema = bool(ctx["above_ema_200"])
         self.state.above_vwap = bool(ctx["above_vwap"])
 
-        wk = get_weekly_trend(df)
+        wk = get_weekly_trend(daily_df)
         self.state.weekly_trend_up = bool(wk["weekly_trend_up"])
 
-        # 3. Detect candlestick patterns
-        patterns = detect_patterns(df)
+        # 3. Detect candlestick patterns on 5-MIN bars
+        patterns = detect_patterns(intraday_df)
         self.state.candle_patterns = [k for k, v in patterns.items() if v]
 
-        # 4. Pick the right strategies for THIS stock
-        selection = select_strategies(df, self.symbol)
+        # 4. Pick strategies based on DAILY regime
+        selection = select_strategies(daily_df, self.symbol)
         self.state.regime = selection["regime"]
         self.state.regime_reason = selection["reason"]
         self.state.strategy_weights = selection["strategies"]
 
-        # 5. Run selected strategies with their weights
+        # 5. Run selected strategies on 5-MIN bars (entry timeframe)
         strategy_scores = {}
-        num_agreeing = 0
+        num_bullish = 0
+        num_bearish = 0
         weighted_sum = 0.0
         total_weight = 0.0
 
@@ -162,7 +176,7 @@ class StockWatcher:
             if not strat:
                 continue
 
-            signals = strat.generate_signals({self.symbol: df})
+            signals = strat.generate_signals({self.symbol: intraday_df})
             score = signals.get(self.symbol, 0.0)
             strategy_scores[strat_name] = round(float(score), 3)
 
@@ -170,28 +184,37 @@ class StockWatcher:
             total_weight += weight
 
             if score > 0.1:
-                num_agreeing += 1
+                num_bullish += 1
+            elif score < -0.1:
+                num_bearish += 1
 
         self.state.strategy_scores = strategy_scores
-        self.state.num_agreeing = num_agreeing
-
         composite = weighted_sum / total_weight if total_weight > 0 else 0.0
         self.state.score = round(float(composite), 3)
 
-        # 6. Decision: does this stock pass all filters?
+        # 6. Decision: LONG, SHORT, or NONE
         min_agreeing = self.config["signals"].get("min_agreeing_strategies", 3)
         min_score = self.config["signals"]["min_composite_score"]
 
-        has_signal = (num_agreeing >= min_agreeing and composite >= min_score)
+        # Check for LONG signal
+        has_long = (num_bullish >= min_agreeing and composite >= min_score)
+        # Check for SHORT signal (3+ strategies bearish, negative composite)
+        has_short = (num_bearish >= min_agreeing and composite <= -min_score)
+
+        self.state.num_agreeing = num_bullish if has_long else num_bearish if has_short else max(num_bullish, num_bearish)
+
+        has_signal = has_long or has_short
+        signal_type = Action.BUY if has_long else Action.SHORT if has_short else Action.NONE
+        direction_str = "LONG" if has_long else "SHORT" if has_short else ""
 
         # Confirmation: signal must persist across 2 checks
         if has_signal and self.state.prev_signal:
             self.state.confirmed = True
-            self.state.action = Action.BUY
+            self.state.action = signal_type
             self.state.status = "signal"
             self.log.info(
-                f"CONFIRMED BUY SIGNAL: score={composite:.3f} "
-                f"confluence={num_agreeing}/{len(selection['strategies'])} "
+                f"CONFIRMED {direction_str} SIGNAL: score={composite:.3f} "
+                f"confluence={self.state.num_agreeing}/{len(selection['strategies'])} "
                 f"regime={selection['regime']}"
             )
         elif has_signal:
@@ -200,8 +223,8 @@ class StockWatcher:
             self.state.action = Action.NONE
             self.state.status = "pending"
             self.log.info(
-                f"Pending signal: score={composite:.3f} "
-                f"confluence={num_agreeing} — waiting for confirmation"
+                f"Pending {direction_str}: score={composite:.3f} "
+                f"confluence={self.state.num_agreeing} — waiting for confirmation"
             )
         else:
             self.state.prev_signal = False

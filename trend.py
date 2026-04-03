@@ -42,7 +42,7 @@ def get_trend_context(df: pd.DataFrame) -> dict:
 
     # ── ADX + Directional Indicators ─────────────────────────
     adx_period = min(14, len(df) - 2)
-    if adx_period >= 5:
+    if adx_period >= 5 and len(df) >= adx_period * 2:
         adx_ind = ta.trend.ADXIndicator(high, low, close, window=adx_period)
         result["adx"] = adx_ind.adx().iloc[-1]
         result["di_plus"] = adx_ind.adx_pos().iloc[-1]

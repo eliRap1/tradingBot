@@ -35,7 +35,8 @@ class RiskManager:
     def size_orders(self, opportunities, bars: dict[str, pd.DataFrame],
                     prices: dict[str, float], equity: float,
                     num_existing: int,
-                    regime_size_mult: float = 1.0) -> list[SizedOrder]:
+                    regime_size_mult: float = 1.0,
+                    tracker_stats: dict = None) -> list[SizedOrder]:
         """
         Convert opportunities into sized orders with stops.
 
@@ -67,25 +68,63 @@ class RiskManager:
             if atr is None or atr <= 0:
                 continue
 
-            stop_loss = entry_price - (atr * self.cfg["stop_loss_atr_mult"])
-            take_profit = entry_price + (atr * self.cfg["take_profit_atr_mult"])
+            # Direction: positive score = long, negative = short
+            is_short = opp.direction == "sell" or opp.score < 0
+
+            if is_short:
+                # SHORT: stop above entry, target below entry
+                stop_loss = entry_price + (atr * self.cfg["stop_loss_atr_mult"])
+                take_profit = entry_price - (atr * self.cfg["take_profit_atr_mult"])
+                risk = stop_loss - entry_price
+                reward = entry_price - take_profit
+                side = "sell"
+            else:
+                # LONG: stop below entry, target above entry
+                stop_loss = entry_price - (atr * self.cfg["stop_loss_atr_mult"])
+                take_profit = entry_price + (atr * self.cfg["take_profit_atr_mult"])
+                risk = entry_price - stop_loss
+                reward = take_profit - entry_price
+                side = "buy"
 
             # ── Risk:Reward filter ───────────────────────────
-            risk = entry_price - stop_loss
-            reward = take_profit - entry_price
             min_rr = self.cfg.get("min_risk_reward", 2.0)
-
             if risk <= 0:
                 continue
-
             rr_ratio = reward / risk
             if rr_ratio < min_rr:
                 log.info(f"Skipping {opp.symbol}: R:R={rr_ratio:.1f} < {min_rr} minimum")
                 continue
 
-            # ── Position sizing (fixed fractional) ───────────
-            risk_per_share = entry_price - stop_loss
-            max_risk_dollars = equity * self.cfg["max_portfolio_risk_pct"]
+            # ── Position sizing ───────────────────────────────
+            risk_per_share = risk
+            sizing_method = self.cfg.get("sizing_method", "fixed_fractional")
+
+            if sizing_method == "kelly" and tracker_stats:
+                # Kelly Criterion: f* = p - q/b
+                # p = win rate, q = 1-p, b = avg_win/avg_loss ratio
+                kelly_min_trades = self.cfg.get("kelly_min_trades", 30)
+                total_trades = tracker_stats.get("total_trades", 0)
+
+                if total_trades >= kelly_min_trades:
+                    p = tracker_stats.get("win_pct", 50) / 100
+                    avg_win = abs(tracker_stats.get("avg_win", 1))
+                    avg_loss = abs(tracker_stats.get("avg_loss", 1))
+                    b = avg_win / avg_loss if avg_loss > 0 else 1.0
+
+                    kelly_f = p - ((1 - p) / b) if b > 0 else 0
+                    # Half Kelly for safety
+                    kelly_f *= self.cfg.get("kelly_fraction", 0.5)
+                    kelly_f = max(0.005, min(kelly_f, self.cfg["max_portfolio_risk_pct"]))
+
+                    max_risk_dollars = equity * kelly_f
+                    log.info(f"Kelly sizing: f={kelly_f:.4f} (half-Kelly, "
+                             f"p={p:.2f} b={b:.2f}) risk=${max_risk_dollars:.2f}")
+                else:
+                    # Not enough trades, fall back to fixed fractional
+                    max_risk_dollars = equity * self.cfg["max_portfolio_risk_pct"]
+            else:
+                max_risk_dollars = equity * self.cfg["max_portfolio_risk_pct"]
+
             qty_by_risk = int(max_risk_dollars / risk_per_share)
 
             max_position_dollars = equity * self.cfg["max_position_pct"]
@@ -93,7 +132,7 @@ class RiskManager:
 
             qty = min(qty_by_risk, qty_by_size)
 
-            # Apply regime size multiplier (reduce in bear/chop markets)
+            # Apply regime size multiplier
             qty = int(qty * regime_size_mult)
 
             if qty <= 0:
@@ -102,7 +141,7 @@ class RiskManager:
             orders.append(SizedOrder(
                 symbol=opp.symbol,
                 qty=qty,
-                side="buy",
+                side=side,
                 entry_price=entry_price,
                 stop_loss=round(stop_loss, 2),
                 take_profit=round(take_profit, 2),
@@ -110,7 +149,7 @@ class RiskManager:
             ))
 
             log.info(
-                f"Sized: {opp.symbol} qty={qty} entry={entry_price:.2f} "
+                f"Sized: {side.upper()} {opp.symbol} qty={qty} entry={entry_price:.2f} "
                 f"SL={stop_loss:.2f} TP={take_profit:.2f} "
                 f"R:R={rr_ratio:.1f} risk=${risk_per_share * qty:.2f}"
             )

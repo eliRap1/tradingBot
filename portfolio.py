@@ -150,6 +150,7 @@ class PortfolioManager:
                     else:
                         reason = "stop_loss"
 
+                    risk_dollars = meta.get("initial_risk", 0.0)
                     self.tracker.record_trade(
                         symbol=sym,
                         side=pos["side"],
@@ -157,6 +158,7 @@ class PortfolioManager:
                         entry_price=pos["entry_price"],
                         exit_price=pos["current_price"],
                         reason=reason,
+                        risk_dollars=risk_dollars,
                     )
             except Exception as e:
                 log.error(f"Failed to close {sym}: {e}")
@@ -190,6 +192,21 @@ class PortfolioManager:
                 f"Now ${pos['current_price']:.2f} | "
                 f"P&L=${pos['unrealized_pl']:+.2f} ({pos['unrealized_plpc']:+.1%}){days_held}"
             )
+
+    def set_position_risk(self, symbol: str, entry_price: float,
+                          stop_loss: float, qty: int):
+        """Record the initial risk for a position (for R-multiple tracking)."""
+        risk_per_share = abs(entry_price - stop_loss)
+        risk_dollars = risk_per_share * qty
+        if symbol not in self.position_meta:
+            self.position_meta[symbol] = {
+                "opened_at": datetime.now().isoformat(),
+                "entry_price": entry_price,
+                "initial_risk": risk_dollars,
+            }
+        else:
+            self.position_meta[symbol]["initial_risk"] = risk_dollars
+        self._save_meta()
 
     def _save_watermarks(self):
         """Persist high watermarks to state file."""

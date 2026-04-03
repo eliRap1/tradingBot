@@ -7,6 +7,9 @@ they just cut out trades that are statistically more likely to lose.
 
 import json
 import os
+import time
+import numpy as np
+import pandas as pd
 from datetime import datetime
 from utils import setup_logger
 
@@ -34,6 +37,8 @@ SECTOR_MAP = {
     "UNH": "health",
     # Consumer
     "HD": "retail", "COST": "retail", "PEP": "consumer", "KO": "consumer",
+    # Crypto
+    "BTC/USD": "crypto", "ETH/USD": "crypto",
 }
 
 CONFIRMATION_FILE = os.path.join(os.path.dirname(__file__), "pending_signals.json")
@@ -41,9 +46,16 @@ MAX_PER_SECTOR = 2
 
 
 class SmartFilters:
-    def __init__(self, tracker=None):
+    def __init__(self, tracker=None, config: dict = None):
         self.tracker = tracker
+        self.config = config or {}
         self._pending_signals = self._load_pending()
+
+        # Correlation cache
+        self._corr_cache: dict = {}
+        self._corr_cache_time: float = 0
+        self._corr_cache_ttl = (config or {}).get("filters", {}).get(
+            "correlation_cache_minutes", 30) * 60
 
     # ═══════════════════════════════════════════════════════════
     # Confirmation bar filter
@@ -142,6 +154,96 @@ class SmartFilters:
             else:
                 filtered.append(opp)
                 sector_count[sector] = current + 1
+
+        return filtered
+
+    # ═══════════════════════════════════════════════════════════
+    # Dynamic correlation filter
+    # ═══════════════════════════════════════════════════════════
+
+    def filter_correlated(self, candidate_symbols: list[str],
+                          held_symbols: list[str],
+                          bars: dict[str, pd.DataFrame],
+                          max_correlation: float = 0.70,
+                          lookback: int = 60) -> list[str]:
+        """
+        Block entry if a candidate is highly correlated with ANY held position.
+        Uses daily close returns for meaningful correlation.
+        Falls back to SECTOR_MAP when insufficient data.
+        """
+        if not held_symbols:
+            return candidate_symbols
+
+        max_corr = self.config.get("filters", {}).get(
+            "max_correlation", max_correlation)
+
+        # Check cache
+        now = time.time()
+        if now - self._corr_cache_time < self._corr_cache_ttl and self._corr_cache:
+            corr_matrix = self._corr_cache
+        else:
+            # Build returns matrix
+            all_syms = list(set(candidate_symbols + held_symbols))
+            returns = {}
+            for sym in all_syms:
+                if sym in bars and bars[sym] is not None and len(bars[sym]) >= lookback:
+                    closes = bars[sym]["close"].tail(lookback)
+                    ret = closes.pct_change().dropna()
+                    if len(ret) >= lookback - 5:
+                        returns[sym] = ret.values[:lookback - 1]
+
+            if len(returns) < 2:
+                return candidate_symbols
+
+            # Align lengths
+            min_len = min(len(v) for v in returns.values())
+            aligned = {k: v[-min_len:] for k, v in returns.items()}
+
+            # Calculate correlation matrix
+            syms = list(aligned.keys())
+            matrix = np.array([aligned[s] for s in syms])
+            corr = np.corrcoef(matrix)
+
+            corr_matrix = {}
+            for i, s1 in enumerate(syms):
+                for j, s2 in enumerate(syms):
+                    if i != j:
+                        corr_matrix[(s1, s2)] = corr[i][j]
+
+            self._corr_cache = corr_matrix
+            self._corr_cache_time = now
+
+        # Filter candidates
+        filtered = []
+        for sym in candidate_symbols:
+            blocked = False
+            for held in held_symbols:
+                pair_corr = corr_matrix.get((sym, held), None)
+                if pair_corr is not None and abs(pair_corr) > max_corr:
+                    log.info(f"CORRELATION FILTER: Skipping {sym} "
+                             f"(corr={pair_corr:.2f} with held {held})")
+                    blocked = True
+                    break
+
+            if not blocked:
+                # Fallback: also check sector if no correlation data
+                if (sym, held_symbols[0]) not in corr_matrix:
+                    sym_sector = SECTOR_MAP.get(sym, "other")
+                    for held in held_symbols:
+                        held_sector = SECTOR_MAP.get(held, "other2")
+                        if sym_sector == held_sector:
+                            sector_count = sum(
+                                1 for h in held_symbols
+                                if SECTOR_MAP.get(h, "x") == sym_sector
+                            )
+                            if sector_count >= MAX_PER_SECTOR:
+                                log.info(f"SECTOR FALLBACK: Skipping {sym} "
+                                         f"(sector '{sym_sector}' full)")
+                                blocked = True
+                                break
+
+            if not blocked:
+                filtered.append(sym)
 
         return filtered
 

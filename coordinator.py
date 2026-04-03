@@ -15,7 +15,7 @@ import threading
 from datetime import datetime
 
 from utils import load_config, setup_logger
-from broker import Broker
+from broker import Broker, CRYPTO_SYMBOLS
 from data import DataFetcher
 from screener import Screener
 from risk import RiskManager
@@ -23,6 +23,7 @@ from portfolio import PortfolioManager
 from regime import RegimeFilter
 from filters import SmartFilters
 from watcher import StockWatcher, Action
+from alerts import AlertManager
 
 log = setup_logger("coordinator")
 
@@ -40,7 +41,8 @@ class Coordinator:
         self.risk = RiskManager(self.config)
         self.portfolio = PortfolioManager(self.config, self.broker)
         self.regime = RegimeFilter(self.data)
-        self.filters = SmartFilters(tracker=self.portfolio.tracker)
+        self.filters = SmartFilters(tracker=self.portfolio.tracker, config=self.config)
+        self.alerts = AlertManager(self.config)
 
         # Watcher threads: {symbol: StockWatcher}
         self.watchers: dict[str, StockWatcher] = {}
@@ -55,15 +57,18 @@ class Coordinator:
         self.risk.peak_equity = max(self.risk.peak_equity, equity)
         self.risk.set_starting_equity(equity)
 
-    def start_watchers(self):
-        """Spawn a watcher thread for each stock in the universe."""
-        universe = self.screener.get_universe()
-        if not universe:
-            # Fall back to config universe if screener can't fetch
-            universe = self.config["screener"]["universe"]
+    def start_watchers(self, crypto_only: bool = False):
+        """Spawn a watcher thread for each stock/crypto in the universe."""
+        if crypto_only:
+            universe = self.config["screener"].get("crypto", [])
+        else:
+            universe = self.screener.get_universe()
+            if not universe:
+                universe = self.config["screener"]["universe"]
+            # Add crypto symbols
+            universe = list(universe) + self.config["screener"].get("crypto", [])
 
         cycle_interval = self.config["schedule"]["cycle_interval_sec"]
-        # Each watcher checks every cycle_interval seconds
         watcher_interval = max(60, cycle_interval)
 
         log.info(f"Starting {len(universe)} watcher threads "
@@ -79,18 +84,24 @@ class Coordinator:
                 )
                 self.watchers[sym] = watcher
                 watcher.start()
-                # Stagger thread starts to avoid API rate limits
                 time.sleep(0.5)
 
         log.info(f"All {len(self.watchers)} watchers running")
 
-    def stop_watchers(self):
-        """Stop all watcher threads."""
-        log.info("Stopping all watchers...")
-        for sym, watcher in self.watchers.items():
-            watcher.stop()
-        self.watchers.clear()
-        log.info("All watchers stopped")
+    def stop_watchers(self, stocks_only: bool = False):
+        """Stop watcher threads. If stocks_only, keep crypto running."""
+        if stocks_only:
+            log.info("Stopping stock watchers (crypto continues)...")
+            to_stop = [s for s in self.watchers if s not in CRYPTO_SYMBOLS]
+            for sym in to_stop:
+                self.watchers[sym].stop()
+                del self.watchers[sym]
+        else:
+            log.info("Stopping all watchers...")
+            for sym, watcher in self.watchers.items():
+                watcher.stop()
+            self.watchers.clear()
+        log.info(f"Watchers remaining: {len(self.watchers)}")
 
     def run(self):
         """Main coordinator loop."""
@@ -101,20 +112,39 @@ class Coordinator:
                 clock = self.broker.get_clock()
 
                 if not clock.is_open:
-                    # Stop watchers while market is closed
-                    if self.watchers:
-                        self.stop_watchers()
+                    # Stop stock watchers but keep crypto running
+                    has_stock_watchers = any(
+                        s not in CRYPTO_SYMBOLS for s in self.watchers
+                    )
+                    if has_stock_watchers:
+                        self.stop_watchers(stocks_only=True)
+
+                    # Start crypto watchers if not already running
+                    crypto_running = any(
+                        s in CRYPTO_SYMBOLS for s in self.watchers
+                    )
+                    if not crypto_running:
+                        self.start_watchers(crypto_only=True)
+
                     next_open = clock.next_open
-                    log.info(f"Market closed. Next open: {next_open}")
-                    self._wait_until(next_open)
+                    log.info(f"Market closed. Crypto watchers active. "
+                             f"Next stock open: {next_open}")
 
-                    # Reset daily tracking
-                    equity = self.broker.get_equity()
-                    self.risk.set_starting_equity(equity)
+                    # Still run coordinator cycle for crypto signals
+                    self._coordinator_cycle()
 
-                    delay = self.config["schedule"]["market_open_delay_min"]
-                    log.info(f"Market opened. Waiting {delay}min...")
-                    time.sleep(delay * 60)
+                    # Wait a cycle then check again
+                    interval = self.config["schedule"]["cycle_interval_sec"]
+                    time.sleep(interval)
+
+                    # Check if market opened
+                    clock = self.broker.get_clock()
+                    if clock.is_open:
+                        equity = self.broker.get_equity()
+                        self.risk.set_starting_equity(equity)
+                        delay = self.config["schedule"]["market_open_delay_min"]
+                        log.info(f"Market opened. Waiting {delay}min...")
+                        time.sleep(delay * 60)
                     continue
 
                 # Check close buffer
@@ -126,14 +156,18 @@ class Coordinator:
                     close_ts = next_close.replace(tzinfo=None).timestamp()
 
                 if time.time() > close_ts - (buffer * 60):
-                    log.info("Too close to market close. Waiting for next day.")
-                    if self.watchers:
-                        self.stop_watchers()
-                    self._wait_until(clock.next_open)
+                    log.info("Too close to market close — stocks paused, crypto continues.")
+                    self.stop_watchers(stocks_only=True)
+                    # Don't wait — keep looping for crypto
+                    self._coordinator_cycle()
+                    time.sleep(self.config["schedule"]["cycle_interval_sec"])
                     continue
 
-                # Start watchers if not running
-                if not self.watchers:
+                # Start all watchers if not running
+                has_stock_watchers = any(
+                    s not in CRYPTO_SYMBOLS for s in self.watchers
+                )
+                if not has_stock_watchers:
                     self.start_watchers()
 
                 # Coordinator cycle: collect signals and execute
@@ -162,7 +196,9 @@ class Coordinator:
         # 1. Check drawdown
         equity = self.broker.get_equity()
         if self.risk.check_drawdown(equity):
+            dd_pct = (self.risk.peak_equity - equity) / self.risk.peak_equity
             log.critical("DRAWDOWN LIMIT HIT — halting all trading")
+            self.alerts.send_drawdown_halt(dd_pct, self.risk.peak_equity, equity)
             self.stop_watchers()
             sys.exit(1)
 
@@ -183,14 +219,7 @@ class Coordinator:
                 positions = self.portfolio.get_current_positions()
                 held_symbols = list(positions.keys())
 
-        # 4. Block new trades in bear regime
-        if not regime["allow_longs"]:
-            log.warning("BEAR REGIME — no new longs allowed")
-            self.portfolio.tracker.log_stats()
-            self._log_watcher_status()
-            return
-
-        # 5. Check position capacity
+        # 4. Check position capacity
         max_pos = self.config["signals"]["max_positions"]
         if len(held_symbols) >= max_pos:
             log.info(f"At max positions ({max_pos}). Skipping new entries.")
@@ -198,25 +227,43 @@ class Coordinator:
             self._log_watcher_status()
             return
 
-        # 6. Collect confirmed BUY signals from watchers
-        buy_signals = []
+        # 5. Collect confirmed signals from watchers (LONG + SHORT)
+        trade_signals = []
         for sym, watcher in self.watchers.items():
             if sym in held_symbols:
-                continue  # Already holding this stock
-            if watcher.state.action == Action.BUY and watcher.state.confirmed:
-                buy_signals.append(watcher)
+                continue
+            if not watcher.state.confirmed:
+                continue
 
-        if not buy_signals:
+            # Crypto is NOT gated by SPY regime — it trades independently
+            is_crypto = sym in CRYPTO_SYMBOLS
+
+            if watcher.state.action == Action.BUY:
+                if not is_crypto and not regime["allow_longs"]:
+                    continue  # Bear regime blocks stock longs only
+                trade_signals.append(watcher)
+
+            elif watcher.state.action == Action.SHORT:
+                # Shorts allowed in bear/chop regime, restricted in bull
+                if not is_crypto and regime["regime"] == "bull" and not self.config["signals"].get("allow_shorts_in_bull", False):
+                    continue
+                trade_signals.append(watcher)
+
+        if not trade_signals:
+            if not regime["allow_longs"]:
+                log.info("BEAR REGIME — scanning for shorts only")
             log.info("No confirmed signals from watchers")
             self.portfolio.tracker.log_stats()
             self._log_watcher_status()
             return
 
-        # Sort by score (best signals first)
-        buy_signals.sort(key=lambda w: w.state.score, reverse=True)
+        # Sort by absolute score (strongest signals first)
+        trade_signals.sort(key=lambda w: abs(w.state.score), reverse=True)
 
-        log.info(f"Confirmed signals from: "
-                 f"{[w.symbol for w in buy_signals]}")
+        longs = [w for w in trade_signals if w.state.action == Action.BUY]
+        shorts = [w for w in trade_signals if w.state.action == Action.SHORT]
+        log.info(f"Confirmed signals — Longs: {[w.symbol for w in longs]} "
+                 f"Shorts: {[w.symbol for w in shorts]}")
 
         # 7. Apply global filters
         # Sector cap
@@ -228,12 +275,12 @@ class Coordinator:
 
         # Gap filter + sector filter
         filtered = []
-        for watcher in buy_signals:
+        for watcher in trade_signals:
             sym = watcher.symbol
             bars = watcher.get_bars()
 
-            # Gap filter
-            if bars is not None and len(bars) >= 2 and "open" in bars.columns:
+            # Gap filter (skip for crypto — gaps are normal)
+            if sym not in CRYPTO_SYMBOLS and bars is not None and len(bars) >= 2 and "open" in bars.columns:
                 prev_close = float(bars["close"].iloc[-2])
                 today_open = float(bars["open"].iloc[-1])
                 gap_pct = abs(today_open - prev_close) / prev_close if prev_close > 0 else 0
@@ -256,6 +303,31 @@ class Coordinator:
             self._log_watcher_status()
             return
 
+        # 7b. Dynamic correlation filter
+        if held_symbols:
+            all_bars = {}
+            for w in filtered:
+                daily = self.data.get_bars([w.symbol], timeframe="1Day", days=60)
+                if w.symbol in daily:
+                    all_bars[w.symbol] = daily[w.symbol]
+            for sym in held_symbols:
+                if sym not in all_bars:
+                    daily = self.data.get_bars([sym], timeframe="1Day", days=60)
+                    if sym in daily:
+                        all_bars[sym] = daily[sym]
+
+            candidate_syms = [w.symbol for w in filtered]
+            passed_syms = self.filters.filter_correlated(
+                candidate_syms, held_symbols, all_bars
+            )
+            filtered = [w for w in filtered if w.symbol in passed_syms]
+
+            if not filtered:
+                log.info("No signals passed correlation filter")
+                self.portfolio.tracker.log_stats()
+                self._log_watcher_status()
+                return
+
         # 8. Size and execute orders
         slots_available = max_pos - len(held_symbols)
         cooldown_mult = self.filters.get_loss_cooldown_mult()
@@ -277,17 +349,53 @@ class Coordinator:
                 prices={sym: price},
                 equity=equity,
                 num_existing=len(held_symbols),
-                regime_size_mult=size_mult
+                regime_size_mult=size_mult,
+                tracker_stats=self.portfolio.tracker.get_stats(),
             )
 
             for order in orders:
                 try:
-                    self.broker.submit_bracket_order(
-                        symbol=order.symbol,
-                        qty=order.qty,
-                        side=order.side,
-                        take_profit=order.take_profit,
-                        stop_loss=order.stop_loss
+                    use_smart = self.config.get("execution", {}).get("smart_orders", False)
+
+                    if order.symbol in CRYPTO_SYMBOLS:
+                        self.broker.submit_crypto_order(
+                            symbol=order.symbol,
+                            qty=order.qty,
+                            side=order.side,
+                            take_profit=order.take_profit,
+                            stop_loss=order.stop_loss
+                        )
+                    elif use_smart:
+                        self.broker.submit_smart_order(
+                            symbol=order.symbol,
+                            qty=order.qty,
+                            side=order.side,
+                            take_profit=order.take_profit,
+                            stop_loss=order.stop_loss,
+                            limit_offset_pct=self.config.get("execution", {}).get(
+                                "limit_offset_pct", 0.0002),
+                            timeout_sec=self.config.get("execution", {}).get(
+                                "limit_timeout_sec", 30),
+                        )
+                    elif order.side == "sell":
+                        self.broker.submit_short_bracket(
+                            symbol=order.symbol,
+                            qty=order.qty,
+                            take_profit=order.take_profit,
+                            stop_loss=order.stop_loss
+                        )
+                    else:
+                        self.broker.submit_bracket_order(
+                            symbol=order.symbol,
+                            qty=order.qty,
+                            side=order.side,
+                            take_profit=order.take_profit,
+                            stop_loss=order.stop_loss
+                        )
+                    # Track position risk for R-multiple calculation
+                    self.portfolio.set_position_risk(
+                        order.symbol, order.entry_price,
+                        order.stop_loss, order.qty
                     )
                     log.info(
                         f"ORDER: {order.side} {order.qty} {order.symbol} "
@@ -296,9 +404,19 @@ class Coordinator:
                         f"regime={watcher.state.regime} "
                         f"confluence={watcher.state.num_agreeing}"
                     )
+                    self.alerts.send_trade_alert(
+                        side=order.side, qty=order.qty,
+                        symbol=order.symbol,
+                        entry_price=order.entry_price,
+                        stop_loss=order.stop_loss,
+                        take_profit=order.take_profit,
+                        regime=watcher.state.regime,
+                        confluence=watcher.state.num_agreeing,
+                    )
                     held_symbols.append(order.symbol)
                 except Exception as e:
                     log.error(f"Order failed for {sym}: {e}")
+                    self.alerts.send_error(f"Order failed for {sym}: {e}")
 
         # 9. Log stats
         self.portfolio.tracker.log_stats()
@@ -365,10 +483,11 @@ class Coordinator:
 def _make_opportunity(watcher: StockWatcher):
     """Convert a watcher's signal into an Opportunity for the risk manager."""
     from signals import Opportunity
+    direction = "sell" if watcher.state.action == Action.SHORT else "buy"
     return Opportunity(
         symbol=watcher.symbol,
         score=watcher.state.score,
-        direction="buy",
+        direction=direction,
         strategy_scores=watcher.state.strategy_scores,
         num_agreeing=watcher.state.num_agreeing
     )
