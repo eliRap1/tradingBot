@@ -252,6 +252,7 @@
 const $ = id => document.getElementById(id);
 const fmt = (n,d=2) => n==null?'--':Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const pnlC = n => n>=0?'pnl-pos':'pnl-neg';
+function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 
 const bearishCandles = ['shooting_star','bearish_engulfing','evening_star','three_black_crows','gravestone_doji','dark_cloud_cover'];
 
@@ -325,7 +326,7 @@ function update(data) {
     $('no-pos').style.display = pos.length?'none':'block';
     $('pos-body').innerHTML = pos.map(p=>`
         <tr>
-            <td><strong>${p.symbol}</strong></td>
+            <td><a href="/chart/${encodeURIComponent(p.symbol)}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(p.symbol)}</a></td>
             <td><span class="badge blue">${p.side}</span></td>
             <td>${p.qty}</td>
             <td>$${fmt(p.entry_price)}</td>
@@ -347,7 +348,7 @@ function update(data) {
             `<span class="badge ${t.regime==='trending'?'cyan':t.regime==='ranging'?'yellow':t.regime==='breakout'?'purple':'gray'}" title="${t.regime_reason}">${t.regime}</span>` : '-';
 
         return `<tr>
-            <td><span class="thread-indicator" style="background:${dotColor}"></span><strong>${t.symbol}</strong></td>
+            <td><span class="thread-indicator" style="background:${dotColor}"></span><a href="/chart/${encodeURIComponent(t.symbol)}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(t.symbol)}</a></td>
             <td>${statusBadge(t.status)}</td>
             <td>$${t.last_price?fmt(t.last_price):'-'}</td>
             <td><span class="score-cell" style="color:${scoreColor(t.score)}">${t.score.toFixed(3)}</span></td>

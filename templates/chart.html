@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ symbol }} - Bot Analysis</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e17; color: #e1e5eb; }
+
+        .top-bar {
+            background: #111827; padding: 10px 20px; display: flex;
+            justify-content: space-between; align-items: center;
+            border-bottom: 1px solid #1f2937;
+        }
+        .top-bar h1 { font-size: 16px; font-weight: 600; }
+        .top-bar a { color: #3b82f6; text-decoration: none; font-size: 13px; }
+        .top-bar a:hover { text-decoration: underline; }
+
+        .symbol-bar {
+            background: #111827; padding: 8px 20px; display: flex;
+            align-items: center; gap: 20px; border-bottom: 1px solid #1f2937;
+            flex-wrap: wrap;
+        }
+        .symbol-name { font-size: 22px; font-weight: 700; color: #f9fafb; }
+        .symbol-price { font-size: 20px; font-weight: 600; }
+        .symbol-change { font-size: 14px; font-weight: 500; }
+        .pos { color: #22c55e; } .neg { color: #ef4444; }
+
+        .info-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+        .pill {
+            display: inline-block; padding: 3px 10px; border-radius: 4px;
+            font-size: 11px; font-weight: 600; background: #1f2937; color: #9ca3af;
+        }
+        .pill.green { background: #052e16; color: #22c55e; }
+        .pill.red { background: #350a0a; color: #ef4444; }
+        .pill.yellow { background: #351f05; color: #eab308; }
+        .pill.blue { background: #0a1e35; color: #3b82f6; }
+        .pill.cyan { background: #0a2e35; color: #22d3ee; }
+        .pill.purple { background: #1e0a35; color: #a78bfa; }
+
+        .chart-controls {
+            background: #111827; padding: 6px 20px; display: flex;
+            gap: 6px; border-bottom: 1px solid #1f2937;
+        }
+        .tf-btn {
+            background: #1f2937; color: #9ca3af; border: none; padding: 4px 12px;
+            border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;
+        }
+        .tf-btn.active { background: #3b82f6; color: #fff; }
+        .tf-btn:hover { background: #374151; }
+        .toggle-btn {
+            background: #1f2937; color: #9ca3af; border: 1px solid #374151;
+            padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px;
+        }
+        .toggle-btn.on { background: #0a1e35; color: #3b82f6; border-color: #3b82f6; }
+
+        #main-chart { width: 100%; height: 55vh; }
+        #rsi-chart { width: 100%; height: 15vh; border-top: 1px solid #1f2937; }
+        #stoch-chart { width: 100%; height: 15vh; border-top: 1px solid #1f2937; }
+
+        .panel-row {
+            display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0;
+            border-top: 1px solid #1f2937;
+        }
+        .panel {
+            padding: 12px 20px; border-right: 1px solid #1f2937;
+        }
+        .panel:last-child { border-right: none; }
+        .panel h3 {
+            font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+            color: #6b7280; margin-bottom: 8px;
+        }
+        .strat-row {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 3px 0; font-size: 12px;
+        }
+        .strat-name { color: #9ca3af; }
+        .strat-score { font-weight: 600; font-family: monospace; }
+        .strat-bar {
+            width: 60px; height: 4px; background: #1f2937; border-radius: 2px;
+            display: inline-block; margin-left: 6px; vertical-align: middle;
+        }
+        .strat-bar-fill { height: 100%; border-radius: 2px; }
+
+        .trend-item { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
+        .trend-label { color: #6b7280; }
+        .trend-val { font-weight: 600; }
+
+        .candle-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+        .candle-tag {
+            display: inline-block; padding: 2px 7px; border-radius: 3px;
+            font-size: 10px; font-weight: 500;
+        }
+        .candle-tag.bull { background: #052e16; color: #22c55e; }
+        .candle-tag.bear { background: #350a0a; color: #ef4444; }
+
+        .symbol-nav { display: flex; gap: 4px; align-items: center; }
+        .symbol-nav a {
+            padding: 3px 8px; border-radius: 4px; font-size: 11px;
+            background: #1f2937; color: #9ca3af; text-decoration: none;
+        }
+        .symbol-nav a:hover { background: #374151; color: #f9fafb; }
+        .symbol-nav a.current { background: #3b82f6; color: #fff; }
+    </style>
+</head>
+<body>
+
+<div class="top-bar">
+    <div style="display:flex;align-items:center;gap:16px">
+        <h1>Bot Analysis</h1>
+        <a href="/">&larr; Dashboard</a>
+    </div>
+    <div class="symbol-nav" id="symbol-nav"></div>
+</div>
+
+<div class="symbol-bar">
+    <span class="symbol-name" id="sym-name">{{ symbol }}</span>
+    <span class="symbol-price" id="sym-price">--</span>
+    <span class="symbol-change" id="sym-change">--</span>
+    <div class="info-pills" id="info-pills"></div>
+</div>
+
+<div class="chart-controls">
+    <button class="tf-btn active" data-tf="daily" onclick="switchTF('daily',this)">1D</button>
+    <button class="tf-btn" data-tf="5min" onclick="switchTF('5min',this)">5m</button>
+    <span style="color:#374151;margin:0 4px">|</span>
+    <button class="toggle-btn on" id="tog-st" onclick="toggleLayer('st')">SuperTrend</button>
+    <button class="toggle-btn on" id="tog-ema20" onclick="toggleLayer('ema20')">EMA 20</button>
+    <button class="toggle-btn on" id="tog-ema50" onclick="toggleLayer('ema50')">EMA 50</button>
+    <button class="toggle-btn on" id="tog-ema200" onclick="toggleLayer('ema200')">EMA 200</button>
+    <button class="toggle-btn on" id="tog-vwap" onclick="toggleLayer('vwap')">VWAP</button>
+    <button class="toggle-btn on" id="tog-vol" onclick="toggleLayer('vol')">Volume</button>
+</div>
+
+<div id="main-chart"></div>
+<div id="rsi-chart"></div>
+<div id="stoch-chart"></div>
+
+<div class="panel-row">
+    <div class="panel">
+        <h3>Strategy Scores</h3>
+        <div id="strat-panel"></div>
+    </div>
+    <div class="panel">
+        <h3>Trend Context</h3>
+        <div id="trend-panel"></div>
+    </div>
+    <div class="panel">
+        <h3>Candle Patterns</h3>
+        <div id="candle-panel"></div>
+    </div>
+</div>
+
+<script>
+const SYMBOL = "{{ symbol }}";
+let chartData = null;
+let currentTF = "daily";
+
+const layers = { st: true, ema20: true, ema50: true, ema200: true, vwap: true, vol: true };
+
+let mainChart, rsiChart, stochChart;
+let candleSeries, volumeSeries, stSeries, ema20Series, ema50Series, ema200Series, vwapSeries;
+let rsiSeries, stochKSeries, stochDSeries;
+let rsiOBSeries, rsiOSSeries, stochOBSeries, stochOSSeries;
+
+const bearishCandles = ['shooting_star','bearish_engulfing','evening_star','three_black_crows','gravestone_doji','dark_cloud_cover'];
+
+function escapeText(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.textContent;
+}
+
+function createCharts() {
+    const opts = {
+        layout: { background: { color: '#0a0e17' }, textColor: '#9ca3af' },
+        grid: { vertLines: { color: '#1f293744' }, horzLines: { color: '#1f293744' } },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        timeScale: { borderColor: '#1f2937', timeVisible: true },
+        rightPriceScale: { borderColor: '#1f2937' },
+    };
+
+    mainChart = LightweightCharts.createChart(document.getElementById('main-chart'), opts);
+    candleSeries = mainChart.addCandlestickSeries({
+        upColor: '#22c55e', downColor: '#ef4444',
+        borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+        wickUpColor: '#22c55e88', wickDownColor: '#ef444488',
+    });
+    volumeSeries = mainChart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol' });
+    mainChart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+
+    stSeries = mainChart.addLineSeries({ lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+    ema20Series = mainChart.addLineSeries({ color: '#f59e0b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    ema50Series = mainChart.addLineSeries({ color: '#3b82f6', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    ema200Series = mainChart.addLineSeries({ color: '#a78bfa', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    vwapSeries = mainChart.addLineSeries({ color: '#22d3ee', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+
+    rsiChart = LightweightCharts.createChart(document.getElementById('rsi-chart'), {
+        ...opts, rightPriceScale: { ...opts.rightPriceScale, scaleMargins: { top: 0.1, bottom: 0.1 } },
+    });
+    rsiSeries = rsiChart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, priceLineVisible: false });
+    rsiOBSeries = rsiChart.addLineSeries({ color: '#ef444444', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+    rsiOSSeries = rsiChart.addLineSeries({ color: '#22c55e44', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+
+    stochChart = LightweightCharts.createChart(document.getElementById('stoch-chart'), {
+        ...opts, rightPriceScale: { ...opts.rightPriceScale, scaleMargins: { top: 0.1, bottom: 0.1 } },
+    });
+    stochKSeries = stochChart.addLineSeries({ color: '#3b82f6', lineWidth: 1.5, priceLineVisible: false });
+    stochDSeries = stochChart.addLineSeries({ color: '#ef4444', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+    stochOBSeries = stochChart.addLineSeries({ color: '#ef444433', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+    stochOSSeries = stochChart.addLineSeries({ color: '#22c55e33', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+
+    // Sync time scales
+    mainChart.timeScale().subscribeVisibleLogicalRangeChange(function(range) {
+        if (range) { rsiChart.timeScale().setVisibleLogicalRange(range); stochChart.timeScale().setVisibleLogicalRange(range); }
+    });
+    rsiChart.timeScale().subscribeVisibleLogicalRangeChange(function(range) {
+        if (range) { mainChart.timeScale().setVisibleLogicalRange(range); stochChart.timeScale().setVisibleLogicalRange(range); }
+    });
+}
+
+function renderChart(data) {
+    const candles = currentTF === '5min' && data.intraday_candles.length > 0
+        ? data.intraday_candles : data.candles;
+    candleSeries.setData(candles);
+
+    if (currentTF === 'daily' && layers.vol) { volumeSeries.setData(data.volumes); } else { volumeSeries.setData([]); }
+    if (layers.st && data.supertrend.length > 0) { stSeries.setData(data.supertrend); } else { stSeries.setData([]); }
+    if (layers.ema20 && data.emas.ema20) { ema20Series.setData(data.emas.ema20); } else { ema20Series.setData([]); }
+    if (layers.ema50 && data.emas.ema50) { ema50Series.setData(data.emas.ema50); } else { ema50Series.setData([]); }
+    if (layers.ema200 && data.emas.ema200) { ema200Series.setData(data.emas.ema200); } else { ema200Series.setData([]); }
+    if (layers.vwap && data.vwap.length > 0) { vwapSeries.setData(data.vwap); } else { vwapSeries.setData([]); }
+
+    if (data.markers.length > 0) { candleSeries.setMarkers(data.markers); }
+
+    if (data.rsi.length > 0) {
+        rsiSeries.setData(data.rsi);
+        var times = data.rsi.map(function(p) { return { time: p.time, value: 70 }; });
+        var timesOS = data.rsi.map(function(p) { return { time: p.time, value: 30 }; });
+        rsiOBSeries.setData(times);
+        rsiOSSeries.setData(timesOS);
+    }
+    if (data.stoch_k.length > 0) {
+        stochKSeries.setData(data.stoch_k);
+        stochDSeries.setData(data.stoch_d);
+        var stTimes = data.stoch_k.map(function(p) { return { time: p.time, value: 80 }; });
+        var stTimesOS = data.stoch_k.map(function(p) { return { time: p.time, value: 20 }; });
+        stochOBSeries.setData(stTimes);
+        stochOSSeries.setData(stTimesOS);
+    }
+
+    mainChart.timeScale().fitContent();
+    rsiChart.timeScale().fitContent();
+    stochChart.timeScale().fitContent();
+}
+
+function scoreColor(v) {
+    if (v > 0.3) return '#22c55e';
+    if (v > 0) return '#86efac';
+    if (v < -0.1) return '#ef4444';
+    return '#6b7280';
+}
+
+function updateInfo(data) {
+    var candles = data.candles;
+    if (candles.length > 0) {
+        var last = candles[candles.length - 1];
+        var prev = candles.length > 1 ? candles[candles.length - 2] : last;
+        var change = last.close - prev.close;
+        var changePct = (change / prev.close * 100);
+        var priceEl = document.getElementById('sym-price');
+        priceEl.textContent = '$' + last.close.toFixed(2);
+        priceEl.className = 'symbol-price ' + (change >= 0 ? 'pos' : 'neg');
+        var changeEl = document.getElementById('sym-change');
+        changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(2) + ' (' + changePct.toFixed(2) + '%)';
+        changeEl.className = 'symbol-change ' + (change >= 0 ? 'pos' : 'neg');
+    }
+
+    // Info pills - built safely with DOM
+    var pillsEl = document.getElementById('info-pills');
+    pillsEl.textContent = '';
+    var w = data.watcher || {};
+
+    function addPill(text, cls) {
+        var span = document.createElement('span');
+        span.className = 'pill ' + cls;
+        span.textContent = text;
+        pillsEl.appendChild(span);
+    }
+
+    if (w.status) addPill(w.status.toUpperCase(), w.confirmed ? 'green' : 'blue');
+    if (w.action && w.action !== 'hold') {
+        var ac = w.action === 'buy' ? 'green' : w.action === 'short' ? 'red' : 'yellow';
+        addPill(w.action.toUpperCase() + ' (' + w.score.toFixed(2) + ')', ac);
+    }
+    if (w.num_agreeing !== undefined) addPill('Confluence: ' + w.num_agreeing + '/5', w.num_agreeing >= 3 ? 'green' : 'yellow');
+    if (w.regime) addPill(w.regime, 'cyan');
+    if (w.trend) addPill('Trend: ' + w.trend, w.trend === 'up' ? 'green' : w.trend === 'down' ? 'red' : 'yellow');
+    if (w.adx) addPill('ADX: ' + w.adx.toFixed(1), '');
+    if (w.above_200ema !== undefined) addPill((w.above_200ema ? 'Above' : 'Below') + ' 200 EMA', w.above_200ema ? 'green' : 'red');
+    if (w.above_vwap !== undefined) addPill((w.above_vwap ? 'Above' : 'Below') + ' VWAP', w.above_vwap ? 'green' : 'red');
+
+    // Strategy scores - built safely with DOM
+    var stratPanel = document.getElementById('strat-panel');
+    stratPanel.textContent = '';
+    var strats = [['supertrend','SuperTrend'],['momentum','Momentum'],['mean_reversion','Mean Rev'],['breakout','Breakout'],['stoch_rsi','Stoch RSI']];
+    var scores = w.strategy_scores || {};
+    var weights = w.strategy_weights || {};
+    var hasScores = false;
+
+    strats.forEach(function(pair) {
+        var key = pair[0], label = pair[1];
+        var sc = scores[key] || 0;
+        var wt = weights[key] || 0;
+        if (wt > 0 || sc !== 0) hasScores = true;
+
+        var row = document.createElement('div');
+        row.className = 'strat-row';
+
+        var nameSpan = document.createElement('span');
+        nameSpan.className = 'strat-name';
+        nameSpan.textContent = label + ' (' + (wt * 100).toFixed(0) + '%)';
+
+        var rightSpan = document.createElement('span');
+        var scoreSpan = document.createElement('span');
+        scoreSpan.className = 'strat-score';
+        scoreSpan.style.color = scoreColor(sc);
+        scoreSpan.textContent = sc.toFixed(3);
+
+        var barOuter = document.createElement('span');
+        barOuter.className = 'strat-bar';
+        var barFill = document.createElement('span');
+        barFill.className = 'strat-bar-fill';
+        barFill.style.width = Math.min(Math.abs(sc) * 100, 60) + 'px';
+        barFill.style.background = sc >= 0 ? '#22c55e' : '#ef4444';
+        barOuter.appendChild(barFill);
+
+        rightSpan.appendChild(scoreSpan);
+        rightSpan.appendChild(barOuter);
+        row.appendChild(nameSpan);
+        row.appendChild(rightSpan);
+        stratPanel.appendChild(row);
+    });
+
+    if (!hasScores) {
+        stratPanel.textContent = 'No watcher data (stock may not be in universe)';
+        stratPanel.style.color = '#4b5563';
+        stratPanel.style.fontSize = '12px';
+    }
+
+    // Trend context - built safely with DOM
+    var trendPanel = document.getElementById('trend-panel');
+    trendPanel.textContent = '';
+    var t = data.trend || {};
+    var trendItems = [
+        ['Trend', t.trend_direction || '--', t.trend_direction === 'up' ? 'pos' : t.trend_direction === 'down' ? 'neg' : ''],
+        ['ADX', t.adx ? t.adx.toFixed(1) : '--', ''],
+        ['RSI', t.rsi ? t.rsi.toFixed(1) : '--', ''],
+        ['Above 200 EMA', t.above_200ema !== undefined ? (t.above_200ema ? 'Yes' : 'No') : '--', t.above_200ema ? 'pos' : 'neg'],
+        ['Above VWAP', t.above_vwap !== undefined ? (t.above_vwap ? 'Yes' : 'No') : '--', t.above_vwap ? 'pos' : 'neg'],
+        ['Weekly Up', t.weekly_trend_up !== undefined ? (t.weekly_trend_up ? 'Yes' : 'No') : '--', t.weekly_trend_up ? 'pos' : 'neg'],
+    ];
+    trendItems.forEach(function(item) {
+        var div = document.createElement('div');
+        div.className = 'trend-item';
+        var lbl = document.createElement('span');
+        lbl.className = 'trend-label';
+        lbl.textContent = item[0];
+        var val = document.createElement('span');
+        val.className = 'trend-val ' + item[2];
+        val.textContent = item[1];
+        div.appendChild(lbl);
+        div.appendChild(val);
+        trendPanel.appendChild(div);
+    });
+
+    // Candle patterns - built safely with DOM
+    var candlePanel = document.getElementById('candle-panel');
+    candlePanel.textContent = '';
+    var patterns = w.candle_patterns || [];
+    if (patterns.length > 0) {
+        var tagsDiv = document.createElement('div');
+        tagsDiv.className = 'candle-tags';
+        patterns.forEach(function(p) {
+            var tag = document.createElement('span');
+            tag.className = 'candle-tag ' + (bearishCandles.indexOf(p) >= 0 ? 'bear' : 'bull');
+            tag.textContent = p.replace(/_/g, ' ');
+            tagsDiv.appendChild(tag);
+        });
+        candlePanel.appendChild(tagsDiv);
+    } else {
+        candlePanel.textContent = 'No patterns detected';
+        candlePanel.style.color = '#4b5563';
+        candlePanel.style.fontSize = '12px';
+    }
+}
+
+function switchTF(tf, btn) {
+    currentTF = tf;
+    document.querySelectorAll('.tf-btn').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+    if (chartData) renderChart(chartData);
+}
+
+function toggleLayer(name) {
+    layers[name] = !layers[name];
+    document.getElementById('tog-' + name).classList.toggle('on', layers[name]);
+    if (chartData) renderChart(chartData);
+}
+
+async function loadChart() {
+    try {
+        var resp = await fetch('/api/chart/' + encodeURIComponent(SYMBOL));
+        if (!resp.ok) return;
+        chartData = await resp.json();
+        renderChart(chartData);
+        updateInfo(chartData);
+    } catch (e) { console.error('Failed to load chart:', e); }
+}
+
+async function loadSymbolNav() {
+    try {
+        var resp = await fetch('/api/state');
+        var state = await resp.json();
+        var allSyms = new Set();
+        (state.watchers || []).forEach(function(w) { allSyms.add(w.symbol); });
+        (state.positions || []).forEach(function(p) { allSyms.add(p.symbol); });
+        var nav = document.getElementById('symbol-nav');
+        nav.textContent = '';
+        Array.from(allSyms).sort().forEach(function(s) {
+            var a = document.createElement('a');
+            a.href = '/chart/' + encodeURIComponent(s);
+            a.textContent = s;
+            if (s === SYMBOL) a.className = 'current';
+            nav.appendChild(a);
+        });
+    } catch (e) {}
+}
+
+createCharts();
+loadChart();
+loadSymbolNav();
+setInterval(loadChart, 30000);
+
+window.addEventListener('resize', function() {
+    mainChart.applyOptions({ width: window.innerWidth });
+    rsiChart.applyOptions({ width: window.innerWidth });
+    stochChart.applyOptions({ width: window.innerWidth });
+});
+</script>
+</body>
+</html>

@@ -219,10 +219,16 @@ class Coordinator:
                 positions = self.portfolio.get_current_positions()
                 held_symbols = list(positions.keys())
 
-        # 4. Check position capacity
+        # 4. Check position capacity (crypto has separate slots)
         max_pos = self.config["signals"]["max_positions"]
-        if len(held_symbols) >= max_pos:
-            log.info(f"At max positions ({max_pos}). Skipping new entries.")
+        stock_positions = [s for s in held_symbols if s not in CRYPTO_SYMBOLS]
+        crypto_positions = [s for s in held_symbols if s in CRYPTO_SYMBOLS]
+        max_crypto = self.config["signals"].get("max_crypto_positions", 2)
+        stocks_full = len(stock_positions) >= max_pos
+        crypto_full = len(crypto_positions) >= max_crypto
+        if stocks_full and crypto_full:
+            log.info(f"At max positions (stocks={len(stock_positions)}/{max_pos}, "
+                     f"crypto={len(crypto_positions)}/{max_crypto}). Skipping new entries.")
             self.portfolio.tracker.log_stats()
             self._log_watcher_status()
             return
@@ -328,12 +334,24 @@ class Coordinator:
                 self._log_watcher_status()
                 return
 
-        # 8. Size and execute orders
-        slots_available = max_pos - len(held_symbols)
+        # 8. Size and execute orders (separate slots for stocks vs crypto)
+        stock_slots = max_pos - len(stock_positions) if not stocks_full else 0
+        crypto_slots = max_crypto - len(crypto_positions) if not crypto_full else 0
         cooldown_mult = self.filters.get_loss_cooldown_mult()
         size_mult = regime["size_multiplier"] * cooldown_mult
 
-        for watcher in filtered[:slots_available]:
+        # Filter by available slots per type
+        executable = []
+        for w in filtered:
+            is_crypto = w.symbol in CRYPTO_SYMBOLS
+            if is_crypto and crypto_slots > 0:
+                executable.append(w)
+                crypto_slots -= 1
+            elif not is_crypto and stock_slots > 0:
+                executable.append(w)
+                stock_slots -= 1
+
+        for watcher in executable:
             sym = watcher.symbol
             bars = watcher.get_bars()
             if bars is None:

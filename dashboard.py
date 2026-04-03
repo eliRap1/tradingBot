@@ -210,6 +210,184 @@ def api_refresh():
     return jsonify({"ok": True})
 
 
+@app.route("/chart/<symbol>")
+def chart_page(symbol):
+    return render_template("chart.html", symbol=symbol)
+
+
+@app.route("/api/chart/<symbol>")
+def api_chart(symbol):
+    """Return OHLCV + indicator data for TradingView lightweight-charts."""
+    from indicators import supertrend, stochastic_rsi
+    from trend import get_trend_context
+
+    days = int(os.environ.get("CHART_DAYS", 120))
+
+    # Fetch daily bars
+    daily = _data.get_bars([symbol], timeframe="1Day", days=days)
+    if symbol not in daily or daily[symbol].empty:
+        return jsonify({"error": "No data"}), 404
+    df = daily[symbol]
+
+    # Fetch 5-min bars
+    intraday = _data.get_intraday_bars(symbol, timeframe="5Min", days=5)
+
+    # Build OHLCV for daily chart
+    candles = []
+    for ts, row in df.iterrows():
+        t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+        candles.append({
+            "time": t,
+            "open": round(float(row["open"]), 2),
+            "high": round(float(row["high"]), 2),
+            "low": round(float(row["low"]), 2),
+            "close": round(float(row["close"]), 2),
+        })
+    volumes = []
+    for ts, row in df.iterrows():
+        t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+        color = "rgba(38,166,154,0.5)" if row["close"] >= row["open"] else "rgba(239,83,80,0.5)"
+        volumes.append({"time": t, "value": int(row["volume"]), "color": color})
+
+    # Build 5-min candles
+    intraday_candles = []
+    if intraday is not None and not intraday.empty:
+        for ts, row in intraday.iterrows():
+            t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+            intraday_candles.append({
+                "time": t,
+                "open": round(float(row["open"]), 2),
+                "high": round(float(row["high"]), 2),
+                "low": round(float(row["low"]), 2),
+                "close": round(float(row["close"]), 2),
+            })
+
+    # SuperTrend overlay
+    st_line = []
+    if len(df) >= 20:
+        st_df = supertrend(df, period=10, multiplier=3.0)
+        for ts, row in st_df.iterrows():
+            t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+            val = float(row.get("supertrend", 0))
+            direction = int(row.get("supertrend_direction", 0))
+            if val > 0:
+                st_line.append({
+                    "time": t,
+                    "value": round(val, 2),
+                    "color": "#22c55e" if direction == 1 else "#ef4444",
+                })
+
+    # EMAs (20, 50, 200)
+    ema_data = {}
+    for period in [20, 50, 200]:
+        if len(df) >= period:
+            ema = df["close"].ewm(span=period, adjust=False).mean()
+            series = []
+            for ts, val in ema.items():
+                t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+                series.append({"time": t, "value": round(float(val), 2)})
+            ema_data[f"ema{period}"] = series
+
+    # VWAP
+    vwap_line = []
+    if "vwap" in df.columns:
+        for ts, row in df.iterrows():
+            t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+            vwap_val = float(row["vwap"])
+            if vwap_val > 0:
+                vwap_line.append({"time": t, "value": round(vwap_val, 2)})
+
+    # StochRSI (for lower pane)
+    stoch_k = []
+    stoch_d = []
+    if len(df) >= 30:
+        k, d = stochastic_rsi(df)
+        for i, ts in enumerate(df.index):
+            t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+            if i < len(k) and not np.isnan(k.iloc[i]):
+                stoch_k.append({"time": t, "value": round(float(k.iloc[i]), 2)})
+            if i < len(d) and not np.isnan(d.iloc[i]):
+                stoch_d.append({"time": t, "value": round(float(d.iloc[i]), 2)})
+
+    # RSI
+    rsi_line = []
+    if len(df) >= 15:
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        for ts, val in rsi.items():
+            t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+            if not np.isnan(val):
+                rsi_line.append({"time": t, "value": round(float(val), 2)})
+
+    # Signal markers from watcher
+    markers = []
+    if symbol in _watchers:
+        w = _watchers[symbol]
+        s = w.state
+        if s.confirmed and s.last_price > 0:
+            last_ts = candles[-1]["time"] if candles else 0
+            if s.action.value == "buy":
+                markers.append({
+                    "time": last_ts, "position": "belowBar",
+                    "color": "#22c55e", "shape": "arrowUp",
+                    "text": f"BUY {s.score:.2f} ({s.num_agreeing}/5)"
+                })
+            elif s.action.value == "short":
+                markers.append({
+                    "time": last_ts, "position": "aboveBar",
+                    "color": "#ef4444", "shape": "arrowDown",
+                    "text": f"SHORT {s.score:.2f} ({s.num_agreeing}/5)"
+                })
+
+    # Trend context
+    trend_ctx = {}
+    try:
+        trend_ctx = get_trend_context(df)
+        trend_ctx = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
+                     for k, v in trend_ctx.items()}
+    except Exception:
+        pass
+
+    # Watcher state
+    watcher_info = {}
+    if symbol in _watchers:
+        s = _watchers[symbol].state
+        watcher_info = {
+            "status": s.status,
+            "score": float(s.score),
+            "num_agreeing": s.num_agreeing,
+            "confirmed": bool(s.confirmed),
+            "action": s.action.value if s.action else "hold",
+            "regime": s.regime,
+            "candle_patterns": list(s.candle_patterns),
+            "strategy_scores": {k: float(v) for k, v in s.strategy_scores.items()},
+            "strategy_weights": {k: float(v) for k, v in s.strategy_weights.items()},
+            "adx": float(s.adx),
+            "trend": s.trend_direction,
+            "above_200ema": bool(s.above_200ema),
+            "above_vwap": bool(s.above_vwap),
+        }
+
+    return jsonify({
+        "symbol": symbol,
+        "candles": candles,
+        "volumes": volumes,
+        "intraday_candles": intraday_candles,
+        "supertrend": st_line,
+        "emas": ema_data,
+        "vwap": vwap_line,
+        "stoch_k": stoch_k,
+        "stoch_d": stoch_d,
+        "rsi": rsi_line,
+        "markers": markers,
+        "trend": trend_ctx,
+        "watcher": watcher_info,
+    })
+
+
 # ── Main ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
