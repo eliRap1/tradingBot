@@ -313,7 +313,7 @@ def api_chart(symbol):
     stoch_k = []
     stoch_d = []
     if len(df) >= 30:
-        k, d = stochastic_rsi(df)
+        k, d = stochastic_rsi(df["close"])
         for i, ts in enumerate(df.index):
             t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
             if i < len(k) and not np.isnan(k.iloc[i]):
