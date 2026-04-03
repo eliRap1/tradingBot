@@ -504,6 +504,9 @@ def api_chart(symbol):
     # Fetch 5-min bars
     intraday = _data.get_intraday_bars(symbol, timeframe="5Min", days=5)
 
+    # Deduplicate daily data
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+
     # Build OHLCV for daily chart
     candles = []
     for ts, row in df.iterrows():
@@ -521,10 +524,16 @@ def api_chart(symbol):
         color = "rgba(38,166,154,0.5)" if row["close"] >= row["open"] else "rgba(239,83,80,0.5)"
         volumes.append({"time": t, "value": int(row["volume"]), "color": color})
 
-    # Build 5-min candles
+    # Build 5-min candles + volume + indicators
     intraday_candles = []
+    intraday_volumes = []
+    intraday_emas = {}
+    intraday_st = []
     if intraday is not None and not intraday.empty:
-        for ts, row in intraday.iterrows():
+        # Deduplicate and sort
+        idf = intraday[~intraday.index.duplicated(keep='last')].sort_index()
+
+        for ts, row in idf.iterrows():
             t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
             intraday_candles.append({
                 "time": t,
@@ -533,6 +542,34 @@ def api_chart(symbol):
                 "low": round(float(row["low"]), 2),
                 "close": round(float(row["close"]), 2),
             })
+            color = "rgba(38,166,154,0.5)" if row["close"] >= row["open"] else "rgba(239,83,80,0.5)"
+            intraday_volumes.append({"time": t, "value": int(row["volume"]), "color": color})
+
+        # 5-min EMAs
+        for period in [9, 21, 50]:
+            if len(idf) >= period:
+                ema = idf["close"].ewm(span=period, adjust=False).mean()
+                series = []
+                for ts, val in ema.items():
+                    t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+                    series.append({"time": t, "value": round(float(val), 2)})
+                intraday_emas[f"ema{period}"] = series
+
+        # 5-min SuperTrend
+        if len(idf) >= 20:
+            try:
+                st_vals, st_dir = supertrend(idf, period=10, multiplier=3.0)
+                for i, ts in enumerate(idf.index):
+                    t = int(ts.timestamp()) if hasattr(ts, 'timestamp') else int(pd.Timestamp(ts).timestamp())
+                    val = float(st_vals.iloc[i])
+                    dirn = int(st_dir.iloc[i])
+                    if val > 0:
+                        intraday_st.append({
+                            "time": t, "value": round(val, 2),
+                            "color": "#22c55e" if dirn == 1 else "#ef4444",
+                        })
+            except Exception:
+                pass
 
     # SuperTrend overlay
     st_line = []
@@ -697,6 +734,9 @@ def api_chart(symbol):
         "candles": candles,
         "volumes": volumes,
         "intraday_candles": intraday_candles,
+        "intraday_volumes": intraday_volumes,
+        "intraday_emas": intraday_emas,
+        "intraday_st": intraday_st,
         "supertrend": st_line,
         "emas": ema_data,
         "vwap": vwap_line,

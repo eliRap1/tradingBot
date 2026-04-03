@@ -282,33 +282,57 @@ function createCharts() {
 }
 
 function renderChart(data) {
-    const candles = currentTF === '5min' && data.intraday_candles.length > 0
-        ? data.intraday_candles : data.candles;
+    var is5m = currentTF === '5min' && data.intraday_candles.length > 0;
+    var candles = is5m ? data.intraday_candles : data.candles;
     candleSeries.setData(candles);
 
-    if (currentTF === 'daily' && layers.vol) { volumeSeries.setData(data.volumes); } else { volumeSeries.setData([]); }
-    if (layers.st && data.supertrend.length > 0) { stSeries.setData(data.supertrend); } else { stSeries.setData([]); }
-    if (layers.ema20 && data.emas.ema20) { ema20Series.setData(data.emas.ema20); } else { ema20Series.setData([]); }
-    if (layers.ema50 && data.emas.ema50) { ema50Series.setData(data.emas.ema50); } else { ema50Series.setData([]); }
-    if (layers.ema200 && data.emas.ema200) { ema200Series.setData(data.emas.ema200); } else { ema200Series.setData([]); }
-    if (layers.vwap && data.vwap.length > 0) { vwapSeries.setData(data.vwap); } else { vwapSeries.setData([]); }
+    // Volume: use intraday volumes for 5-min
+    if (layers.vol) {
+        var vols = is5m ? (data.intraday_volumes || []) : data.volumes;
+        volumeSeries.setData(vols);
+    } else {
+        volumeSeries.setData([]);
+    }
+
+    // Overlays: use intraday-specific data in 5-min mode
+    if (is5m) {
+        // 5-min SuperTrend
+        if (layers.st && data.intraday_st && data.intraday_st.length > 0) {
+            stSeries.setData(data.intraday_st);
+        } else { stSeries.setData([]); }
+        // 5-min EMAs (9, 21, 50 instead of 20, 50, 200)
+        var ie = data.intraday_emas || {};
+        if (layers.ema20 && ie.ema9) { ema20Series.setData(ie.ema9); } else { ema20Series.setData([]); }
+        if (layers.ema50 && ie.ema21) { ema50Series.setData(ie.ema21); } else { ema50Series.setData([]); }
+        if (layers.ema200 && ie.ema50) { ema200Series.setData(ie.ema50); } else { ema200Series.setData([]); }
+        // No daily VWAP on 5-min
+        vwapSeries.setData([]);
+    } else {
+        // Daily overlays
+        if (layers.st && data.supertrend.length > 0) { stSeries.setData(data.supertrend); } else { stSeries.setData([]); }
+        if (layers.ema20 && data.emas.ema20) { ema20Series.setData(data.emas.ema20); } else { ema20Series.setData([]); }
+        if (layers.ema50 && data.emas.ema50) { ema50Series.setData(data.emas.ema50); } else { ema50Series.setData([]); }
+        if (layers.ema200 && data.emas.ema200) { ema200Series.setData(data.emas.ema200); } else { ema200Series.setData([]); }
+        if (layers.vwap && data.vwap.length > 0) { vwapSeries.setData(data.vwap); } else { vwapSeries.setData([]); }
+    }
 
     if (data.markers.length > 0) { candleSeries.setMarkers(data.markers); }
 
-    if (data.rsi.length > 0) {
+    // RSI + StochRSI (daily only for now)
+    if (!is5m && data.rsi.length > 0) {
         rsiSeries.setData(data.rsi);
-        var times = data.rsi.map(function(p) { return { time: p.time, value: 70 }; });
-        var timesOS = data.rsi.map(function(p) { return { time: p.time, value: 30 }; });
-        rsiOBSeries.setData(times);
-        rsiOSSeries.setData(timesOS);
+        rsiOBSeries.setData(data.rsi.map(function(p) { return { time: p.time, value: 70 }; }));
+        rsiOSSeries.setData(data.rsi.map(function(p) { return { time: p.time, value: 30 }; }));
+    } else {
+        rsiSeries.setData([]); rsiOBSeries.setData([]); rsiOSSeries.setData([]);
     }
-    if (data.stoch_k.length > 0) {
+    if (!is5m && data.stoch_k.length > 0) {
         stochKSeries.setData(data.stoch_k);
         stochDSeries.setData(data.stoch_d);
-        var stTimes = data.stoch_k.map(function(p) { return { time: p.time, value: 80 }; });
-        var stTimesOS = data.stoch_k.map(function(p) { return { time: p.time, value: 20 }; });
-        stochOBSeries.setData(stTimes);
-        stochOSSeries.setData(stTimesOS);
+        stochOBSeries.setData(data.stoch_k.map(function(p) { return { time: p.time, value: 80 }; }));
+        stochOSSeries.setData(data.stoch_k.map(function(p) { return { time: p.time, value: 20 }; }));
+    } else {
+        stochKSeries.setData([]); stochDSeries.setData([]); stochOBSeries.setData([]); stochOSSeries.setData([]);
     }
 
     mainChart.timeScale().fitContent();
@@ -572,6 +596,16 @@ function switchTF(tf, btn) {
     currentTF = tf;
     document.querySelectorAll('.tf-btn').forEach(function(b) { b.classList.remove('active'); });
     btn.classList.add('active');
+    // Update EMA labels for timeframe
+    if (tf === '5min') {
+        document.getElementById('tog-ema20').textContent = 'EMA 9';
+        document.getElementById('tog-ema50').textContent = 'EMA 21';
+        document.getElementById('tog-ema200').textContent = 'EMA 50';
+    } else {
+        document.getElementById('tog-ema20').textContent = 'EMA 20';
+        document.getElementById('tog-ema50').textContent = 'EMA 50';
+        document.getElementById('tog-ema200').textContent = 'EMA 200';
+    }
     if (chartData) renderChart(chartData);
 }
 
