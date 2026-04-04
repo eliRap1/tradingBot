@@ -8,6 +8,7 @@ Responsibilities:
   - Execute trades when watchers report confirmed signals
   - Manage existing positions (trailing stops, exits)
   - Apply profit maximization enhancements
+  - ENSURE LIVE TRADING with real-time data validation
 """
 
 import time
@@ -26,6 +27,8 @@ from filters import SmartFilters
 from watcher import StockWatcher, Action
 from alerts import AlertManager
 from profit_maximizer import ProfitMaximizer, AdaptiveExitManager
+from live_trading import LiveTradingManager, DataFreshnessValidator, ensure_live_trading_mode
+from walk_forward_optimizer import apply_optimized_params
 
 log = setup_logger("coordinator")
 
@@ -36,10 +39,19 @@ class Coordinator:
 
     def __init__(self):
         log.info("=" * 60)
-        log.info("TRADING BOT STARTING (Threaded Architecture)")
+        log.info("TRADING BOT STARTING (LIVE TRADING MODE)")
         log.info("=" * 60)
+        
+        # Verify we're in live/paper mode, not backtest
+        if not ensure_live_trading_mode():
+            log.error("Invalid trading mode - exiting")
+            sys.exit(1)
 
         self.config = load_config()
+        
+        # Apply optimized parameters if available
+        self.config = apply_optimized_params(self.config)
+        
         self.broker = Broker(self.config)
         self.data = DataFetcher(self.broker)
         self.screener = Screener(self.config, self.data)
@@ -52,6 +64,10 @@ class Coordinator:
         # Profit maximization modules
         self.profit_max = ProfitMaximizer(self.config)
         self.exit_manager = AdaptiveExitManager(self.config)
+        
+        # LIVE TRADING: Real-time data validation
+        self.live_manager = LiveTradingManager(self.broker)
+        self.freshness_validator = DataFreshnessValidator()
 
         # Watcher threads: {symbol: StockWatcher}
         self.watchers: dict[str, StockWatcher] = {}
@@ -60,7 +76,7 @@ class Coordinator:
         # Order rate limiter: track timestamps of recent orders
         self._order_timestamps: list[float] = []
 
-        # Verify connection
+        # Verify connection and show market status
         account = self.broker.get_account()
         equity = float(account.equity)
         log.info(f"Account: equity=${equity:,.2f} "
@@ -68,6 +84,13 @@ class Coordinator:
                  f"buying_power=${float(account.buying_power):,.2f}")
         self.risk.peak_equity = max(self.risk.peak_equity, equity)
         self.risk.set_starting_equity(equity)
+        
+        # Show market status
+        market_status = self.live_manager.get_market_status()
+        log.info(f"Market Status: {'OPEN' if market_status.is_open else 'CLOSED'} "
+                 f"(session: {market_status.session})")
+        if market_status.next_open:
+            log.info(f"Next market open: {market_status.next_open}")
 
     def start_watchers(self, crypto_only: bool = False):
         """Spawn a watcher thread for each stock/crypto in the universe."""
@@ -226,11 +249,26 @@ class Coordinator:
     def _coordinator_cycle(self):
         """
         Collect signals from all watchers, apply global filters, execute trades.
+        
+        LIVE TRADING: Validates market hours and data freshness before trading.
         """
         log.info("-" * 40)
         log.info(f"COORDINATOR CYCLE: {datetime.now():%H:%M:%S}")
 
-        # 0. Check crypto exit fills (manual OCO behavior)
+        # 0a. Check if we should skip this cycle (market hours check)
+        should_skip, skip_reason = self.live_manager.should_skip_cycle()
+        if should_skip:
+            log.info(f"Skipping cycle: {skip_reason}")
+            return
+        
+        # 0b. Log market status
+        market_status = self.live_manager.get_market_status()
+        if market_status.is_open:
+            log.info("Market: OPEN (regular session)")
+        else:
+            log.info(f"Market: {market_status.session.upper()} session - stocks limited, crypto OK")
+
+        # 0c. Check crypto exit fills (manual OCO behavior)
         self.broker.check_crypto_exit_fills()
 
         # 1. Check drawdown
@@ -406,10 +444,30 @@ class Coordinator:
             bars = watcher.get_bars()
             if bars is None:
                 continue
-
-            price = self.data.get_latest_price(sym)
-            if not price:
+            
+            # LIVE TRADING: Validate data freshness
+            is_fresh, freshness_reason = self.freshness_validator.validate_bars(bars, "5Min")
+            if not is_fresh:
+                log.warning(f"Skipping {sym}: {freshness_reason}")
                 continue
+            
+            # LIVE TRADING: Check if we can trade this symbol now
+            can_trade, trade_reason = self.live_manager.can_trade_symbol(sym)
+            if not can_trade:
+                log.info(f"Cannot trade {sym} now: {trade_reason}")
+                continue
+
+            # LIVE TRADING: Get verified live price
+            price, price_status = self.live_manager.get_live_price(sym, self.data)
+            if not price:
+                log.warning(f"No live price for {sym}: {price_status}")
+                continue
+            
+            if "stale" in price_status or "closed" in price_status:
+                log.warning(f"Price issue for {sym}: {price_status}")
+                # For crypto, continue anyway (24/7 trading)
+                if sym not in CRYPTO_SYMBOLS:
+                    continue
 
             # Apply correlation-adjusted sizing
             corr_mult = self.filters.get_corr_size_mult(sym)
