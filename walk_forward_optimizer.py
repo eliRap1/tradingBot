@@ -423,6 +423,7 @@ class WalkForwardOptimizer:
 def load_optimized_params() -> Optional[dict]:
     """Load optimized parameters if they exist and are recent."""
     if not os.path.exists(OPTIMIZED_PARAMS_FILE):
+        log.info("No optimized params file found - using default config")
         return None
     
     try:
@@ -445,19 +446,23 @@ def load_optimized_params() -> Optional[dict]:
 
 def apply_optimized_params(config: dict) -> dict:
     """Apply optimized parameters to config if available."""
-    params = load_optimized_params()
-    
-    if not params:
-        log.info("No optimized params found - using default config")
+    try:
+        params = load_optimized_params()
+        
+        if not params:
+            log.info("Using default config (no optimization applied)")
+            return config
+        
+        log.info("Applying optimized parameters from walk-forward analysis")
+        
+        for section, values in params.items():
+            if section in config and isinstance(values, dict):
+                config[section].update(values)
+        
         return config
-    
-    log.info("Applying optimized parameters")
-    
-    for section, values in params.items():
-        if section in config and isinstance(values, dict):
-            config[section].update(values)
-    
-    return config
+    except Exception as e:
+        log.warning(f"Could not apply optimized params: {e} - using defaults")
+        return config
 
 
 # CLI entry point
