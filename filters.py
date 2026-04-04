@@ -167,15 +167,22 @@ class SmartFilters:
                           max_correlation: float = 0.70,
                           lookback: int = 60) -> list[str]:
         """
-        Block entry if a candidate is highly correlated with ANY held position.
-        Uses daily close returns for meaningful correlation.
-        Falls back to SECTOR_MAP when insufficient data.
+        Correlation-adjusted filter: instead of binary block, scales position
+        size based on correlation with held positions.
+
+        Returns candidates that pass (with size adjustments stored in self.corr_size_mult).
+        Hard block only at >0.85 correlation.
         """
+        self.corr_size_mult = {}  # {symbol: multiplier 0.0-1.0}
+
         if not held_symbols:
+            for sym in candidate_symbols:
+                self.corr_size_mult[sym] = 1.0
             return candidate_symbols
 
         max_corr = self.config.get("filters", {}).get(
             "max_correlation", max_correlation)
+        hard_block_corr = 0.85  # Only hard-block above this
 
         # Check cache
         now = time.time()
@@ -193,6 +200,8 @@ class SmartFilters:
                         returns[sym] = ret.values[:lookback - 1]
 
             if len(returns) < 2:
+                for sym in candidate_symbols:
+                    self.corr_size_mult[sym] = 1.0
                 return candidate_symbols
 
             # Align lengths
@@ -213,39 +222,53 @@ class SmartFilters:
             self._corr_cache = corr_matrix
             self._corr_cache_time = now
 
-        # Filter candidates
+        # Filter candidates with proportional sizing
         filtered = []
         for sym in candidate_symbols:
-            blocked = False
+            max_pair_corr = 0.0
+            has_data = False
+
             for held in held_symbols:
                 pair_corr = corr_matrix.get((sym, held), None)
-                if pair_corr is not None and abs(pair_corr) > max_corr:
-                    log.info(f"CORRELATION FILTER: Skipping {sym} "
-                             f"(corr={pair_corr:.2f} with held {held})")
-                    blocked = True
-                    break
+                if pair_corr is not None:
+                    has_data = True
+                    max_pair_corr = max(max_pair_corr, abs(pair_corr))
 
-            if not blocked:
-                # Fallback: also check sector if no correlation data
-                if (sym, held_symbols[0]) not in corr_matrix:
-                    sym_sector = SECTOR_MAP.get(sym, "other")
-                    for held in held_symbols:
-                        held_sector = SECTOR_MAP.get(held, "other2")
-                        if sym_sector == held_sector:
-                            sector_count = sum(
-                                1 for h in held_symbols
-                                if SECTOR_MAP.get(h, "x") == sym_sector
-                            )
-                            if sector_count >= MAX_PER_SECTOR:
-                                log.info(f"SECTOR FALLBACK: Skipping {sym} "
-                                         f"(sector '{sym_sector}' full)")
-                                blocked = True
-                                break
-
-            if not blocked:
+            if has_data:
+                if max_pair_corr > hard_block_corr:
+                    log.info(f"CORRELATION BLOCK: Skipping {sym} "
+                             f"(corr={max_pair_corr:.2f} > {hard_block_corr})")
+                    continue
+                elif max_pair_corr > max_corr:
+                    # Proportional reduction: 0.70 corr = 70% size, 0.80 = 50% size
+                    reduction = (max_pair_corr - max_corr) / (hard_block_corr - max_corr)
+                    mult = max(0.3, 1.0 - reduction * 0.7)
+                    self.corr_size_mult[sym] = round(mult, 2)
+                    log.info(f"CORRELATION ADJUST: {sym} corr={max_pair_corr:.2f} "
+                             f"→ size multiplier={mult:.2f}")
+                    filtered.append(sym)
+                else:
+                    self.corr_size_mult[sym] = 1.0
+                    filtered.append(sym)
+            else:
+                # Fallback: sector check
+                sym_sector = SECTOR_MAP.get(sym, "other")
+                sector_held = sum(
+                    1 for h in held_symbols
+                    if SECTOR_MAP.get(h, "x") == sym_sector
+                )
+                if sector_held >= MAX_PER_SECTOR:
+                    log.info(f"SECTOR FALLBACK: Skipping {sym} "
+                             f"(sector '{sym_sector}' full)")
+                    continue
+                self.corr_size_mult[sym] = 1.0
                 filtered.append(sym)
 
         return filtered
+
+    def get_corr_size_mult(self, symbol: str) -> float:
+        """Get correlation-adjusted size multiplier for a symbol."""
+        return self.corr_size_mult.get(symbol, 1.0)
 
     # ═══════════════════════════════════════════════════════════
     # Consecutive loss cooldown

@@ -31,24 +31,32 @@ log = setup_logger("backtester")
 # ── Slippage Model ──────────────────────────────────────────
 
 class SlippageModel:
-    """Realistic fill price simulation."""
+    """Realistic fill price simulation with slippage + spread costs.
+
+    Total round-trip cost target: ~15 bps
+      - Slippage: 10 bps per fill (market impact)
+      - Spread: 5 bps per fill (bid-ask crossing cost)
+      - Volume impact: additional cost on large orders
+    """
 
     def __init__(self, config: dict):
         bt_cfg = config.get("backtest", {})
         self.base_slippage_pct = bt_cfg.get("slippage_pct", 0.001)  # 10 bps
+        self.spread_pct = bt_cfg.get("spread_pct", 0.0005)  # 5 bps half-spread
         self.volume_impact = bt_cfg.get("volume_impact", True)
         self.commission_per_share = bt_cfg.get("commission_per_share", 0.0)
 
     def get_fill_price(self, price: float, side: str, volume: int,
                        qty: int) -> float:
         """
-        Calculate realistic fill price.
+        Calculate realistic fill price including slippage and spread.
         - Base slippage (10 bps default)
+        - Spread cost (5 bps — crossing the bid-ask)
         - Volume impact: extra slippage if qty > 1% of bar volume
         - Direction: buys fill higher, sells fill lower
         """
         participation = qty / max(volume, 1)
-        impact = self.base_slippage_pct
+        impact = self.base_slippage_pct + self.spread_pct
         if self.volume_impact and participation > 0.01:
             impact += participation * 0.01
 
@@ -424,7 +432,7 @@ class Backtester:
                           daily_returns: list) -> BacktestResult:
         """Calculate all performance metrics from completed trades."""
         if not trades:
-            return self._empty_result()
+            return self._empty_result(equity_curve)
 
         pnls = [t.pnl for t in trades]
         wins = [p for p in pnls if p >= 0]
@@ -516,9 +524,17 @@ class Backtester:
             reasons[reason] = reasons.get(reason, 0) + 1
         log.info(f"Exit Reasons: {reasons}")
 
-    def _empty_result(self) -> BacktestResult:
+        # Survivorship bias warning
+        log.warning(
+            "SURVIVORSHIP BIAS NOTE: This backtest uses only currently-listed "
+            "stocks. Delisted stocks (bankruptcies, acquisitions) are excluded, "
+            "which inflates results by ~1-3% annually. Adjust expectations "
+            "accordingly. Real OOS performance is the true benchmark."
+        )
+
+    def _empty_result(self, equity_curve: list = None) -> BacktestResult:
         return BacktestResult(
-            trades=[], equity_curve=[], total_return_pct=0.0,
+            trades=[], equity_curve=equity_curve or [], total_return_pct=0.0,
             sharpe_ratio=0.0, max_drawdown_pct=0.0, win_rate=0.0,
             profit_factor=0.0, expectancy=0.0, total_trades=0,
             avg_bars_held=0.0, commission_total=0.0,

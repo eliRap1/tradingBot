@@ -68,10 +68,11 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "trending",
             "strategies": {
-                "supertrend": 0.35,
-                "momentum": 0.35,
-                "stoch_rsi": 0.20,
+                "supertrend": 0.30,
+                "momentum": 0.30,
+                "stoch_rsi": 0.15,
                 "breakout": 0.10,
+                "vwap_reclaim": 0.15,
                 "mean_reversion": 0.00,  # OFF — don't fight the trend
             },
             "reason": f"Strong uptrend (ADX={adx:.0f}), using trend strategies",
@@ -81,10 +82,11 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "trending",
             "strategies": {
-                "supertrend": 0.35,   # ST flips bearish = strong short signal
-                "momentum": 0.30,     # EMA cross down + MACD negative
-                "stoch_rsi": 0.20,    # Sell rallies in downtrend
+                "supertrend": 0.30,   # ST flips bearish = strong short signal
+                "momentum": 0.25,     # EMA cross down + MACD negative
+                "stoch_rsi": 0.15,    # Sell rallies in downtrend
                 "breakout": 0.15,     # Breakdown below support
+                "vwap_reclaim": 0.15, # VWAP rejection = short signal
                 "mean_reversion": 0.00,  # Don't mean-revert in strong trends
             },
             "reason": f"Strong downtrend (ADX={adx:.0f}), short bias active",
@@ -95,10 +97,11 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "breakout",
             "strategies": {
-                "breakout": 0.40,
-                "supertrend": 0.20,
-                "momentum": 0.20,
+                "breakout": 0.35,
+                "supertrend": 0.15,
+                "momentum": 0.15,
                 "stoch_rsi": 0.10,
+                "vwap_reclaim": 0.15,
                 "mean_reversion": 0.10,
             },
             "reason": f"Range squeeze detected, watching for breakout",
@@ -109,9 +112,10 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "breakout",
             "strategies": {
-                "breakout": 0.35,
-                "momentum": 0.25,
-                "supertrend": 0.25,
+                "breakout": 0.30,
+                "momentum": 0.20,
+                "supertrend": 0.20,
+                "vwap_reclaim": 0.15,
                 "stoch_rsi": 0.15,
                 "mean_reversion": 0.00,
             },
@@ -123,9 +127,10 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "breakdown",
             "strategies": {
-                "breakout": 0.35,     # Breakdown below support
-                "momentum": 0.25,     # Bearish momentum
-                "supertrend": 0.25,   # ST bearish confirmation
+                "breakout": 0.30,     # Breakdown below support
+                "momentum": 0.20,     # Bearish momentum
+                "supertrend": 0.20,   # ST bearish confirmation
+                "vwap_reclaim": 0.15, # VWAP rejection
                 "stoch_rsi": 0.15,    # Sell rallies
                 "mean_reversion": 0.00,
             },
@@ -137,10 +142,11 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "ranging",
             "strategies": {
-                "mean_reversion": 0.35,
-                "stoch_rsi": 0.25,
-                "momentum": 0.15,
-                "supertrend": 0.15,
+                "mean_reversion": 0.30,
+                "stoch_rsi": 0.20,
+                "vwap_reclaim": 0.20,  # VWAP bounce/fade in range
+                "momentum": 0.10,
+                "supertrend": 0.10,
                 "breakout": 0.10,
             },
             "reason": f"Ranging market (ADX={adx:.0f}), mean reversion favored",
@@ -151,11 +157,12 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "trending",
             "strategies": {
-                "momentum": 0.25,
-                "supertrend": 0.25,
-                "stoch_rsi": 0.20,
+                "momentum": 0.20,
+                "supertrend": 0.20,
+                "vwap_reclaim": 0.20,
+                "stoch_rsi": 0.15,
                 "breakout": 0.15,
-                "mean_reversion": 0.15,
+                "mean_reversion": 0.10,
             },
             "reason": f"Moderate uptrend (ADX={adx:.0f}), balanced approach",
         }
@@ -165,10 +172,11 @@ def select_strategies(df: pd.DataFrame, symbol: str) -> dict:
         return {
             "regime": "trending",
             "strategies": {
-                "supertrend": 0.30,
-                "momentum": 0.25,
-                "stoch_rsi": 0.20,
-                "breakout": 0.15,
+                "supertrend": 0.25,
+                "momentum": 0.20,
+                "vwap_reclaim": 0.20,
+                "stoch_rsi": 0.15,
+                "breakout": 0.10,
                 "mean_reversion": 0.10,
             },
             "reason": f"Moderate downtrend (ADX={adx:.0f}), short bias",
@@ -182,10 +190,11 @@ def _default():
     return {
         "regime": "mixed",
         "strategies": {
-            "momentum": 0.25,
-            "supertrend": 0.25,
+            "momentum": 0.20,
+            "supertrend": 0.20,
+            "vwap_reclaim": 0.15,
             "stoch_rsi": 0.15,
-            "breakout": 0.20,
+            "breakout": 0.15,
             "mean_reversion": 0.15,
         },
         "reason": "No clear regime, using balanced weights",

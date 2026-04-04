@@ -221,6 +221,62 @@ def ichimoku(df: pd.DataFrame, tenkan_period: int = 9, kijun_period: int = 26,
 # VWAP with standard deviation bands
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# RVOL — Relative Volume by time of day
+# ═══════════════════════════════════════════════════════════════
+
+def rvol(df: pd.DataFrame, lookback_days: int = 10) -> float:
+    """
+    Calculate Relative Volume: current bar's volume vs average volume
+    at the same time of day over the past N days.
+
+    Returns ratio (e.g., 1.5 = 50% above average for this time slot).
+    For daily bars, falls back to simple volume ratio vs 20-bar average.
+    """
+    if len(df) < 5 or "volume" not in df.columns:
+        return 1.0
+
+    volume = df["volume"]
+
+    # Check if index has time information (intraday data)
+    idx = df.index
+    has_time = False
+    try:
+        if hasattr(idx, 'hour') or (hasattr(idx[0], 'hour') and idx[0].hour != 0):
+            has_time = True
+    except (AttributeError, TypeError):
+        pass
+
+    if has_time:
+        # Intraday: compare to same time-of-day average
+        try:
+            current_time = idx[-1]
+            if hasattr(current_time, 'hour'):
+                target_hour = current_time.hour
+                target_minute = current_time.minute
+
+                # Find bars at the same time of day
+                same_time_vols = []
+                for i in range(len(df) - 1):
+                    bar_time = idx[i]
+                    if hasattr(bar_time, 'hour'):
+                        if bar_time.hour == target_hour and bar_time.minute == target_minute:
+                            same_time_vols.append(float(volume.iloc[i]))
+
+                if len(same_time_vols) >= 3:
+                    avg_vol = sum(same_time_vols[-lookback_days:]) / len(same_time_vols[-lookback_days:])
+                    if avg_vol > 0:
+                        return float(volume.iloc[-1]) / avg_vol
+        except Exception:
+            pass
+
+    # Daily fallback: simple ratio vs 20-bar average
+    avg_vol = volume.tail(20).mean()
+    if avg_vol > 0:
+        return float(volume.iloc[-1]) / float(avg_vol)
+    return 1.0
+
+
 def vwap_bands(df: pd.DataFrame, num_deviations: list[float] = [1.0, 2.0]):
     """
     Calculate VWAP and standard deviation bands.

@@ -29,6 +29,9 @@ def make_config():
                 "d_smooth": 3, "ema_period": 50, "oversold": 20,
                 "overbought": 80, "weight": 0.15,
             },
+            "vwap_reclaim": {
+                "weight": 0.15,
+            },
         },
         "signals": {
             "min_composite_score": 0.25,

@@ -18,9 +18,10 @@ log = setup_logger("regime")
 
 
 class RegimeFilter:
-    def __init__(self, data_fetcher):
+    def __init__(self, data_fetcher, universe: list[str] = None):
         self.data = data_fetcher
         self._last_regime = None
+        self._universe = universe or []
 
     def get_regime(self) -> dict:
         """
@@ -101,12 +102,28 @@ class RegimeFilter:
             size_mult = 0.2
             desc += " (Strong downtrend — minimal exposure)"
 
+        # ── Market breadth: % of universe above 50 EMA ────────
+        breadth = self._get_market_breadth()
+        breadth_pct = breadth["pct_above_50ema"]
+
+        if breadth_pct < 30 and regime != "bear":
+            # Weak breadth even in "bull" SPY = hidden weakness
+            size_mult *= 0.7
+            desc += f" (weak breadth: {breadth_pct:.0f}% above 50EMA)"
+        elif breadth_pct > 70 and regime == "bull":
+            # Strong breadth confirms bull
+            size_mult = min(size_mult * 1.1, 1.0)
+            desc += f" (strong breadth: {breadth_pct:.0f}%)"
+        elif breadth_pct < 50:
+            desc += f" (breadth: {breadth_pct:.0f}%)"
+
         result = {
             "regime": regime,
             "allow_longs": allow_longs,
             "size_multiplier": round(size_mult, 2),
             "spy_trend": trend,
             "spy_rsi": round(spy_rsi, 1),
+            "breadth_pct": round(breadth_pct, 1),
             "description": desc,
         }
 
@@ -117,6 +134,32 @@ class RegimeFilter:
 
         return result
 
+    def _get_market_breadth(self) -> dict:
+        """Calculate % of universe stocks above their 50 EMA."""
+        if not self._universe:
+            return {"pct_above_50ema": 50.0, "total": 0, "above": 0}
+
+        try:
+            # Sample up to 20 stocks for speed
+            sample = self._universe[:20]
+            bars = self.data.get_bars(sample, timeframe="1Day", days=80)
+
+            above = 0
+            total = 0
+            for sym, df in bars.items():
+                if len(df) < 50:
+                    continue
+                total += 1
+                ema50 = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
+                if df["close"].iloc[-1] > ema50.iloc[-1]:
+                    above += 1
+
+            pct = (above / total * 100) if total > 0 else 50.0
+            return {"pct_above_50ema": pct, "total": total, "above": above}
+        except Exception as e:
+            log.error(f"Breadth calculation failed: {e}")
+            return {"pct_above_50ema": 50.0, "total": 0, "above": 0}
+
     def _default_regime(self):
         """Fallback when SPY data unavailable — be cautious."""
         return {
@@ -125,5 +168,6 @@ class RegimeFilter:
             "size_multiplier": 0.5,
             "spy_trend": "neutral",
             "spy_rsi": 50.0,
+            "breadth_pct": 50.0,
             "description": "UNKNOWN — SPY data unavailable, cautious mode",
         }

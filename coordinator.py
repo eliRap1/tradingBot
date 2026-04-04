@@ -40,7 +40,7 @@ class Coordinator:
         self.screener = Screener(self.config, self.data)
         self.risk = RiskManager(self.config)
         self.portfolio = PortfolioManager(self.config, self.broker)
-        self.regime = RegimeFilter(self.data)
+        self.regime = RegimeFilter(self.data, universe=self.config["screener"]["universe"])
         self.filters = SmartFilters(tracker=self.portfolio.tracker, config=self.config)
         self.alerts = AlertManager(self.config)
 
@@ -238,7 +238,9 @@ class Coordinator:
 
         if positions:
             prices = self.data.get_latest_prices(list(positions.keys()))
-            to_close = self.portfolio.check_trailing_stops(positions, prices)
+            to_close, partial_exits = self.portfolio.check_trailing_stops(positions, prices)
+            if partial_exits:
+                self.portfolio.execute_partial_exits(partial_exits, positions)
             if to_close:
                 self.portfolio.execute_exits(to_close, positions)
                 positions = self.portfolio.get_current_positions()
@@ -363,7 +365,7 @@ class Coordinator:
         stock_slots = max_pos - len(stock_positions) if not stocks_full else 0
         crypto_slots = max_crypto - len(crypto_positions) if not crypto_full else 0
         cooldown_mult = self.filters.get_loss_cooldown_mult()
-        size_mult = regime["size_multiplier"] * cooldown_mult
+        base_size_mult = regime["size_multiplier"] * cooldown_mult
 
         # Filter by available slots per type
         executable = []
@@ -385,6 +387,10 @@ class Coordinator:
             price = self.data.get_latest_price(sym)
             if not price:
                 continue
+
+            # Apply correlation-adjusted sizing
+            corr_mult = self.filters.get_corr_size_mult(sym)
+            size_mult = base_size_mult * corr_mult
 
             orders = self.risk.size_orders(
                 opportunities=[_make_opportunity(watcher)],

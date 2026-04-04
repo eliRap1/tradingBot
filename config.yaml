@@ -92,6 +92,9 @@ strategies:
     overbought: 80
     weight: 0.15
 
+  vwap_reclaim:
+    weight: 0.15
+
 signals:
   min_composite_score: 0.25
   max_positions: 9
@@ -112,6 +115,9 @@ risk:
   min_risk_reward: 2.0         # reject trades below 2:1 R:R
   max_drawdown_pct: 0.10       # 10% drawdown halts trading
   trailing_stop_pct: 0.03      # 3% trailing stop
+  partial_exit_enabled: true    # close 50% at 1.5R, trail rest
+  partial_exit_r: 1.5           # R-multiple to trigger first partial exit
+  partial_exit_pct: 0.50        # close 50% of position at partial exit
   daily_loss_limit_pct: 0.03   # 3% daily loss limit — stop trading for day
   sizing_method: "fixed_fractional"  # "fixed_fractional" or "kelly"
   kelly_fraction: 0.5          # half Kelly (standard practice)
@@ -129,9 +135,11 @@ filters:
 
 backtest:
   slippage_pct: 0.001           # 10 basis points per fill
+  spread_pct: 0.0005            # 5 bps estimated half-spread cost per fill
   volume_impact: true           # extra slippage on large orders
-  commission_per_share: 0.0     # Alpaca is commission-free
+  commission_per_share: 0.0     # Alpaca is commission-free (but spread matters)
   initial_equity: 100000
+  # Total realistic cost: ~15 bps round-trip (10 slippage + 5 spread per side)
 
 alerts:
   enabled: true                  # set to false to disable

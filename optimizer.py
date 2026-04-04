@@ -60,10 +60,18 @@ class OptimizationResult:
 # ── Parameter Grid ──────────────────────────────────────────
 
 DEFAULT_PARAM_GRID = {
-    "signals.min_composite_score": [0.20, 0.25, 0.30, 0.35],
+    # Signal thresholds
+    "signals.min_composite_score": [0.15, 0.20, 0.25, 0.30, 0.35],
     "signals.min_agreeing_strategies": [2, 3, 4],
-    "risk.stop_loss_atr_mult": [1.5, 2.0, 2.5],
-    "risk.take_profit_atr_mult": [3.0, 4.0, 5.0],
+    # Risk management
+    "risk.stop_loss_atr_mult": [1.5, 2.0, 2.5, 3.0],
+    "risk.take_profit_atr_mult": [3.0, 4.0, 5.0, 6.0],
+    # Strategy-specific thresholds
+    "strategies.supertrend.multiplier": [2.5, 3.0, 3.5],
+    "strategies.momentum.ema_fast": [5, 8, 13],
+    "strategies.mean_reversion.bb_std": [1.5, 2.0, 2.5],
+    "strategies.stoch_rsi.oversold": [15, 20, 25],
+    "strategies.stoch_rsi.overbought": [75, 80, 85],
 }
 
 

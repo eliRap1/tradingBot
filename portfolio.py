@@ -56,10 +56,16 @@ class PortfolioManager:
         return positions
 
     def check_trailing_stops(self, positions: dict,
-                              prices: dict[str, float]) -> list[str]:
-        """Check trailing stops, return symbols to close."""
+                              prices: dict[str, float]) -> tuple[list[str], list[dict]]:
+        """Check trailing stops, partial exits, return symbols to close and partial exits."""
         trail_pct = self.config["risk"]["trailing_stop_pct"]
         to_close = []
+        partial_exits = []  # [{"symbol": str, "qty": int, "reason": str}]
+
+        # Partial exit config
+        partial_enabled = self.config["risk"].get("partial_exit_enabled", False)
+        partial_r = self.config["risk"].get("partial_exit_r", 1.5)
+        partial_pct = self.config["risk"].get("partial_exit_pct", 0.50)
 
         for sym, pos in positions.items():
             if sym not in prices:
@@ -67,6 +73,7 @@ class PortfolioManager:
 
             current_price = prices[sym]
             entry_price = pos["entry_price"]
+            is_long = pos.get("side", "long") == "long"
 
             # Update high watermark
             if sym not in self.high_watermarks:
@@ -77,12 +84,39 @@ class PortfolioManager:
             hwm = self.high_watermarks[sym]
             trail_price = hwm * (1 - trail_pct)
 
+            # === PARTIAL EXIT at 1.5R ===
+            meta = self.position_meta.get(sym, {})
+            if partial_enabled and not meta.get("partial_done", False):
+                initial_risk = meta.get("initial_risk", 0.0)
+                qty = pos["qty"]
+                if initial_risk > 0 and qty > 1:
+                    risk_per_share = initial_risk / qty
+                    if is_long:
+                        current_r = (current_price - entry_price) / risk_per_share if risk_per_share > 0 else 0
+                    else:
+                        current_r = (entry_price - current_price) / risk_per_share if risk_per_share > 0 else 0
+
+                    if current_r >= partial_r:
+                        close_qty = max(1, int(qty * partial_pct))
+                        partial_exits.append({
+                            "symbol": sym,
+                            "qty": close_qty,
+                            "reason": f"partial_exit_{partial_r}R",
+                            "r_multiple": round(current_r, 2),
+                        })
+                        log.info(
+                            f"PARTIAL EXIT: {sym} — {current_r:.1f}R reached, "
+                            f"closing {close_qty}/{qty} shares ({partial_pct:.0%})"
+                        )
+                        # Mark partial done so we don't repeat
+                        meta["partial_done"] = True
+                        self.position_meta[sym] = meta
+                        self._save_meta()
+
             # === BREAKEVEN STOP ===
-            # After 0.75R profit, move stop to entry (breakeven)
             profit_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
             breakeven_triggered = False
             if profit_pct >= 0.015:  # ~0.75R for typical 2% risk
-                # Stop should be at entry price minimum
                 if current_price <= entry_price and pos["unrealized_pl"] <= 0:
                     log.info(f"BREAKEVEN STOP: {sym} — was in profit, now back at entry")
                     to_close.append(sym)
@@ -97,15 +131,13 @@ class PortfolioManager:
                 to_close.append(sym)
 
             # === TIME-BASED STOP ===
-            # Close zombie trades: 5+ days with less than 0.5R profit
             if not breakeven_triggered and sym not in to_close:
-                meta = self.position_meta.get(sym, {})
                 opened_str = meta.get("opened_at", "")
                 if opened_str:
                     try:
                         opened = datetime.fromisoformat(opened_str)
                         days_held = (datetime.now() - opened).days
-                        if days_held >= 5 and profit_pct < 0.01:  # <0.5R after 5 days
+                        if days_held >= 5 and profit_pct < 0.01:
                             log.info(
                                 f"TIME STOP: {sym} — held {days_held} days "
                                 f"with only {profit_pct:.1%} profit. Closing zombie trade."
@@ -115,7 +147,34 @@ class PortfolioManager:
                         pass
 
         self._save_watermarks()
-        return to_close
+        return to_close, partial_exits
+
+    def execute_partial_exits(self, partial_exits: list[dict], positions: dict):
+        """Execute partial position exits (close a portion of the position)."""
+        for partial in partial_exits:
+            sym = partial["symbol"]
+            qty = partial["qty"]
+            try:
+                pos = positions.get(sym)
+                if not pos:
+                    continue
+
+                side = "sell" if pos.get("side", "long") == "long" else "buy"
+                self.broker.submit_market_order(sym, qty, side)
+                log.info(f"Partial exit executed: {side} {qty} {sym} ({partial['reason']})")
+
+                # Record the partial as a trade
+                self.tracker.record_trade(
+                    symbol=sym,
+                    side=pos.get("side", "long"),
+                    qty=qty,
+                    entry_price=pos["entry_price"],
+                    exit_price=pos["current_price"],
+                    reason=partial["reason"],
+                    risk_dollars=self.position_meta.get(sym, {}).get("initial_risk", 0.0) * (qty / pos["qty"]),
+                )
+            except Exception as e:
+                log.error(f"Failed partial exit for {sym}: {e}")
 
     def execute_exits(self, symbols_to_close: list[str], positions: dict = None):
         """Close positions for given symbols and record trades."""

@@ -1,6 +1,6 @@
 import pandas as pd
 import ta
-from indicators import supertrend, crossover, crossunder
+from indicators import supertrend, crossover, crossunder, rvol
 from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
@@ -77,9 +77,8 @@ class SuperTrendStrategy:
         ema_200 = ta.trend.EMAIndicator(close, window=ema_window).ema_indicator()
         above_ema200 = close.iloc[-1] > ema_200.iloc[-1]
 
-        # Volume
-        avg_vol = volume.tail(20).mean()
-        vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
+        # RVOL (time-of-day adjusted volume)
+        vol_ratio = rvol(df)
 
         # Candles
         patterns = detect_patterns(df)

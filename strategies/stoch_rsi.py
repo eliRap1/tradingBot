@@ -1,6 +1,6 @@
 import pandas as pd
 import ta
-from indicators import stochastic_rsi, crossover, crossunder
+from indicators import stochastic_rsi, crossover, crossunder, rvol
 from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
@@ -81,8 +81,7 @@ class StochRSIStrategy:
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
 
-        avg_vol = volume.tail(20).mean()
-        vol_ok = volume.iloc[-1] > avg_vol * 0.8
+        vol_ok = rvol(df) > 0.8
 
         # ── LONG: Buy pullback in uptrend ────────────────────
         if above_ema or ctx["direction"] != "down":

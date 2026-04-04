@@ -1,5 +1,6 @@
 import pandas as pd
 import ta
+from indicators import rvol
 from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
@@ -80,8 +81,8 @@ class MomentumStrategy:
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
 
-        avg_vol = volume.tail(20).mean()
-        vol_strong = volume.iloc[-1] > avg_vol * 1.1
+        vol_ratio = rvol(df)
+        vol_strong = vol_ratio > 1.1
 
         # ── LONG SCORING ─────────────────────────────────────
         if ctx["direction"] != "down" or not ctx["trending"]:

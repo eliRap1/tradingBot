@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import ta
-from indicators import pivot_high, pivot_low, last_pivot_value, bars_since_pivot, supertrend
+from indicators import pivot_high, pivot_low, last_pivot_value, bars_since_pivot, supertrend, rvol
 from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
@@ -68,9 +68,8 @@ class BreakoutStrategy:
 
         ctx = get_trend_context(df)
 
-        # Volume
-        avg_volume = volume.iloc[-lookback - 1:-1].mean()
-        vol_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+        # RVOL (time-of-day adjusted volume)
+        vol_ratio = rvol(df)
 
         # ATR
         atr = ta.volatility.AverageTrueRange(

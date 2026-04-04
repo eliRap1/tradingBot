@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import ta
+from indicators import rvol
 from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
@@ -87,8 +88,7 @@ class MeanReversionStrategy:
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
 
-        avg_vol = volume.tail(20).mean()
-        vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
+        vol_ratio = rvol(df)
         vol_spike = vol_ratio > 1.5
 
         # ── LONG: Buy at lower band (oversold bounce) ────────
