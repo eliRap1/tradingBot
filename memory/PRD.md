@@ -1,67 +1,116 @@
-# Trading Bot PRD & Implementation Log
+# Trading Bot PRD - PROFIT MAXIMIZED Edition
 
 ## Original Problem Statement
-Review, debug, and improve a trading bot code for stocks and crypto using Alpaca API. Goals included:
-- Identify bugs, logical errors, edge cases
-- Evaluate trading strategy (entries, exits, risk management)
-- Detect overfitting/unrealistic assumptions
-- Improve performance and real-world handling
-- Ensure proper risk management
-- Evaluate backtesting quality
-- Provide improvements and testing recommendations
+Build the most profitable trading bot possible for stocks and crypto using Alpaca API. The bot should:
+- Make the most profit
+- Have robust risk management
+- Support both stocks and crypto
+- Have a monitoring dashboard
 
 ## Tech Stack
-- **Language**: Python
+- **Backend**: Python (FastAPI for API if needed)
 - **Broker API**: Alpaca (paper & live trading)
 - **Dashboard**: Flask + HTML/JS (TradingView Lightweight Charts)
-- **Database**: JSON files for state persistence
+- **Storage**: JSON files for state persistence
 
-## Core Architecture
-- **Coordinator**: Main orchestrator running 5-min cycles
-- **Watchers**: Per-symbol threads monitoring price action
-- **Strategies**: SuperTrend, Momentum, Mean Reversion, Breakout, Stoch RSI, VWAP Reclaim
-- **Risk Manager**: ATR-based position sizing, Kelly criterion, max drawdown
-- **Portfolio Manager**: Trailing stops, partial exits, position reconciliation
+## Architecture
+
+### Core Components
+1. **Coordinator** - Main orchestrator running 5-min cycles
+2. **Watchers** - Per-symbol threads monitoring price action (40+ stocks, 2 crypto)
+3. **Strategies** (7 total):
+   - SuperTrend (trend following)
+   - Momentum (EMA + RSI + MACD)
+   - Mean Reversion (Bollinger Bands)
+   - Breakout (range breakout)
+   - Stoch RSI (oscillator)
+   - VWAP Reclaim (institutional levels)
+   - **NEW: Gap** (gap and go / fade)
+4. **Profit Maximizer** - Signal enhancement and adaptive exits
+5. **Risk Manager** - Volatility-adjusted sizing, Kelly criterion
+6. **Portfolio Manager** - Multi-tier partial exits, trailing stops
+
+### Signal Flow
+```
+Watcher → Strategy Signals → Confluence Filter → Profit Enhancement → Risk Sizing → Execution
+```
 
 ## What's Been Implemented (2026-01-27)
 
-### Critical Bug Fixes
-1. ✅ **Crypto OCO Tracking** (`broker.py`) - TP/SL orders now properly linked; one cancels the other
-2. ✅ **Partial Fill Handling** (`broker.py`) - Waits for fill confirmation, uses actual filled_qty
-3. ✅ **Idempotency Keys** (`broker.py`) - Prevents duplicate orders on network retries
-4. ✅ **API Rate Limiting** (`data.py`) - Token bucket rate limiter with exponential backoff
-5. ✅ **Kelly Edge Case** (`risk.py`) - Capped win/loss ratio at 5:1
-6. ✅ **Memory Leak Fix** (`watcher.py`) - Bars cache expiry to prevent memory buildup
-7. ✅ **Coordinator Crypto Check** (`coordinator.py`) - Added OCO fill check to each cycle
+### Session 1: Bug Fixes
+- ✅ Crypto OCO tracking (TP/SL properly linked)
+- ✅ Partial fill handling
+- ✅ Idempotency keys for orders
+- ✅ API rate limiting with exponential backoff
+- ✅ Kelly criterion edge case fix
+- ✅ Memory leak fix in watcher threads
 
-### Documentation
-- ✅ `CODE_REVIEW.md` - Comprehensive analysis with all issues and fixes
+### Session 2: Profit Maximization
+- ✅ **Gap Trading Strategy** - New high-probability setup
+- ✅ **Volatility-Adjusted Sizing** - Inverse vol positioning
+- ✅ **Enhanced Momentum Strategy** - MACD cross, divergence detection
+- ✅ **Profit Maximizer Module** - Volume surge, sector rotation
+- ✅ **Two-Tier Partial Exits** - 40% at 1.2R, 30% at 2.5R
+- ✅ **More Aggressive Config** - Lowered confluence, bigger targets
+- ✅ Updated documentation with profit expectations
 
 ## User Personas
-- **Algorithmic Trader**: Wants reliable automated execution with proper risk management
-- **Quant Developer**: Needs to understand and modify strategy logic
-- **Part-time Trader**: Uses dashboard for monitoring without coding
+1. **Aggressive Trader**: Wants max returns, comfortable with higher risk
+2. **Part-time Investor**: Uses dashboard for monitoring, hands-off approach
+3. **Quant Developer**: Wants to understand and modify strategy logic
+
+## Risk Management Layers
+1. **Trade Level**: 2.5:1 minimum R:R, volatility-adjusted sizing
+2. **Position Level**: 10% max per position, correlation limits
+3. **Portfolio Level**: 12% max drawdown, 2.5% daily loss limit
+4. **Exit Management**: Partial profits, trailing stops, time stops
+
+## Configuration Summary
+
+| Category | Key Settings |
+|----------|--------------|
+| Positions | Max 12 stocks + 2 crypto |
+| Risk | 2% per trade, 12% max drawdown |
+| Entries | 2+ strategies agree, 0.20+ score |
+| Exits | 1.2R partial (40%), 2.5R partial (30%), trail rest |
+| Sizing | Volatility-adjusted (0.6x-1.4x multiplier) |
 
 ## Prioritized Backlog
 
-### P0 (Critical - Deferred to User Decision)
-- [ ] Smart order blocking (30s timeout) - affects latency
-- [ ] Trailing stop intra-bar updates - consider native Alpaca trails
+### P0 (Completed)
+- ✅ Critical bug fixes
+- ✅ Profit maximization improvements
 
-### P1 (Important)
-- [ ] Correlation cache freshness (currently 30min)
-- [ ] Per-sector parameter optimization
-- [ ] Walk-forward backtesting framework
+### P1 (Next Session)
+- [ ] Walk-forward optimization framework
 - [ ] Monte Carlo trade sequence simulation
-
-### P2 (Nice to Have)
-- [ ] Stochastic slippage model based on ATR
 - [ ] WebSocket streaming for real-time updates
 - [ ] Email/SMS alerting integration
-- [ ] Performance attribution by strategy
+
+### P2 (Future)
+- [ ] Machine learning signal enhancement
+- [ ] Options strategy integration
+- [ ] Multi-broker support
+- [ ] Mobile app dashboard
+
+## Testing Requirements
+
+### Paper Trading (Required)
+- Minimum 50 trades before live
+- Win rate target: > 50%
+- Profit factor target: > 1.5
+- Max drawdown: < 10%
+
+### Validation Checklist
+- [ ] All 7 strategies generating signals
+- [ ] Partial exits triggering correctly
+- [ ] Gap strategy working on market open
+- [ ] Correlation filter blocking similar positions
+- [ ] Volatility sizing working as expected
 
 ## Next Tasks
-1. User to provide Alpaca API keys for live testing
-2. Run paper trading for 30+ trades validation
-3. Implement user's choice on deferred issues
-4. Add walk-forward optimization if requested
+1. User provides Alpaca API keys
+2. Run paper trading validation
+3. Monitor for 50+ trades
+4. Adjust config based on results
+5. Consider live deployment with 1/4 size

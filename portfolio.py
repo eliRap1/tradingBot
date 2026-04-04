@@ -106,7 +106,7 @@ class PortfolioManager:
                 watermark = self.low_watermarks[sym]
                 trail_price = watermark * (1 + trail_pct)
 
-            # === PARTIAL EXIT at 1.5R ===
+            # === PARTIAL EXIT at 1.2R (first partial) ===
             if partial_enabled and not meta.get("partial_done", False):
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
@@ -126,12 +126,46 @@ class PortfolioManager:
                             "r_multiple": round(current_r, 2),
                         })
                         log.info(
-                            f"PARTIAL EXIT: {sym} — {current_r:.1f}R reached, "
+                            f"PARTIAL EXIT 1: {sym} — {current_r:.1f}R reached, "
                             f"closing {close_qty}/{qty} shares ({partial_pct:.0%})"
                         )
                         meta["partial_done"] = True
                         self.position_meta[sym] = meta
                         self._save_meta()
+
+            # === SECOND PARTIAL EXIT at 2.5R ===
+            second_partial_enabled = self.config["risk"].get("second_partial_enabled", False)
+            second_partial_r = self.config["risk"].get("second_partial_r", 2.5)
+            second_partial_pct = self.config["risk"].get("second_partial_pct", 0.30)
+            
+            if second_partial_enabled and meta.get("partial_done") and not meta.get("second_partial_done", False):
+                initial_risk = meta.get("initial_risk", 0.0)
+                qty = pos["qty"]
+                if initial_risk > 0 and qty > 1:
+                    # Recalculate risk per share with remaining quantity
+                    original_qty = meta.get("original_qty", qty * 2)  # Estimate original qty
+                    risk_per_share = initial_risk / original_qty if original_qty > 0 else 0
+                    if is_long:
+                        current_r = (current_price - entry_price) / risk_per_share if risk_per_share > 0 else 0
+                    else:
+                        current_r = (entry_price - current_price) / risk_per_share if risk_per_share > 0 else 0
+
+                    if current_r >= second_partial_r:
+                        close_qty = max(1, int(qty * second_partial_pct))
+                        if close_qty < qty:  # Don't close everything
+                            partial_exits.append({
+                                "symbol": sym,
+                                "qty": close_qty,
+                                "reason": f"partial_exit_{second_partial_r}R",
+                                "r_multiple": round(current_r, 2),
+                            })
+                            log.info(
+                                f"PARTIAL EXIT 2: {sym} — {current_r:.1f}R reached, "
+                                f"closing {close_qty}/{qty} shares ({second_partial_pct:.0%})"
+                            )
+                            meta["second_partial_done"] = True
+                            self.position_meta[sym] = meta
+                            self._save_meta()
 
             # === BREAKEVEN STOP (persisted) ===
             breakeven_triggered = False

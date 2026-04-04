@@ -7,6 +7,7 @@ Responsibilities:
   - Enforce global risk limits (max positions, regime, drawdown)
   - Execute trades when watchers report confirmed signals
   - Manage existing positions (trailing stops, exits)
+  - Apply profit maximization enhancements
 """
 
 import time
@@ -24,6 +25,7 @@ from regime import RegimeFilter
 from filters import SmartFilters
 from watcher import StockWatcher, Action
 from alerts import AlertManager
+from profit_maximizer import ProfitMaximizer, AdaptiveExitManager
 
 log = setup_logger("coordinator")
 
@@ -46,6 +48,10 @@ class Coordinator:
         self.regime = RegimeFilter(self.data, universe=self.config["screener"]["universe"])
         self.filters = SmartFilters(tracker=self.portfolio.tracker, config=self.config)
         self.alerts = AlertManager(self.config)
+        
+        # Profit maximization modules
+        self.profit_max = ProfitMaximizer(self.config)
+        self.exit_manager = AdaptiveExitManager(self.config)
 
         # Watcher threads: {symbol: StockWatcher}
         self.watchers: dict[str, StockWatcher] = {}

@@ -100,33 +100,45 @@ strategies:
   vwap_reclaim:
     weight: 0.15
 
+  gap:
+    min_gap_pct: 1.5
+    strong_gap_pct: 3.0
+    weight: 0.15
+
 signals:
-  min_composite_score: 0.25
-  max_positions: 9
-  min_agreeing_strategies: 3   # confluence: need 3/5 strategies to agree
-  max_crypto_positions: 2      # separate slots for BTC/USD + ETH/USD
-  min_crypto_agreeing: 2       # crypto needs only 2/5 strategies (24/7 market behaves differently)
-  min_crypto_score: 0.15       # lower score threshold for crypto entries
-  allow_shorts_in_bull: false  # block shorts in bull regime by default
-  entry_timeframe: "5Min"      # 5-min candles for entries
-  trend_timeframe: "1Day"      # daily candles for trend context
-  intraday_lookback_days: 5    # how many days of 5-min bars to fetch
+  min_composite_score: 0.20        # Lowered for more trades (was 0.25)
+  max_positions: 12                # More positions = more profit opportunities (was 9)
+  min_agreeing_strategies: 2       # Lowered confluence (was 3) - let more trades through
+  max_crypto_positions: 2          # Keep crypto slots
+  min_crypto_agreeing: 2           # crypto needs only 2/5 strategies
+  min_crypto_score: 0.12           # Lower for more crypto entries (was 0.15)
+  allow_shorts_in_bull: true       # Allow shorts even in bull (hedging)
+  entry_timeframe: "5Min"          # 5-min candles for entries
+  trend_timeframe: "1Day"          # daily candles for trend context
+  intraday_lookback_days: 5        # how many days of 5-min bars to fetch
 
 risk:
-  max_position_pct: 0.08       # 8% of portfolio per position (~72% deployed with 9 positions, 28% reserve)
-  max_portfolio_risk_pct: 0.015 # 1.5% risk per trade (slightly more aggressive)
-  stop_loss_atr_mult: 2.0      # stop loss at 2x ATR below entry
-  take_profit_atr_mult: 4.0    # take profit at 4x ATR (2:1 R:R on ATR)
-  min_risk_reward: 2.0         # reject trades below 2:1 R:R
-  max_drawdown_pct: 0.10       # 10% drawdown halts trading
-  trailing_stop_pct: 0.03      # 3% trailing stop
-  partial_exit_enabled: true    # close 50% at 1.5R, trail rest
-  partial_exit_r: 1.5           # R-multiple to trigger first partial exit
-  partial_exit_pct: 0.50        # close 50% of position at partial exit
-  daily_loss_limit_pct: 0.03   # 3% daily loss limit — stop trading for day
-  sizing_method: "fixed_fractional"  # "fixed_fractional" or "kelly"
-  kelly_fraction: 0.5          # half Kelly (standard practice)
-  kelly_min_trades: 30         # need 30 trades before Kelly activates
+  max_position_pct: 0.10           # 10% per position for bigger gains (was 8%)
+  max_portfolio_risk_pct: 0.02     # 2% risk per trade - more aggressive (was 1.5%)
+  stop_loss_atr_mult: 1.5          # Tighter stops = less loss per trade (was 2.0)
+  take_profit_atr_mult: 5.0        # Bigger targets = let winners run (was 4.0)
+  min_risk_reward: 2.5             # Only take 2.5:1 R:R or better (was 2.0)
+  max_drawdown_pct: 0.12           # Slightly higher tolerance (was 10%)
+  trailing_stop_pct: 0.025         # Tighter trail to lock profits (was 3%)
+  partial_exit_enabled: true       # Take partial profits
+  partial_exit_r: 1.2              # Take first partial earlier at 1.2R (was 1.5R)
+  partial_exit_pct: 0.40           # Close 40% at first target (was 50%)
+  second_partial_enabled: true     # NEW: Second partial exit
+  second_partial_r: 2.5            # NEW: Take more at 2.5R
+  second_partial_pct: 0.30         # NEW: Close 30% more
+  daily_loss_limit_pct: 0.025      # 2.5% daily loss limit - tighter (was 3%)
+  sizing_method: "volatility_adjusted"  # NEW: Better sizing (was fixed_fractional)
+  kelly_fraction: 0.5
+  kelly_min_trades: 30
+  # NEW: Profit maximizer settings
+  volume_surge_size_boost: 1.2     # Bigger size on high volume signals
+  sector_rotation_enabled: true    # Overweight strong sectors
+  dynamic_targets_enabled: true    # Use support/resistance for TP/SL
 
 execution:
   smart_orders: false            # set true to use limit orders with fallback
