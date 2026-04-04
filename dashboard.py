@@ -631,24 +631,26 @@ def api_chart(symbol):
             if not np.isnan(val):
                 rsi_line.append({"time": t, "value": round(float(val), 2)})
 
-    # Signal markers from watcher
+    # Signal markers from watcher - CURRENT signals only
     markers = []
+    current_time = int(datetime.now().timestamp())
+    
     if symbol in _watchers:
         w = _watchers[symbol]
         s = w.state
         if s.confirmed and s.last_price > 0:
-            last_ts = candles[-1]["time"] if candles else 0
+            # Use current time for LIVE signal marker (not historical bar time)
             if s.action.value == "buy":
                 markers.append({
-                    "time": last_ts, "position": "belowBar",
-                    "color": "#22c55e", "shape": "arrowUp",
-                    "text": f"BUY {s.score:.2f} ({s.num_agreeing}/5)"
+                    "time": current_time, "position": "belowBar",
+                    "color": "#00ff00", "shape": "arrowUp",
+                    "text": f">>> LIVE BUY {s.score:.2f} ({s.num_agreeing}/5) <<<"
                 })
             elif s.action.value == "short":
                 markers.append({
-                    "time": last_ts, "position": "aboveBar",
-                    "color": "#ef4444", "shape": "arrowDown",
-                    "text": f"SHORT {s.score:.2f} ({s.num_agreeing}/5)"
+                    "time": current_time, "position": "aboveBar",
+                    "color": "#ff0000", "shape": "arrowDown",
+                    "text": f">>> LIVE SHORT {s.score:.2f} ({s.num_agreeing}/5) <<<"
                 })
 
     # Trend context
@@ -680,7 +682,9 @@ def api_chart(symbol):
             "above_vwap": bool(s.above_vwap),
         }
 
-    # Trade history markers (actual buys/sells from tracker)
+    # Trade history markers (actual buys/sells from tracker) - Last 7 days only
+    seven_days_ago = current_time - (7 * 24 * 60 * 60)
+    
     for trade in _tracker.trades:
         if trade.get("symbol") != symbol:
             continue
@@ -692,6 +696,11 @@ def api_chart(symbol):
                     entry_ts = int(pd.Timestamp(entry_time).timestamp())
                 else:
                     entry_ts = int(entry_time.timestamp())
+                
+                # Only show recent trades (last 7 days)
+                if entry_ts < seven_days_ago:
+                    continue
+                    
                 side = trade.get("side", "buy")
                 is_buy = side == "buy"
                 markers.append({
@@ -711,6 +720,11 @@ def api_chart(symbol):
                     exit_ts = int(pd.Timestamp(exit_time).timestamp())
                 else:
                     exit_ts = int(exit_time.timestamp())
+                
+                # Only show recent exits
+                if exit_ts < seven_days_ago:
+                    continue
+                    
                 pnl = trade.get("pnl", 0)
                 markers.append({
                     "time": exit_ts,
@@ -729,6 +743,19 @@ def api_chart(symbol):
     analysis = _build_analysis(symbol, df, intraday, trend_ctx)
 
     # Use NumpyEncoder to handle numpy types (bool_, int64, float64, etc.)
+    
+    # Add signal timing info for clarity
+    last_data_time = candles[-1]["time"] if candles else 0
+    last_intraday_time = intraday_candles[-1]["time"] if intraday_candles else 0
+    
+    signal_info = {
+        "current_time": current_time,
+        "current_time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_daily_bar": datetime.fromtimestamp(last_data_time).strftime("%Y-%m-%d %H:%M") if last_data_time else "N/A",
+        "last_5min_bar": datetime.fromtimestamp(last_intraday_time).strftime("%Y-%m-%d %H:%M") if last_intraday_time else "N/A",
+        "has_live_signal": len([m for m in markers if "LIVE" in m.get("text", "")]) > 0,
+    }
+    
     result = {
         "symbol": symbol,
         "candles": candles,
@@ -747,6 +774,7 @@ def api_chart(symbol):
         "trend": trend_ctx,
         "watcher": watcher_info,
         "analysis": analysis,
+        "signal_timing": signal_info,
     }
     safe = json.loads(json.dumps(result, cls=NumpyEncoder))
     return jsonify(safe)
