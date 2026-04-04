@@ -20,6 +20,7 @@ class SizedOrder:
 
 class RiskManager:
     def __init__(self, config: dict):
+        self._config = config
         self.cfg = config["risk"]
         # Restore peak equity from persisted state
         state = load_state()
@@ -71,17 +72,26 @@ class RiskManager:
             # Direction: positive score = long, negative = short
             is_short = opp.direction == "sell" or opp.score < 0
 
+            # Use crypto-specific risk params if applicable
+            from broker import CRYPTO_SYMBOLS
+            crypto_cfg = self.cfg
+            if opp.symbol in CRYPTO_SYMBOLS:
+                # Merge crypto overrides from screener.crypto_risk
+                crypto_overrides = self._config.get("screener", {}).get("crypto_risk", {})
+                if crypto_overrides:
+                    crypto_cfg = {**self.cfg, **crypto_overrides}
+
             if is_short:
                 # SHORT: stop above entry, target below entry
-                stop_loss = entry_price + (atr * self.cfg["stop_loss_atr_mult"])
-                take_profit = entry_price - (atr * self.cfg["take_profit_atr_mult"])
+                stop_loss = entry_price + (atr * crypto_cfg["stop_loss_atr_mult"])
+                take_profit = entry_price - (atr * crypto_cfg["take_profit_atr_mult"])
                 risk = stop_loss - entry_price
                 reward = entry_price - take_profit
                 side = "sell"
             else:
                 # LONG: stop below entry, target above entry
-                stop_loss = entry_price - (atr * self.cfg["stop_loss_atr_mult"])
-                take_profit = entry_price + (atr * self.cfg["take_profit_atr_mult"])
+                stop_loss = entry_price - (atr * crypto_cfg["stop_loss_atr_mult"])
+                take_profit = entry_price + (atr * crypto_cfg["take_profit_atr_mult"])
                 risk = entry_price - stop_loss
                 reward = take_profit - entry_price
                 side = "buy"

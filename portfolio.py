@@ -2,9 +2,11 @@
 Portfolio management with pro-grade exit logic.
 
 Improvements:
-- Trailing stops (persisted across restarts)
+- Direction-aware trailing stops (long: high watermark, short: low watermark)
 - Time-based stops (close zombie trades after 5 days with <0.5R profit)
-- Breakeven stop (move stop to entry after 0.75R profit)
+- Breakeven stop (move stop to entry after 0.75R profit, persisted)
+- Partial exit scaling (close 50% at 1.5R)
+- Position reconciliation with broker state
 - Trade recording for performance tracking
 """
 
@@ -12,6 +14,7 @@ from datetime import datetime
 from utils import setup_logger
 from state import load_state, save_state
 from tracker import TradeTracker
+from broker import CRYPTO_SYMBOLS
 
 log = setup_logger("portfolio")
 
@@ -24,10 +27,12 @@ class PortfolioManager:
 
         # Restore watermarks from persisted state
         state = load_state()
-        self.high_watermarks = state.get("high_watermarks", {})
+        self.high_watermarks = state.get("high_watermarks", {})  # longs: tracks highs
+        self.low_watermarks = state.get("low_watermarks", {})    # shorts: tracks lows
 
         # Track when positions were opened and their initial risk
-        # {symbol: {"opened_at": iso_str, "entry_price": float, "initial_risk": float}}
+        # {symbol: {"opened_at": iso_str, "entry_price": float, "initial_risk": float,
+        #           "breakeven_armed": bool, "partial_done": bool}}
         self.position_meta = state.get("position_meta", {})
 
     def get_current_positions(self) -> dict:
@@ -57,8 +62,15 @@ class PortfolioManager:
 
     def check_trailing_stops(self, positions: dict,
                               prices: dict[str, float]) -> tuple[list[str], list[dict]]:
-        """Check trailing stops, partial exits, return symbols to close and partial exits."""
-        trail_pct = self.config["risk"]["trailing_stop_pct"]
+        """Check trailing stops, partial exits, return symbols to close and partial exits.
+
+        Direction-aware:
+        - Long: high watermark tracks price peaks, trail triggers on drop from peak
+        - Short: low watermark tracks price troughs, trail triggers on rise from trough
+        """
+        default_trail_pct = self.config["risk"]["trailing_stop_pct"]
+        crypto_trail_pct = self.config.get("screener", {}).get(
+            "crypto_risk", {}).get("trailing_stop_pct", default_trail_pct)
         to_close = []
         partial_exits = []  # [{"symbol": str, "qty": int, "reason": str}]
 
@@ -74,18 +86,27 @@ class PortfolioManager:
             current_price = prices[sym]
             entry_price = pos["entry_price"]
             is_long = pos.get("side", "long") == "long"
+            meta = self.position_meta.get(sym, {})
+            trail_pct = crypto_trail_pct if sym in CRYPTO_SYMBOLS else default_trail_pct
 
-            # Update high watermark
-            if sym not in self.high_watermarks:
-                self.high_watermarks[sym] = max(entry_price, current_price)
+            # === DIRECTION-AWARE WATERMARK ===
+            if is_long:
+                if sym not in self.high_watermarks:
+                    self.high_watermarks[sym] = max(entry_price, current_price)
+                else:
+                    self.high_watermarks[sym] = max(self.high_watermarks[sym], current_price)
+                watermark = self.high_watermarks[sym]
+                trail_price = watermark * (1 - trail_pct)
             else:
-                self.high_watermarks[sym] = max(self.high_watermarks[sym], current_price)
-
-            hwm = self.high_watermarks[sym]
-            trail_price = hwm * (1 - trail_pct)
+                # Short: track the lowest price (best for short)
+                if sym not in self.low_watermarks:
+                    self.low_watermarks[sym] = min(entry_price, current_price)
+                else:
+                    self.low_watermarks[sym] = min(self.low_watermarks[sym], current_price)
+                watermark = self.low_watermarks[sym]
+                trail_price = watermark * (1 + trail_pct)
 
             # === PARTIAL EXIT at 1.5R ===
-            meta = self.position_meta.get(sym, {})
             if partial_enabled and not meta.get("partial_done", False):
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
@@ -108,27 +129,50 @@ class PortfolioManager:
                             f"PARTIAL EXIT: {sym} — {current_r:.1f}R reached, "
                             f"closing {close_qty}/{qty} shares ({partial_pct:.0%})"
                         )
-                        # Mark partial done so we don't repeat
                         meta["partial_done"] = True
                         self.position_meta[sym] = meta
                         self._save_meta()
 
-            # === BREAKEVEN STOP ===
-            profit_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+            # === BREAKEVEN STOP (persisted) ===
             breakeven_triggered = False
-            if profit_pct >= 0.015:  # ~0.75R for typical 2% risk
-                if current_price <= entry_price and pos["unrealized_pl"] <= 0:
-                    log.info(f"BREAKEVEN STOP: {sym} — was in profit, now back at entry")
+            if is_long:
+                profit_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+            else:
+                profit_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0
+
+            # Arm breakeven when profit hits 0.75R (persist so it survives restarts)
+            if profit_pct >= 0.015 and not meta.get("breakeven_armed", False):
+                meta["breakeven_armed"] = True
+                self.position_meta[sym] = meta
+                self._save_meta()
+                log.info(f"BREAKEVEN ARMED: {sym} — profit reached {profit_pct:.1%}")
+
+            if meta.get("breakeven_armed", False):
+                if is_long and current_price <= entry_price:
+                    log.info(f"BREAKEVEN STOP: {sym} (long) — was in profit, now at/below entry")
+                    to_close.append(sym)
+                    breakeven_triggered = True
+                elif not is_long and current_price >= entry_price:
+                    log.info(f"BREAKEVEN STOP: {sym} (short) — was in profit, now at/above entry")
                     to_close.append(sym)
                     breakeven_triggered = True
 
-            # === TRAILING STOP ===
-            if not breakeven_triggered and current_price <= trail_price and pos["unrealized_pl"] > 0:
-                log.info(
-                    f"TRAILING STOP: {sym} price={current_price:.2f} "
-                    f"trail={trail_price:.2f} hwm={hwm:.2f} P&L=${pos['unrealized_pl']:.2f}"
-                )
-                to_close.append(sym)
+            # === TRAILING STOP (direction-aware) ===
+            if not breakeven_triggered and sym not in to_close:
+                if is_long and current_price <= trail_price and pos["unrealized_pl"] > 0:
+                    log.info(
+                        f"TRAILING STOP: {sym} (long) price={current_price:.2f} "
+                        f"trail={trail_price:.2f} hwm={watermark:.2f} "
+                        f"P&L=${pos['unrealized_pl']:.2f}"
+                    )
+                    to_close.append(sym)
+                elif not is_long and current_price >= trail_price and pos["unrealized_pl"] > 0:
+                    log.info(
+                        f"TRAILING STOP: {sym} (short) price={current_price:.2f} "
+                        f"trail={trail_price:.2f} lwm={watermark:.2f} "
+                        f"P&L=${pos['unrealized_pl']:.2f}"
+                    )
+                    to_close.append(sym)
 
             # === TIME-BASED STOP ===
             if not breakeven_triggered and sym not in to_close:
@@ -180,18 +224,25 @@ class PortfolioManager:
         """Close positions for given symbols and record trades."""
         for sym in symbols_to_close:
             try:
-                # Grab position info before closing so we can record the trade
+                # Grab position info and meta BEFORE closing/popping
                 pos = positions.get(sym) if positions else None
+                meta = self.position_meta.get(sym, {})
+
                 self.broker.close_position(sym)
                 log.info(f"Closed position: {sym}")
+
+                # Clean up both watermark dicts
                 self.high_watermarks.pop(sym, None)
-                self.position_meta.pop(sym, None)
+                self.low_watermarks.pop(sym, None)
 
                 if pos:
                     # Determine exit reason
-                    reason = "exit"
-                    profit_pct = (pos["current_price"] - pos["entry_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0
-                    meta = self.position_meta.get(sym, {})
+                    is_long = pos.get("side", "long") == "long"
+                    if is_long:
+                        profit_pct = (pos["current_price"] - pos["entry_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0
+                    else:
+                        profit_pct = (pos["entry_price"] - pos["current_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0
+
                     opened_str = meta.get("opened_at", "")
                     days_held = 0
                     if opened_str:
@@ -202,7 +253,7 @@ class PortfolioManager:
 
                     if days_held >= 5 and profit_pct < 0.01:
                         reason = "time_stop"
-                    elif pos["unrealized_pl"] <= 0 and profit_pct >= -0.005:
+                    elif meta.get("breakeven_armed") and pos["unrealized_pl"] <= 0:
                         reason = "breakeven_stop"
                     elif pos["unrealized_pl"] > 0:
                         reason = "trailing_stop"
@@ -219,6 +270,9 @@ class PortfolioManager:
                         reason=reason,
                         risk_dollars=risk_dollars,
                     )
+
+                # Pop meta AFTER using it
+                self.position_meta.pop(sym, None)
             except Exception as e:
                 log.error(f"Failed to close {sym}: {e}")
 
@@ -268,9 +322,10 @@ class PortfolioManager:
         self._save_meta()
 
     def _save_watermarks(self):
-        """Persist high watermarks to state file."""
+        """Persist watermarks to state file."""
         state = load_state()
         state["high_watermarks"] = self.high_watermarks
+        state["low_watermarks"] = self.low_watermarks
         save_state(state)
 
     def _save_meta(self):

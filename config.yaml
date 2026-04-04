@@ -53,6 +53,11 @@ screener:
   crypto:
     - BTC/USD
     - ETH/USD
+  # Crypto-specific risk overrides (wider stops for higher volatility)
+  crypto_risk:
+    stop_loss_atr_mult: 2.5       # wider SL for crypto volatility
+    take_profit_atr_mult: 5.0     # wider TP to match
+    trailing_stop_pct: 0.05       # 5% trail (crypto swings more)
 
 strategies:
   momentum:
@@ -134,12 +139,14 @@ filters:
   correlation_cache_minutes: 30
 
 backtest:
-  slippage_pct: 0.001           # 10 basis points per fill
-  spread_pct: 0.0005            # 5 bps estimated half-spread cost per fill
+  slippage_pct: 0.001           # 10 basis points per fill (stocks)
+  spread_pct: 0.0005            # 5 bps estimated half-spread cost per fill (stocks)
+  crypto_slippage_pct: 0.002    # 20 bps per fill (wider crypto spreads on Alpaca)
+  crypto_spread_pct: 0.001      # 10 bps half-spread for crypto
   volume_impact: true           # extra slippage on large orders
   commission_per_share: 0.0     # Alpaca is commission-free (but spread matters)
   initial_equity: 100000
-  # Total realistic cost: ~15 bps round-trip (10 slippage + 5 spread per side)
+  # Stocks: ~15 bps round-trip | Crypto: ~60 bps round-trip
 
 alerts:
   enabled: true                  # set to false to disable

@@ -29,6 +29,9 @@ log = setup_logger("coordinator")
 
 
 class Coordinator:
+    # Hard limit: max orders per hour to prevent runaway order loops
+    MAX_ORDERS_PER_HOUR = 20
+
     def __init__(self):
         log.info("=" * 60)
         log.info("TRADING BOT STARTING (Threaded Architecture)")
@@ -47,6 +50,9 @@ class Coordinator:
         # Watcher threads: {symbol: StockWatcher}
         self.watchers: dict[str, StockWatcher] = {}
         self._lock = threading.Lock()
+
+        # Order rate limiter: track timestamps of recent orders
+        self._order_timestamps: list[float] = []
 
         # Verify connection
         account = self.broker.get_account()
@@ -231,10 +237,11 @@ class Coordinator:
         regime = self.regime.get_regime()
         log.info(f"Market: {regime['description']}")
 
-        # 3. Manage existing positions
+        # 3. Manage existing positions + reconcile with broker
         positions = self.portfolio.get_current_positions()
-        self.portfolio.log_portfolio_status(positions)
         held_symbols = list(positions.keys())
+        self._reconcile_positions(held_symbols)
+        self.portfolio.log_portfolio_status(positions)
 
         if positions:
             prices = self.data.get_latest_prices(list(positions.keys()))
@@ -378,6 +385,13 @@ class Coordinator:
                 executable.append(w)
                 stock_slots -= 1
 
+        # Rate limit check
+        if not self._check_order_rate_limit():
+            log.critical("ORDER RATE LIMIT HIT — halting new orders this cycle")
+            self.portfolio.tracker.log_stats()
+            self._log_watcher_status()
+            return
+
         for watcher in executable:
             sym = watcher.symbol
             bars = watcher.get_bars()
@@ -463,6 +477,7 @@ class Coordinator:
                         confluence=watcher.state.num_agreeing,
                     )
                     held_symbols.append(order.symbol)
+                    self._order_timestamps.append(time.time())
                 except Exception as e:
                     log.error(f"Order failed for {sym}: {e}")
                     self.alerts.send_error(f"Order failed for {sym}: {e}")
@@ -470,6 +485,49 @@ class Coordinator:
         # 9. Log stats
         self.portfolio.tracker.log_stats()
         self._log_watcher_status()
+
+    def _check_order_rate_limit(self) -> bool:
+        """Returns False if order rate limit exceeded. Safety valve."""
+        now = time.time()
+        hour_ago = now - 3600
+        self._order_timestamps = [t for t in self._order_timestamps if t > hour_ago]
+        if len(self._order_timestamps) >= self.MAX_ORDERS_PER_HOUR:
+            log.critical(
+                f"ORDER RATE LIMIT: {len(self._order_timestamps)} orders in last hour "
+                f"(max={self.MAX_ORDERS_PER_HOUR}). Halting new entries."
+            )
+            self.alerts.send_error(
+                f"Order rate limit hit: {len(self._order_timestamps)} orders/hour"
+            )
+            return False
+        return True
+
+    def _reconcile_positions(self, held_symbols: list[str]):
+        """
+        Reconcile local state with broker's actual positions.
+        Cleans up watermarks/meta for positions that no longer exist
+        (e.g., bracket SL/TP filled between cycles).
+        """
+        broker_positions = set(held_symbols)
+        stale_hw = [s for s in self.portfolio.high_watermarks if s not in broker_positions]
+        stale_lw = [s for s in self.portfolio.low_watermarks if s not in broker_positions]
+        stale_meta = [s for s in self.portfolio.position_meta if s not in broker_positions]
+
+        cleaned = False
+        for sym in stale_hw:
+            self.portfolio.high_watermarks.pop(sym, None)
+            cleaned = True
+        for sym in stale_lw:
+            self.portfolio.low_watermarks.pop(sym, None)
+            cleaned = True
+        for sym in stale_meta:
+            log.info(f"RECONCILE: {sym} no longer held — cleaning up local state")
+            self.portfolio.position_meta.pop(sym, None)
+            cleaned = True
+
+        if cleaned:
+            self.portfolio._save_watermarks()
+            self.portfolio._save_meta()
 
     def _log_watcher_status(self):
         """Log a summary of all watcher threads."""

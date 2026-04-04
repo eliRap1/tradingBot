@@ -23,6 +23,7 @@ from candles import detect_patterns, bullish_score
 from trend import get_trend_context
 from risk import RiskManager
 from signals import Opportunity
+from broker import CRYPTO_SYMBOLS
 from utils import setup_logger
 
 log = setup_logger("backtester")
@@ -33,30 +34,30 @@ log = setup_logger("backtester")
 class SlippageModel:
     """Realistic fill price simulation with slippage + spread costs.
 
-    Total round-trip cost target: ~15 bps
-      - Slippage: 10 bps per fill (market impact)
-      - Spread: 5 bps per fill (bid-ask crossing cost)
-      - Volume impact: additional cost on large orders
+    Stocks: ~15 bps round-trip (10 slippage + 5 spread per side)
+    Crypto: ~60 bps round-trip (20 slippage + 10 spread per side, wider Alpaca spreads)
     """
 
     def __init__(self, config: dict):
         bt_cfg = config.get("backtest", {})
-        self.base_slippage_pct = bt_cfg.get("slippage_pct", 0.001)  # 10 bps
-        self.spread_pct = bt_cfg.get("spread_pct", 0.0005)  # 5 bps half-spread
+        self.base_slippage_pct = bt_cfg.get("slippage_pct", 0.001)
+        self.spread_pct = bt_cfg.get("spread_pct", 0.0005)
+        self.crypto_slippage_pct = bt_cfg.get("crypto_slippage_pct", 0.002)
+        self.crypto_spread_pct = bt_cfg.get("crypto_spread_pct", 0.001)
         self.volume_impact = bt_cfg.get("volume_impact", True)
         self.commission_per_share = bt_cfg.get("commission_per_share", 0.0)
 
     def get_fill_price(self, price: float, side: str, volume: int,
-                       qty: int) -> float:
+                       qty: int, is_crypto: bool = False) -> float:
         """
         Calculate realistic fill price including slippage and spread.
-        - Base slippage (10 bps default)
-        - Spread cost (5 bps — crossing the bid-ask)
-        - Volume impact: extra slippage if qty > 1% of bar volume
-        - Direction: buys fill higher, sells fill lower
+        Uses higher costs for crypto due to wider Alpaca spreads.
         """
         participation = qty / max(volume, 1)
-        impact = self.base_slippage_pct + self.spread_pct
+        if is_crypto:
+            impact = self.crypto_slippage_pct + self.crypto_spread_pct
+        else:
+            impact = self.base_slippage_pct + self.spread_pct
         if self.volume_impact and participation > 0.01:
             impact += participation * 0.01
 
@@ -196,47 +197,45 @@ class Backtester:
 
                 exit_price = None
                 exit_reason = None
+                _crypto = sym in CRYPTO_SYMBOLS
 
                 if pos.side == "buy":
                     # Stop loss hit? (low goes below stop)
                     if bar_low <= pos.stop_loss:
-                        # Gap through stop → fill at open
                         if bar_open <= pos.stop_loss:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "sell", bar_vol, pos.qty)
+                                bar_open, "sell", bar_vol, pos.qty, _crypto)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.stop_loss, "sell", bar_vol, pos.qty)
+                                pos.stop_loss, "sell", bar_vol, pos.qty, _crypto)
                         exit_reason = "stop_loss"
 
-                    # Take profit hit? (high goes above TP)
                     elif bar_high >= pos.take_profit:
                         if bar_open >= pos.take_profit:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "sell", bar_vol, pos.qty)
+                                bar_open, "sell", bar_vol, pos.qty, _crypto)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.take_profit, "sell", bar_vol, pos.qty)
+                                pos.take_profit, "sell", bar_vol, pos.qty, _crypto)
                         exit_reason = "take_profit"
 
                 else:  # short
-                    # Stop loss hit? (high goes above stop)
                     if bar_high >= pos.stop_loss:
                         if bar_open >= pos.stop_loss:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "buy", bar_vol, pos.qty)
+                                bar_open, "buy", bar_vol, pos.qty, _crypto)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.stop_loss, "buy", bar_vol, pos.qty)
+                                pos.stop_loss, "buy", bar_vol, pos.qty, _crypto)
                         exit_reason = "stop_loss"
 
                     elif bar_low <= pos.take_profit:
                         if bar_open <= pos.take_profit:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "buy", bar_vol, pos.qty)
+                                bar_open, "buy", bar_vol, pos.qty, _crypto)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.take_profit, "buy", bar_vol, pos.qty)
+                                pos.take_profit, "buy", bar_vol, pos.qty, _crypto)
                         exit_reason = "take_profit"
 
                 if exit_price is not None:
@@ -287,10 +286,11 @@ class Backtester:
                 # Strategy selection based on historical data
                 selection = select_strategies(hist, sym)
 
-                # Run strategies
+                # Run strategies — track both bullish and bearish agreement
                 weighted_sum = 0.0
                 total_weight = 0.0
-                num_agreeing = 0
+                num_bullish = 0
+                num_bearish = 0
                 strat_scores = {}
 
                 for strat_name, weight in selection["strategies"].items():
@@ -307,26 +307,40 @@ class Backtester:
                     total_weight += weight
 
                     if score > 0.1:
-                        num_agreeing += 1
+                        num_bullish += 1
+                    elif score < -0.1:
+                        num_bearish += 1
 
                 if total_weight == 0:
                     continue
 
                 composite = weighted_sum / total_weight
 
-                if num_agreeing >= self.min_agreeing and composite >= self.min_score:
+                # Check long signal
+                if num_bullish >= self.min_agreeing and composite >= self.min_score:
                     signals_by_sym[sym] = {
                         "score": composite,
-                        "num_agreeing": num_agreeing,
+                        "direction": "buy",
+                        "num_agreeing": num_bullish,
+                        "strat_scores": strat_scores,
+                        "hist": hist,
+                    }
+                    total_signals_found += 1
+                # Check short signal
+                elif num_bearish >= self.min_agreeing and composite <= -self.min_score:
+                    signals_by_sym[sym] = {
+                        "score": composite,
+                        "direction": "sell",
+                        "num_agreeing": num_bearish,
                         "strat_scores": strat_scores,
                         "hist": hist,
                     }
                     total_signals_found += 1
 
-            # ── 3. Size and execute ─────────────────────────
-            # Sort by score
+            # ── 3. Size and execute (long + short) ─────────
+            # Sort by absolute score
             sorted_signals = sorted(signals_by_sym.items(),
-                                    key=lambda x: x[1]["score"], reverse=True)
+                                    key=lambda x: abs(x[1]["score"]), reverse=True)
 
             slots = self.max_positions - len(positions)
             for sym, sig in sorted_signals[:slots]:
@@ -337,6 +351,7 @@ class Backtester:
 
                 bar_close = float(bar["close"])
                 bar_vol = int(bar["volume"])
+                direction = sig["direction"]
 
                 # ATR-based stops
                 import ta
@@ -350,20 +365,29 @@ class Backtester:
 
                 sl_mult = self.config["risk"]["stop_loss_atr_mult"]
                 tp_mult = self.config["risk"]["take_profit_atr_mult"]
-                stop_loss = bar_close - (atr_val * sl_mult)
-                take_profit = bar_close + (atr_val * tp_mult)
 
-                risk_per_share = bar_close - stop_loss
+                if direction == "sell":
+                    # SHORT: stop above, target below
+                    stop_loss = bar_close + (atr_val * sl_mult)
+                    take_profit = bar_close - (atr_val * tp_mult)
+                    risk_per_share = stop_loss - bar_close
+                    reward = bar_close - take_profit
+                else:
+                    # LONG: stop below, target above
+                    stop_loss = bar_close - (atr_val * sl_mult)
+                    take_profit = bar_close + (atr_val * tp_mult)
+                    risk_per_share = bar_close - stop_loss
+                    reward = take_profit - bar_close
+
                 if risk_per_share <= 0:
                     continue
 
                 # R:R filter
-                reward = take_profit - bar_close
                 rr = reward / risk_per_share
                 if rr < self.config["risk"]["min_risk_reward"]:
                     continue
 
-                # Position sizing (1% risk)
+                # Position sizing
                 max_risk = equity * self.config["risk"]["max_portfolio_risk_pct"]
                 qty = int(max_risk / risk_per_share)
                 max_pos_value = equity * self.config["risk"]["max_position_pct"]
@@ -372,12 +396,13 @@ class Backtester:
                 if qty <= 0:
                     continue
 
-                # Simulate fill with slippage
+                # Simulate fill with slippage (crypto gets wider spreads)
                 fill_price = self.slippage.get_fill_price(
-                    bar_close, "buy", bar_vol, qty)
+                    bar_close, direction, bar_vol, qty,
+                    is_crypto=sym in CRYPTO_SYMBOLS)
 
                 positions[sym] = Position(
-                    symbol=sym, side="buy", qty=qty,
+                    symbol=sym, side=direction, qty=qty,
                     entry_price=round(fill_price, 2),
                     stop_loss=round(stop_loss, 2),
                     take_profit=round(take_profit, 2),

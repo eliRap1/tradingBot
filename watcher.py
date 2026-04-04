@@ -12,6 +12,8 @@ This mimics how a real trader watches a chart — focused on one instrument
 at a time, reading price action, and applying the right setup.
 """
 
+import json
+import os
 import threading
 import time
 import pandas as pd
@@ -25,6 +27,8 @@ from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context, get_weekly_trend
 from indicators import supertrend, pivot_high, pivot_low, stochastic_rsi, last_pivot_value
 from utils import setup_logger
+
+PENDING_STATE_FILE = os.path.join(os.path.dirname(__file__), "watcher_pending.json")
 
 
 class Action(Enum):
@@ -81,6 +85,9 @@ class StockWatcher:
         self._thread = None
         self._stop_event = threading.Event()
         self._bars = None  # cached bars
+
+        # Restore pending signal state from disk (survives restarts)
+        self.state.prev_signal = _load_pending_state(symbol)
 
     def start(self):
         """Start watching in a background thread."""
@@ -212,11 +219,12 @@ class StockWatcher:
         signal_type = Action.BUY if has_long else Action.SHORT if has_short else Action.NONE
         direction_str = "LONG" if has_long else "SHORT" if has_short else ""
 
-        # Confirmation: signal must persist across 2 checks
+        # Confirmation: signal must persist across 2 checks (persisted to disk)
         if has_signal and self.state.prev_signal:
             self.state.confirmed = True
             self.state.action = signal_type
             self.state.status = "signal"
+            _save_pending_state(self.symbol, True)
             self.log.info(
                 f"CONFIRMED {direction_str} SIGNAL: score={composite:.3f} "
                 f"confluence={self.state.num_agreeing}/{len(selection['strategies'])} "
@@ -227,6 +235,7 @@ class StockWatcher:
             self.state.confirmed = False
             self.state.action = Action.NONE
             self.state.status = "pending"
+            _save_pending_state(self.symbol, True)
             self.log.info(
                 f"Pending {direction_str}: score={composite:.3f} "
                 f"confluence={self.state.num_agreeing} — waiting for confirmation"
@@ -236,7 +245,40 @@ class StockWatcher:
             self.state.confirmed = False
             self.state.action = Action.NONE
             self.state.status = "watching"
+            _save_pending_state(self.symbol, False)
 
     def get_bars(self) -> pd.DataFrame | None:
         """Return cached bars for order sizing."""
         return self._bars
+
+
+# ── Pending signal persistence (survives restarts) ────────
+
+_pending_lock = threading.Lock()
+
+
+def _load_pending_state(symbol: str) -> bool:
+    """Load whether a symbol had a pending signal from disk."""
+    try:
+        if not os.path.exists(PENDING_STATE_FILE):
+            return False
+        with open(PENDING_STATE_FILE, "r") as f:
+            data = json.load(f)
+        return data.get(symbol, False)
+    except Exception:
+        return False
+
+
+def _save_pending_state(symbol: str, has_signal: bool):
+    """Save pending signal state to disk (thread-safe)."""
+    with _pending_lock:
+        try:
+            data = {}
+            if os.path.exists(PENDING_STATE_FILE):
+                with open(PENDING_STATE_FILE, "r") as f:
+                    data = json.load(f)
+            data[symbol] = has_signal
+            with open(PENDING_STATE_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass

@@ -214,7 +214,7 @@
 </div>
 
 <script>
-const SYMBOL = "{{ symbol }}";
+const SYMBOL = {{ symbol | tojson }};
 let chartData = null;
 let currentTF = "daily";
 
