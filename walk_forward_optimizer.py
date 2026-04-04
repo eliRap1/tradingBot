@@ -275,31 +275,76 @@ class WalkForwardOptimizer:
             # Import here to avoid circular imports
             from backtester import Backtester
             
-            bt = Backtester(config)
-            result = bt.run(
-                start_date=start_date,
-                end_date=end_date,
-                symbols=config["screener"]["universe"][:20],  # Limit for speed
-            )
+            # Use cached data if available, otherwise fetch
+            cache_key = f"{start_date}_{end_date}"
             
-            if not result or result.get("total_trades", 0) == 0:
+            if not hasattr(self, '_data_cache'):
+                self._data_cache = {}
+            
+            if cache_key not in self._data_cache:
+                # Try to fetch data
+                try:
+                    from data import DataFetcher
+                    from broker import Broker
+                    
+                    broker = Broker(config)
+                    data_fetcher = DataFetcher(broker)
+                    
+                    # Calculate days needed
+                    start = datetime.strptime(start_date, "%Y-%m-%d")
+                    end = datetime.strptime(end_date, "%Y-%m-%d")
+                    days_needed = (end - start).days + 60  # Extra buffer
+                    
+                    symbols = config["screener"]["universe"][:15]
+                    raw_bars = data_fetcher.get_bars(symbols, timeframe="1Day", days=days_needed)
+                    
+                    # Convert to DataFrames with proper index
+                    bars_dict = {}
+                    for sym, bar_list in raw_bars.items():
+                        if isinstance(bar_list, list) and len(bar_list) >= 30:
+                            df = pd.DataFrame(bar_list)
+                            if 'timestamp' in df.columns:
+                                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                                df.set_index('timestamp', inplace=True)
+                            bars_dict[sym] = df
+                        elif isinstance(bar_list, pd.DataFrame) and len(bar_list) >= 30:
+                            bars_dict[sym] = bar_list
+                    
+                    self._data_cache[cache_key] = bars_dict
+                    
+                except Exception as e:
+                    log.warning(f"Could not fetch data: {e}")
+                    return None
+            
+            bars_dict = self._data_cache.get(cache_key, {})
+            
+            if not bars_dict:
+                return None
+            
+            # Run backtest
+            bt = Backtester(config)
+            result = bt.run(bars_dict, min_bars=30)
+            
+            if result is None or result.total_trades == 0:
                 return None
             
             return BacktestResult(
                 params=params,
-                total_return=result.get("total_return", 0),
-                sharpe_ratio=result.get("sharpe_ratio", 0),
-                max_drawdown=result.get("max_drawdown", 0),
-                win_rate=result.get("win_rate", 0),
-                profit_factor=result.get("profit_factor", 0),
-                total_trades=result.get("total_trades", 0),
-                avg_trade_duration=result.get("avg_trade_duration", 0),
+                total_return=result.total_return_pct,
+                sharpe_ratio=result.sharpe_ratio,
+                max_drawdown=result.max_drawdown_pct / 100,  # Convert to decimal
+                win_rate=result.win_rate,
+                profit_factor=result.profit_factor,
+                total_trades=result.total_trades,
+                avg_trade_duration=result.avg_bars_held,
                 start_date=start_date,
                 end_date=end_date,
             )
             
         except Exception as e:
             log.error(f"Backtest failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def _merge_params(self, params: dict) -> dict:
