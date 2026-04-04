@@ -112,7 +112,8 @@ class RiskManager:
                 side = "buy"
 
             # ── Risk:Reward filter ───────────────────────────
-            min_rr = self.cfg.get("min_risk_reward", 2.5)
+            # Use crypto-specific min R:R if available
+            min_rr = crypto_cfg.get("min_risk_reward", self.cfg.get("min_risk_reward", 2.5))
             if risk <= 0:
                 continue
             rr_ratio = reward / risk

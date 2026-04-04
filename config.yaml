@@ -58,6 +58,7 @@ screener:
     stop_loss_atr_mult: 2.5       # wider SL for crypto volatility
     take_profit_atr_mult: 5.0     # wider TP to match
     trailing_stop_pct: 0.05       # 5% trail (crypto swings more)
+    min_risk_reward: 1.8          # Lower R:R for crypto (more volatile)
 
 strategies:
   momentum:

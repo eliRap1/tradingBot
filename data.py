@@ -159,26 +159,48 @@ class DataFetcher:
     def get_latest_price(self, symbol: str) -> float | None:
         try:
             if symbol in CRYPTO_SYMBOLS:
-                # Alpaca v2: use quote (bid/ask midpoint) for crypto
-                quote = self._api_call_with_retry(self.api.get_latest_crypto_quote, symbol)
-                bid = float(quote.bp) if hasattr(quote, 'bp') else 0
-                ask = float(quote.ap) if hasattr(quote, 'ap') else 0
-                if bid > 0 and ask > 0:
-                    return (bid + ask) / 2
-                return ask or bid or None
+                # Try multiple methods for crypto price (API versions vary)
+                # Method 1: get_latest_crypto_quotes (plural, newer API)
+                try:
+                    quotes = self._api_call_with_retry(
+                        self.api.get_latest_crypto_quotes, [symbol]
+                    )
+                    if symbol in quotes:
+                        q = quotes[symbol]
+                        bid = float(q.bp) if hasattr(q, 'bp') else 0
+                        ask = float(q.ap) if hasattr(q, 'ap') else 0
+                        if bid > 0 and ask > 0:
+                            return (bid + ask) / 2
+                        return ask or bid
+                except AttributeError:
+                    pass
+                
+                # Method 2: get_crypto_bars (fallback)
+                try:
+                    bars = self._api_call_with_retry(
+                        self.api.get_crypto_bars, symbol, "1Min", limit=1
+                    )
+                    for bar in bars:
+                        return float(bar.c)
+                except Exception:
+                    pass
+                
+                # Method 3: get_latest_bar (another fallback)
+                try:
+                    bar = self._api_call_with_retry(
+                        self.api.get_latest_crypto_bar, symbol
+                    )
+                    if bar:
+                        return float(bar.c)
+                except AttributeError:
+                    pass
+                
+                return None
             else:
                 trade = self._api_call_with_retry(self.api.get_latest_trade, symbol, feed="iex")
                 return float(trade.price)
         except Exception as e:
             log.error(f"Failed to get price for {symbol}: {e}")
-            # Fallback: try getting price from latest bar
-            try:
-                if symbol in CRYPTO_SYMBOLS:
-                    bars = self._api_call_with_retry(self.api.get_crypto_bars, symbol, "1Min", limit=1)
-                    for bar in bars:
-                        return float(bar.c)
-            except Exception:
-                pass
             return None
 
     def get_latest_prices(self, symbols: list[str]) -> dict[str, float]:
