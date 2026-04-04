@@ -224,6 +224,9 @@ class Coordinator:
         log.info("-" * 40)
         log.info(f"COORDINATOR CYCLE: {datetime.now():%H:%M:%S}")
 
+        # 0. Check crypto exit fills (manual OCO behavior)
+        self.broker.check_crypto_exit_fills()
+
         # 1. Check drawdown
         equity = self.broker.get_equity()
         if self.risk.check_drawdown(equity):

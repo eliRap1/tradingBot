@@ -1,4 +1,6 @@
 import pandas as pd
+import time
+import threading
 from datetime import datetime, timedelta
 from utils import setup_logger
 
@@ -8,12 +10,70 @@ CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
 
 
 class DataFetcher:
-    def __init__(self, broker):
+    """Data fetching with rate limiting and exponential backoff.
+    
+    Alpaca limits: 200 requests/min for free tier, higher for paid.
+    We implement a token bucket rate limiter + exponential backoff on failures.
+    """
+    
+    def __init__(self, broker, requests_per_minute: int = 150):
         self.api = broker.api
+        
+        # Rate limiter: token bucket
+        self._rate_limit = requests_per_minute
+        self._tokens = requests_per_minute
+        self._last_refill = time.time()
+        self._lock = threading.Lock()
+    
+    def _wait_for_rate_limit(self):
+        """Block until a request token is available."""
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_refill
+            
+            # Refill tokens based on elapsed time
+            refill = elapsed * (self._rate_limit / 60.0)
+            self._tokens = min(self._rate_limit, self._tokens + refill)
+            self._last_refill = now
+            
+            if self._tokens < 1:
+                # Wait until we have a token
+                wait_time = (1 - self._tokens) * (60.0 / self._rate_limit)
+                time.sleep(wait_time)
+                self._tokens = 1
+            
+            self._tokens -= 1
+    
+    def _api_call_with_retry(self, func, *args, max_retries: int = 3, **kwargs):
+        """Execute API call with exponential backoff on failure."""
+        for attempt in range(max_retries):
+            self._wait_for_rate_limit()
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # Rate limit error - back off significantly
+                if "rate" in error_str or "429" in error_str or "too many" in error_str:
+                    backoff = min(60, 2 ** attempt * 5)  # 5s, 10s, 20s, max 60s
+                    log.warning(f"Rate limit hit, backing off {backoff}s: {e}")
+                    time.sleep(backoff)
+                # Server error - retry with backoff
+                elif "500" in error_str or "502" in error_str or "503" in error_str:
+                    backoff = 2 ** attempt
+                    log.warning(f"Server error, retry in {backoff}s: {e}")
+                    time.sleep(backoff)
+                # Other errors - don't retry
+                else:
+                    raise e
+        
+        # Final attempt without catching
+        self._wait_for_rate_limit()
+        return func(*args, **kwargs)
 
     def get_bars(self, symbols: list[str], timeframe: str = "1Day",
                  days: int = 60) -> dict[str, pd.DataFrame]:
-        """Fetch historical bars for multiple symbols."""
+        """Fetch historical bars for multiple symbols with rate limiting."""
         end = datetime.now()
         start = end - timedelta(days=days)
 
@@ -24,12 +84,13 @@ class DataFetcher:
         bars = {}
         time_fmt = "%Y-%m-%dT%H:%M:%SZ" if "Min" in timeframe else "%Y-%m-%d"
 
-        # Fetch stock bars
+        # Fetch stock bars with rate limiting
         batch_size = 20
         for i in range(0, len(stock_symbols), batch_size):
             batch = stock_symbols[i:i + batch_size]
             try:
-                raw = self.api.get_bars(
+                raw = self._api_call_with_retry(
+                    self.api.get_bars,
                     batch,
                     timeframe,
                     start=start.strftime(time_fmt),
@@ -53,10 +114,11 @@ class DataFetcher:
             except Exception as e:
                 log.error(f"Failed to fetch bars for {batch}: {e}")
 
-        # Fetch crypto bars (use "us_equity" feed doesn't apply — Alpaca crypto uses different endpoint)
+        # Fetch crypto bars with rate limiting
         for sym in crypto_symbols:
             try:
-                raw = self.api.get_crypto_bars(
+                raw = self._api_call_with_retry(
+                    self.api.get_crypto_bars,
                     sym,
                     timeframe,
                     start=start.strftime(time_fmt),
@@ -98,21 +160,21 @@ class DataFetcher:
         try:
             if symbol in CRYPTO_SYMBOLS:
                 # Alpaca v2: use quote (bid/ask midpoint) for crypto
-                quote = self.api.get_latest_crypto_quote(symbol)
+                quote = self._api_call_with_retry(self.api.get_latest_crypto_quote, symbol)
                 bid = float(quote.bp) if hasattr(quote, 'bp') else 0
                 ask = float(quote.ap) if hasattr(quote, 'ap') else 0
                 if bid > 0 and ask > 0:
                     return (bid + ask) / 2
                 return ask or bid or None
             else:
-                trade = self.api.get_latest_trade(symbol, feed="iex")
+                trade = self._api_call_with_retry(self.api.get_latest_trade, symbol, feed="iex")
                 return float(trade.price)
         except Exception as e:
             log.error(f"Failed to get price for {symbol}: {e}")
             # Fallback: try getting price from latest bar
             try:
                 if symbol in CRYPTO_SYMBOLS:
-                    bars = self.api.get_crypto_bars(symbol, "1Min", limit=1)
+                    bars = self._api_call_with_retry(self.api.get_crypto_bars, symbol, "1Min", limit=1)
                     for bar in bars:
                         return float(bar.c)
             except Exception:
@@ -129,7 +191,7 @@ class DataFetcher:
 
     def get_snapshot(self, symbol: str):
         try:
-            return self.api.get_snapshot(symbol, feed="iex")
+            return self._api_call_with_retry(self.api.get_snapshot, symbol, feed="iex")
         except Exception as e:
             log.error(f"Failed to get snapshot for {symbol}: {e}")
             return None

@@ -85,6 +85,8 @@ class StockWatcher:
         self._thread = None
         self._stop_event = threading.Event()
         self._bars = None  # cached bars
+        self._bars_cache_time = None  # track cache age
+        self._max_cache_age_seconds = 300  # refresh bars every 5 min max
 
         # Restore pending signal state from disk (survives restarts)
         self.state.prev_signal = _load_pending_state(symbol)
@@ -128,8 +130,16 @@ class StockWatcher:
         Multi-timeframe approach:
           - Daily bars → trend context (200 EMA, ADX, weekly trend)
           - 5-min bars → entry signals (strategies, candle patterns)
+          
+        Memory management: Clear old bars to prevent memory leaks in long-running bot.
         """
         self.state.status = "analyzing"
+        
+        # Clear old cached bars periodically to prevent memory buildup
+        now = time.time()
+        if self._bars is not None and self._bars_cache_time:
+            if now - self._bars_cache_time > self._max_cache_age_seconds:
+                self._bars = None  # Force refresh
 
         # 1a. Fetch DAILY bars for trend context
         daily_bars = self.data.get_bars([self.symbol], timeframe="1Day", days=250)
@@ -146,6 +156,7 @@ class StockWatcher:
             intraday_df = daily_df
 
         self._bars = intraday_df  # used for order sizing (ATR on entry timeframe)
+        self._bars_cache_time = time.time()  # Track cache age
         self.state.last_price = float(intraday_df["close"].iloc[-1])
 
         # 2. Read the chart — DAILY timeframe for trend context

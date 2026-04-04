@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import uuid
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
 from utils import setup_logger
@@ -27,6 +28,11 @@ class Broker:
             base_url=base_url,
             api_version="v2"
         )
+        
+        # Track crypto exit orders for proper OCO behavior
+        # {symbol: {"tp_order_id": str, "sl_order_id": str, "qty": float}}
+        self._crypto_exit_orders = {}
+        self._crypto_lock = threading.Lock()
 
     def get_account(self):
         return self.api.get_account()
@@ -84,14 +90,24 @@ class Broker:
 
     def submit_crypto_order(self, symbol: str, qty: float, side: str,
                              take_profit: float, stop_loss: float):
-        """Submit crypto order with separate TP and SL orders.
-        Crypto doesn't support bracket orders on Alpaca, so we place
-        entry + TP limit + SL stop as 3 separate orders."""
+        """Submit crypto order with linked TP and SL orders.
+        
+        Crypto doesn't support bracket orders on Alpaca, so we:
+        1. Place entry order and wait for fill confirmation
+        2. Place TP limit and SL stop orders with the actual filled qty
+        3. Track both exit orders so we can cancel the other when one fills
+        
+        CRITICAL: The exit orders are tracked in _crypto_exit_orders so that
+        when one fills, we can cancel the other (manual OCO behavior).
+        """
         log.info(f"CRYPTO ORDER: {side} {qty} {symbol} | TP={take_profit:.2f} SL={stop_loss:.2f}")
 
         # Round crypto prices (BTC to 2 decimals, ETH to 2)
         tp_price = round(take_profit, 2)
         sl_price = round(stop_loss, 2)
+        
+        # Use client_order_id for idempotency
+        client_id = f"crypto_{symbol.replace('/', '')}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
         # Entry order
         entry = self.api.submit_order(
@@ -99,41 +115,158 @@ class Broker:
             qty=qty,
             side=side,
             type="market",
-            time_in_force="gtc"
+            time_in_force="gtc",
+            client_order_id=f"{client_id}_entry"
         )
-
+        
+        # Wait for entry fill (up to 30 seconds) to get actual filled qty
+        filled_qty = qty
+        for _ in range(15):
+            time.sleep(2)
+            try:
+                order_status = self.api.get_order(entry.id)
+                if order_status.status == "filled":
+                    filled_qty = float(order_status.filled_qty)
+                    log.info(f"CRYPTO ENTRY FILLED: {symbol} qty={filled_qty}")
+                    break
+                elif order_status.status in ("canceled", "expired", "rejected"):
+                    log.error(f"CRYPTO ENTRY FAILED: {symbol} status={order_status.status}")
+                    return entry
+            except Exception as e:
+                log.warning(f"Error checking entry status: {e}")
+        
         # Exit side (opposite of entry)
         exit_side = "sell" if side == "buy" else "buy"
+        
+        tp_order_id = None
+        sl_order_id = None
 
         # Take-profit limit order
         try:
-            self.api.submit_order(
+            tp_order = self.api.submit_order(
                 symbol=symbol,
-                qty=qty,
+                qty=filled_qty,
                 side=exit_side,
                 type="limit",
                 limit_price=tp_price,
-                time_in_force="gtc"
+                time_in_force="gtc",
+                client_order_id=f"{client_id}_tp"
             )
-            log.info(f"CRYPTO TP order placed: {exit_side} {qty} {symbol} @ ${tp_price}")
+            tp_order_id = tp_order.id
+            log.info(f"CRYPTO TP order placed: {exit_side} {filled_qty} {symbol} @ ${tp_price}")
         except Exception as e:
             log.error(f"Failed to place crypto TP order: {e}")
 
         # Stop-loss order
         try:
-            self.api.submit_order(
+            sl_order = self.api.submit_order(
                 symbol=symbol,
-                qty=qty,
+                qty=filled_qty,
                 side=exit_side,
                 type="stop",
                 stop_price=sl_price,
-                time_in_force="gtc"
+                time_in_force="gtc",
+                client_order_id=f"{client_id}_sl"
             )
-            log.info(f"CRYPTO SL order placed: {exit_side} {qty} {symbol} @ ${sl_price}")
+            sl_order_id = sl_order.id
+            log.info(f"CRYPTO SL order placed: {exit_side} {filled_qty} {symbol} @ ${sl_price}")
         except Exception as e:
             log.error(f"Failed to place crypto SL order: {e}")
 
+        # Track exit orders for OCO behavior
+        if tp_order_id or sl_order_id:
+            with self._crypto_lock:
+                self._crypto_exit_orders[symbol] = {
+                    "tp_order_id": tp_order_id,
+                    "sl_order_id": sl_order_id,
+                    "qty": filled_qty,
+                    "entry_side": side
+                }
+
         return entry
+    
+    def check_crypto_exit_fills(self):
+        """Check if any crypto TP/SL orders have filled and cancel the other.
+        
+        This should be called periodically (e.g., in coordinator cycle) to
+        implement manual OCO behavior for crypto positions.
+        """
+        with self._crypto_lock:
+            symbols_to_remove = []
+            
+            for symbol, orders in self._crypto_exit_orders.items():
+                tp_id = orders.get("tp_order_id")
+                sl_id = orders.get("sl_order_id")
+                
+                tp_filled = False
+                sl_filled = False
+                
+                # Check TP order status
+                if tp_id:
+                    try:
+                        tp_status = self.api.get_order(tp_id)
+                        if tp_status.status == "filled":
+                            tp_filled = True
+                            log.info(f"CRYPTO TP FILLED: {symbol}")
+                        elif tp_status.status in ("canceled", "expired", "rejected"):
+                            orders["tp_order_id"] = None
+                    except Exception:
+                        pass
+                
+                # Check SL order status
+                if sl_id:
+                    try:
+                        sl_status = self.api.get_order(sl_id)
+                        if sl_status.status == "filled":
+                            sl_filled = True
+                            log.info(f"CRYPTO SL FILLED: {symbol}")
+                        elif sl_status.status in ("canceled", "expired", "rejected"):
+                            orders["sl_order_id"] = None
+                    except Exception:
+                        pass
+                
+                # If one filled, cancel the other (OCO behavior)
+                if tp_filled and sl_id:
+                    try:
+                        self.api.cancel_order(sl_id)
+                        log.info(f"CRYPTO OCO: Cancelled SL for {symbol} (TP filled)")
+                    except Exception as e:
+                        log.warning(f"Failed to cancel SL after TP fill: {e}")
+                    symbols_to_remove.append(symbol)
+                    
+                elif sl_filled and tp_id:
+                    try:
+                        self.api.cancel_order(tp_id)
+                        log.info(f"CRYPTO OCO: Cancelled TP for {symbol} (SL filled)")
+                    except Exception as e:
+                        log.warning(f"Failed to cancel TP after SL fill: {e}")
+                    symbols_to_remove.append(symbol)
+                
+                # Clean up if both orders are gone
+                elif not orders.get("tp_order_id") and not orders.get("sl_order_id"):
+                    symbols_to_remove.append(symbol)
+            
+            for symbol in symbols_to_remove:
+                self._crypto_exit_orders.pop(symbol, None)
+    
+    def cancel_crypto_exit_orders(self, symbol: str):
+        """Cancel any pending TP/SL orders for a crypto position."""
+        with self._crypto_lock:
+            orders = self._crypto_exit_orders.pop(symbol, {})
+        
+        if orders.get("tp_order_id"):
+            try:
+                self.api.cancel_order(orders["tp_order_id"])
+                log.info(f"Cancelled crypto TP order for {symbol}")
+            except Exception:
+                pass
+        
+        if orders.get("sl_order_id"):
+            try:
+                self.api.cancel_order(orders["sl_order_id"])
+                log.info(f"Cancelled crypto SL order for {symbol}")
+            except Exception:
+                pass
 
     def get_quote(self, symbol: str):
         """Get current bid/ask quote."""
@@ -155,7 +288,12 @@ class Broker:
         1. Gets current price and places limit order slightly better
         2. Waits up to timeout_sec for fill
         3. If not filled, cancels and sends market bracket order
+        
+        Uses client_order_id for idempotency on retries.
         """
+        # Generate idempotency key
+        client_id = f"smart_{symbol}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        
         quote = self.get_quote(symbol)
         if not quote:
             # Fallback to immediate bracket order
@@ -178,11 +316,12 @@ class Broker:
                  f"(timeout={timeout_sec}s)")
 
         try:
-            # Place limit order (no bracket yet)
+            # Place limit order with idempotency key (no bracket yet)
             order = self.api.submit_order(
                 symbol=symbol, qty=qty, side=side,
                 type="limit", limit_price=limit_price,
-                time_in_force="day"
+                time_in_force="day",
+                client_order_id=f"{client_id}_entry"
             )
             order_id = order.id
 

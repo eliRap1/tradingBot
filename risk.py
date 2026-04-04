@@ -119,11 +119,16 @@ class RiskManager:
                     p = tracker_stats.get("win_pct", 50) / 100
                     avg_win = abs(tracker_stats.get("avg_win", 1))
                     avg_loss = abs(tracker_stats.get("avg_loss", 1))
+                    
+                    # EDGE CASE FIX: Cap the win/loss ratio to prevent extreme sizing
+                    # when avg_loss is very small (e.g., first few losses are tiny)
                     b = avg_win / avg_loss if avg_loss > 0 else 1.0
-
+                    b = min(b, 5.0)  # Cap at 5:1 win/loss ratio for safety
+                    
                     kelly_f = p - ((1 - p) / b) if b > 0 else 0
                     # Half Kelly for safety
                     kelly_f *= self.cfg.get("kelly_fraction", 0.5)
+                    # Bound Kelly between 0.5% and max_portfolio_risk_pct
                     kelly_f = max(0.005, min(kelly_f, self.cfg["max_portfolio_risk_pct"]))
 
                     max_risk_dollars = equity * kelly_f
