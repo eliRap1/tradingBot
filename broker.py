@@ -84,9 +84,15 @@ class Broker:
 
     def submit_crypto_order(self, symbol: str, qty: float, side: str,
                              take_profit: float, stop_loss: float):
-        """Submit crypto order with separate TP/SL (no bracket for crypto).
-        Places a market entry then a limit TP order."""
+        """Submit crypto order with separate TP and SL orders.
+        Crypto doesn't support bracket orders on Alpaca, so we place
+        entry + TP limit + SL stop as 3 separate orders."""
         log.info(f"CRYPTO ORDER: {side} {qty} {symbol} | TP={take_profit:.2f} SL={stop_loss:.2f}")
+
+        # Round crypto prices (BTC to 2 decimals, ETH to 2)
+        tp_price = round(take_profit, 2)
+        sl_price = round(stop_loss, 2)
+
         # Entry order
         entry = self.api.submit_order(
             symbol=symbol,
@@ -95,16 +101,38 @@ class Broker:
             type="market",
             time_in_force="gtc"
         )
-        # Place take-profit limit order
-        tp_side = "sell" if side == "buy" else "buy"
-        self.api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side=tp_side,
-            type="limit",
-            limit_price=round(take_profit, 2),
-            time_in_force="gtc"
-        )
+
+        # Exit side (opposite of entry)
+        exit_side = "sell" if side == "buy" else "buy"
+
+        # Take-profit limit order
+        try:
+            self.api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=exit_side,
+                type="limit",
+                limit_price=tp_price,
+                time_in_force="gtc"
+            )
+            log.info(f"CRYPTO TP order placed: {exit_side} {qty} {symbol} @ ${tp_price}")
+        except Exception as e:
+            log.error(f"Failed to place crypto TP order: {e}")
+
+        # Stop-loss order
+        try:
+            self.api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=exit_side,
+                type="stop",
+                stop_price=sl_price,
+                time_in_force="gtc"
+            )
+            log.info(f"CRYPTO SL order placed: {exit_side} {qty} {symbol} @ ${sl_price}")
+        except Exception as e:
+            log.error(f"Failed to place crypto SL order: {e}")
+
         return entry
 
     def get_quote(self, symbol: str):

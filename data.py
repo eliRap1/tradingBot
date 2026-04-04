@@ -97,12 +97,26 @@ class DataFetcher:
     def get_latest_price(self, symbol: str) -> float | None:
         try:
             if symbol in CRYPTO_SYMBOLS:
-                trade = self.api.get_latest_crypto_trade(symbol)
+                # Alpaca v2: use quote (bid/ask midpoint) for crypto
+                quote = self.api.get_latest_crypto_quote(symbol)
+                bid = float(quote.bp) if hasattr(quote, 'bp') else 0
+                ask = float(quote.ap) if hasattr(quote, 'ap') else 0
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2
+                return ask or bid or None
             else:
                 trade = self.api.get_latest_trade(symbol, feed="iex")
-            return float(trade.price)
+                return float(trade.price)
         except Exception as e:
             log.error(f"Failed to get price for {symbol}: {e}")
+            # Fallback: try getting price from latest bar
+            try:
+                if symbol in CRYPTO_SYMBOLS:
+                    bars = self.api.get_crypto_bars(symbol, "1Min", limit=1)
+                    for bar in bars:
+                        return float(bar.c)
+            except Exception:
+                pass
             return None
 
     def get_latest_prices(self, symbols: list[str]) -> dict[str, float]:
