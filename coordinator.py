@@ -7,7 +7,6 @@ Responsibilities:
   - Enforce global risk limits (max positions, regime, drawdown)
   - Execute trades when watchers report confirmed signals
   - Manage existing positions (trailing stops, exits)
-  - Apply profit maximization enhancements
   - ENSURE LIVE TRADING with real-time data validation
 """
 
@@ -25,10 +24,10 @@ from portfolio import PortfolioManager
 from regime import RegimeFilter
 from filters import SmartFilters
 from watcher import StockWatcher, Action
-from alerts import AlertManager
-from profit_maximizer import ProfitMaximizer, AdaptiveExitManager
+from alerts import AlertManager, DiscordBot
 from live_trading import LiveTradingManager, DataFreshnessValidator, ensure_live_trading_mode
 from walk_forward_optimizer import apply_optimized_params
+from ml_model import MLMetaModel
 
 log = setup_logger("coordinator")
 
@@ -38,9 +37,10 @@ class Coordinator:
     MAX_ORDERS_PER_HOUR = 20
 
     def __init__(self):
-        log.info("=" * 60)
-        log.info("TRADING BOT STARTING (LIVE TRADING MODE)")
-        log.info("=" * 60)
+        log.info("")
+        log.info("=" * 55)
+        log.info("     TRADING BOT v2.0 - LIVE MODE")
+        log.info("=" * 55)
         
         # Verify we're in live/paper mode, not backtest
         if not ensure_live_trading_mode():
@@ -60,11 +60,13 @@ class Coordinator:
         self.regime = RegimeFilter(self.data, universe=self.config["screener"]["universe"])
         self.filters = SmartFilters(tracker=self.portfolio.tracker, config=self.config)
         self.alerts = AlertManager(self.config)
-        
-        # Profit maximization modules
-        self.profit_max = ProfitMaximizer(self.config)
-        self.exit_manager = AdaptiveExitManager(self.config)
-        
+        self.discord_bot = DiscordBot(
+            tracker=self.portfolio.tracker, broker=self.broker
+        )
+        self.discord_bot.start()
+        self.ml_model = MLMetaModel()
+        self._ml_train_counter = 0  # retrain every N cycles
+
         # LIVE TRADING: Real-time data validation
         self.live_manager = LiveTradingManager(self.broker)
         self.freshness_validator = DataFreshnessValidator()
@@ -164,6 +166,20 @@ class Coordinator:
                     next_open = clock.next_open
                     log.info(f"Market closed. Crypto watchers active. "
                              f"Next stock open: {next_open}")
+                    # Send ONE Discord alert with Israel time + full stats
+                    equity = self.broker.get_equity()
+                    positions = self.portfolio.get_current_positions()
+                    stats = self.portfolio.tracker.get_stats()
+                    # Count today's trades
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    today_trades = [t for t in self.portfolio.tracker.trades
+                                    if t.get("closed_at", "").startswith(today_str)]
+                    daily_pnl = sum(t["pnl"] for t in today_trades)
+                    self.alerts.send_market_closed(
+                        next_open, stats=stats, equity=equity,
+                        positions=len(positions), daily_pnl=daily_pnl,
+                        daily_trades=len(today_trades),
+                    )
 
                     # Market-closed loop: keep running crypto cycles
                     interval = self.config["schedule"]["cycle_interval_sec"]
@@ -252,8 +268,10 @@ class Coordinator:
         
         LIVE TRADING: Validates market hours and data freshness before trading.
         """
-        log.info("-" * 40)
-        log.info(f"COORDINATOR CYCLE: {datetime.now():%H:%M:%S}")
+        log.info("")
+        log.info("=" * 50)
+        log.info(f"  CYCLE @ {datetime.now():%H:%M:%S}")
+        log.info("=" * 50)
 
         # 0a. Check if we should skip this cycle (market hours check)
         should_skip, skip_reason = self.live_manager.should_skip_cycle()
@@ -284,6 +302,20 @@ class Coordinator:
         regime = self.regime.get_regime()
         log.info(f"Market: {regime['description']}")
 
+        # 2b. Retrain ML meta-model periodically (every 50 cycles)
+        self._ml_train_counter += 1
+        if self._ml_train_counter % 50 == 1:
+            self.ml_model.train(self.portfolio.tracker.trades)
+
+        # 2c. Update alpha decay factors and distribute to watchers
+        decay_factors = self.portfolio.tracker.get_strategy_alpha_decay()
+        if decay_factors:
+            decaying = {s: f for s, f in decay_factors.items() if f < 0.8}
+            if decaying:
+                log.info(f"Alpha decay: {', '.join(f'{s}={f:.2f}x' for s, f in decaying.items())}")
+            for w in self.watchers.values():
+                w._alpha_decay = decay_factors
+
         # 3. Manage existing positions + reconcile with broker
         positions = self.portfolio.get_current_positions()
         held_symbols = list(positions.keys())
@@ -292,10 +324,45 @@ class Coordinator:
 
         if positions:
             prices = self.data.get_latest_prices(list(positions.keys()))
-            to_close, partial_exits = self.portfolio.check_trailing_stops(positions, prices)
+            # Fetch bars for ATR-based Chandelier trailing stops
+            pos_bars = {}
+            for sym in positions:
+                w = self.watchers.get(sym)
+                if w and w.get_bars() is not None:
+                    pos_bars[sym] = w.get_bars()
+            to_close, partial_exits = self.portfolio.check_trailing_stops(positions, prices, pos_bars)
             if partial_exits:
+                for p in partial_exits:
+                    pos = positions.get(p["symbol"])
+                    if pos:
+                        self.alerts.send_exit_alert(
+                            symbol=p["symbol"], side=pos.get("side", "long"),
+                            entry_price=pos["entry_price"],
+                            exit_price=pos["current_price"],
+                            pnl=pos.get("unrealized_pl", 0.0) * (p["qty"] / pos["qty"]) if pos["qty"] > 0 else 0,
+                            pnl_pct=(pos["current_price"] - pos["entry_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0,
+                            reason=p.get("reason", "partial_exit"),
+                        )
                 self.portfolio.execute_partial_exits(partial_exits, positions)
             if to_close:
+                # Send Discord exit alerts before closing
+                for sym in to_close:
+                    pos = positions.get(sym)
+                    if pos:
+                        meta = self.portfolio.position_meta.get(sym, {})
+                        is_long = pos.get("side", "long") == "long"
+                        pnl = pos.get("unrealized_pl", 0.0)
+                        if is_long:
+                            pnl_pct = (pos["current_price"] - pos["entry_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0
+                        else:
+                            pnl_pct = (pos["entry_price"] - pos["current_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0
+                        reason = "trailing_stop" if pnl > 0 else "stop_loss"
+                        self.alerts.send_exit_alert(
+                            symbol=sym, side=pos.get("side", "long"),
+                            entry_price=pos["entry_price"],
+                            exit_price=pos["current_price"],
+                            pnl=pnl, pnl_pct=pnl_pct, reason=reason,
+                        )
                 self.portfolio.execute_exits(to_close, positions)
                 positions = self.portfolio.get_current_positions()
                 held_symbols = list(positions.keys())
@@ -316,7 +383,7 @@ class Coordinator:
 
         # 5. Collect confirmed signals from watchers (LONG + SHORT)
         trade_signals = []
-        for sym, watcher in self.watchers.items():
+        for sym, watcher in list(self.watchers.items()):
             if sym in held_symbols:
                 continue
             if not watcher.state.confirmed:
@@ -344,6 +411,28 @@ class Coordinator:
             self._log_watcher_status()
             return
 
+        # 5b. ML meta-model filter: skip signals with low predicted win probability
+        if self.ml_model.is_ready:
+            ml_filtered = []
+            for w in trade_signals:
+                features = {
+                    "strategy_scores": w.state.strategy_scores,
+                    "num_agreeing": w.state.num_agreeing,
+                    "composite_score": w.state.score,
+                }
+                prob = self.ml_model.predict(features)
+                if prob is not None and prob < 0.4:
+                    log.info(f"ML FILTER: {w.symbol} blocked (win_prob={prob:.1%})")
+                    continue
+                ml_filtered.append(w)
+            trade_signals = ml_filtered
+
+            if not trade_signals:
+                log.info("All signals filtered by ML model")
+                self.portfolio.tracker.log_stats()
+                self._log_watcher_status()
+                return
+
         # Sort by absolute score (strongest signals first)
         trade_signals.sort(key=lambda w: abs(w.state.score), reverse=True)
 
@@ -360,20 +449,10 @@ class Coordinator:
             sector = SECTOR_MAP.get(sym, "other")
             sector_count[sector] = sector_count.get(sector, 0) + 1
 
-        # Gap filter + sector filter
+        # Sector filter (gap filter removed — GapStrategy handles gap analysis)
         filtered = []
         for watcher in trade_signals:
             sym = watcher.symbol
-            bars = watcher.get_bars()
-
-            # Gap filter (skip for crypto — gaps are normal)
-            if sym not in CRYPTO_SYMBOLS and bars is not None and len(bars) >= 2 and "open" in bars.columns:
-                prev_close = float(bars["close"].iloc[-2])
-                today_open = float(bars["open"].iloc[-1])
-                gap_pct = abs(today_open - prev_close) / prev_close if prev_close > 0 else 0
-                if gap_pct > 0.02:
-                    log.info(f"GAP FILTER: Skipping {sym} (gapped {gap_pct:.1%})")
-                    continue
 
             # Sector cap
             sector = SECTOR_MAP.get(sym, "other")
@@ -481,6 +560,7 @@ class Coordinator:
                 num_existing=len(held_symbols),
                 regime_size_mult=size_mult,
                 tracker_stats=self.portfolio.tracker.get_stats(),
+                tracker=self.portfolio.tracker,
             )
 
             for order in orders:
@@ -527,6 +607,10 @@ class Coordinator:
                         order.symbol, order.entry_price,
                         order.stop_loss, order.qty
                     )
+                    # Store which strategies fired for alpha decay tracking
+                    contributing = [s for s, v in watcher.state.strategy_scores.items()
+                                    if abs(v) > 0.1]
+                    self.portfolio.position_meta.setdefault(order.symbol, {})["strategies"] = contributing
                     log.info(
                         f"ORDER: {order.side} {order.qty} {order.symbol} "
                         f"@ ~${order.entry_price:.2f} | "
@@ -545,6 +629,10 @@ class Coordinator:
                     )
                     held_symbols.append(order.symbol)
                     self._order_timestamps.append(time.time())
+                    # Clear watcher signal to prevent re-entry if position stops out
+                    watcher.state.confirmed = False
+                    watcher.state.prev_signal = False
+                    watcher.state.action = Action.NONE
                 except Exception as e:
                     log.error(f"Order failed for {sym}: {e}")
                     self.alerts.send_error(f"Order failed for {sym}: {e}")
@@ -597,25 +685,31 @@ class Coordinator:
             self.portfolio._save_meta()
 
     def _log_watcher_status(self):
-        """Log a summary of all watcher threads."""
+        """Log a visual summary of all watcher threads."""
+        watchers_snapshot = list(self.watchers.values())
         statuses = {}
-        for sym, w in self.watchers.items():
+        for w in watchers_snapshot:
             s = w.state.status
             statuses[s] = statuses.get(s, 0) + 1
 
-        signals = [w.symbol for w in self.watchers.values()
-                   if w.state.score > 0.2]
-        pending = [w.symbol for w in self.watchers.values()
-                   if w.state.status == "pending"]
+        signals = [f"{w.symbol}({w.state.score:+.2f})" for w in watchers_snapshot if w.state.score > 0.2]
+        pending = [w.symbol for w in watchers_snapshot if w.state.status == "pending"]
+        errors = [w.symbol for w in watchers_snapshot if w.state.status == "error"]
 
-        log.info(f"Watchers: {len(self.watchers)} threads | "
-                 f"Status: {statuses} | "
-                 f"Signals: {signals} | Pending: {pending}")
+        status_str = " | ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
+        log.info(f"  WATCHERS: {len(watchers_snapshot)} active | {status_str}")
+        if signals:
+            log.info(f"  SIGNALS:  {', '.join(signals)}")
+        if pending:
+            log.info(f"  PENDING:  {', '.join(pending)}")
+        if errors:
+            log.warning(f"  ERRORS:   {', '.join(errors)}")
+        log.info("-" * 50)
 
     def get_all_watcher_states(self) -> list[dict]:
         """Return all watcher states for the dashboard."""
         states = []
-        for sym, watcher in sorted(self.watchers.items()):
+        for sym, watcher in sorted(list(self.watchers.items())):
             s = watcher.state
             states.append({
                 "symbol": s.symbol,
@@ -658,10 +752,12 @@ def _make_opportunity(watcher: StockWatcher):
     """Convert a watcher's signal into an Opportunity for the risk manager."""
     from signals import Opportunity
     direction = "sell" if watcher.state.action == Action.SHORT else "buy"
+    contributing = [s for s, v in watcher.state.strategy_scores.items() if abs(v) > 0.1]
     return Opportunity(
         symbol=watcher.symbol,
         score=watcher.state.score,
         direction=direction,
         strategy_scores=watcher.state.strategy_scores,
-        num_agreeing=watcher.state.num_agreeing
+        num_agreeing=watcher.state.num_agreeing,
+        contributing_strategies=contributing,
     )

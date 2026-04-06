@@ -24,8 +24,9 @@ from enum import Enum
 from strategies import ALL_STRATEGIES
 from strategy_selector import select_strategies
 from candles import detect_patterns, bullish_score, bearish_score
-from trend import get_trend_context, get_weekly_trend
-from indicators import supertrend, pivot_high, pivot_low, stochastic_rsi, last_pivot_value
+from trend import get_trend_context, get_weekly_trend, get_hourly_bias
+from indicators import supertrend, pivot_high, pivot_low, stochastic_rsi, last_pivot_value, order_flow_imbalance
+from crypto_sentiment import crypto_sentiment
 from utils import setup_logger
 
 PENDING_STATE_FILE = os.path.join(os.path.dirname(__file__), "watcher_pending.json")
@@ -87,6 +88,7 @@ class StockWatcher:
         self._bars = None  # cached bars
         self._bars_cache_time = None  # track cache age
         self._max_cache_age_seconds = 300  # refresh bars every 5 min max
+        self._alpha_decay = {}  # {strategy_name: float} set by coordinator
 
         # Restore pending signal state from disk (survives restarts)
         self.state.prev_signal = _load_pending_state(symbol)
@@ -155,6 +157,13 @@ class StockWatcher:
             # Fall back to daily if intraday not available (market closed, etc.)
             intraday_df = daily_df
 
+        # 1c. Fetch 1-HOUR bars for intermediate confirmation
+        hourly_df = self.data.get_intraday_bars(self.symbol, timeframe="1Hour", days=10)
+        if hourly_df is not None and len(hourly_df) >= 25:
+            self._hourly_bias = get_hourly_bias(hourly_df)
+        else:
+            self._hourly_bias = {"bias": "neutral"}  # neutral = don't block
+
         self._bars = intraday_df  # used for order sizing (ATR on entry timeframe)
         self._bars_cache_time = time.time()  # Track cache age
         self.state.last_price = float(intraday_df["close"].iloc[-1])
@@ -194,12 +203,16 @@ class StockWatcher:
             if not strat:
                 continue
 
+            # Apply alpha decay factor (reduces weight of decaying strategies)
+            decay = self._alpha_decay.get(strat_name, 1.0)
+            adj_weight = weight * decay
+
             signals = strat.generate_signals({self.symbol: intraday_df})
             score = signals.get(self.symbol, 0.0)
             strategy_scores[strat_name] = round(float(score), 3)
 
-            weighted_sum += score * weight
-            total_weight += weight
+            weighted_sum += score * adj_weight
+            total_weight += adj_weight
 
             if score > 0.1:
                 num_bullish += 1
@@ -210,6 +223,9 @@ class StockWatcher:
         composite = weighted_sum / total_weight if total_weight > 0 else 0.0
         self.state.score = round(float(composite), 3)
 
+        # 5b. Order flow imbalance filter
+        flow = order_flow_imbalance(intraday_df, lookback=20)
+
         # 6. Decision: LONG, SHORT, or NONE
         from data import CRYPTO_SYMBOLS
         is_crypto = self.symbol in CRYPTO_SYMBOLS
@@ -219,10 +235,25 @@ class StockWatcher:
         min_score = self.config["signals"].get("min_crypto_score", 0.15) if is_crypto \
             else self.config["signals"]["min_composite_score"]
 
-        # Check for LONG signal
-        has_long = (num_bullish >= min_agreeing and composite >= min_score)
-        # Check for SHORT signal (3+ strategies bearish, negative composite)
-        has_short = (num_bearish >= min_agreeing and composite <= -min_score)
+        # Crypto sentiment filter (funding rate proxy)
+        crypto_penalize_long = False
+        crypto_penalize_short = False
+        if is_crypto:
+            sent = crypto_sentiment(intraday_df)
+            crypto_penalize_long = sent["penalize_longs"]
+            crypto_penalize_short = sent["penalize_shorts"]
+            if sent["extreme_greed"] or sent["extreme_fear"]:
+                self.log.info(f"Crypto sentiment: {sent['sentiment']:+.2f} "
+                              f"({'EXTREME GREED' if sent['extreme_greed'] else 'EXTREME FEAR'})")
+
+        # Check for LONG signal (blocked if strong bearish order flow or crypto extreme greed)
+        has_long = (num_bullish >= min_agreeing and composite >= min_score
+                    and not flow["is_bearish_flow"]
+                    and not crypto_penalize_long)
+        # Check for SHORT signal (blocked if strong bullish order flow or crypto extreme fear)
+        has_short = (num_bearish >= min_agreeing and composite <= -min_score
+                     and not flow["is_bullish_flow"]
+                     and not crypto_penalize_short)
 
         self.state.num_agreeing = num_bullish if has_long else num_bearish if has_short else max(num_bullish, num_bearish)
 
@@ -230,8 +261,16 @@ class StockWatcher:
         signal_type = Action.BUY if has_long else Action.SHORT if has_short else Action.NONE
         direction_str = "LONG" if has_long else "SHORT" if has_short else ""
 
-        # Confirmation: signal must persist across 2 checks (persisted to disk)
-        if has_signal and self.state.prev_signal:
+        # Hourly bias gate: 1H must agree or be neutral
+        hourly_bias = getattr(self, "_hourly_bias", {}).get("bias", "neutral")
+        hourly_agrees = (
+            hourly_bias == "neutral"
+            or (has_long and hourly_bias == "bullish")
+            or (has_short and hourly_bias == "bearish")
+        )
+
+        # Confirmation: signal must persist across 2 checks + hourly agreement (persisted to disk)
+        if has_signal and self.state.prev_signal and hourly_agrees:
             self.state.confirmed = True
             self.state.action = signal_type
             self.state.status = "signal"
@@ -239,7 +278,17 @@ class StockWatcher:
             self.log.info(
                 f"CONFIRMED {direction_str} SIGNAL: score={composite:.3f} "
                 f"confluence={self.state.num_agreeing}/{len(selection['strategies'])} "
-                f"regime={selection['regime']}"
+                f"regime={selection['regime']} 1H_bias={hourly_bias}"
+            )
+        elif has_signal and self.state.prev_signal and not hourly_agrees:
+            # Signal confirmed on 5min but 1H disagrees — block it
+            self.state.prev_signal = True
+            self.state.confirmed = False
+            self.state.action = Action.NONE
+            self.state.status = "pending"
+            _save_pending_state(self.symbol, True)
+            self.log.info(
+                f"BLOCKED {direction_str}: 1H bias={hourly_bias} conflicts — waiting for alignment"
             )
         elif has_signal:
             self.state.prev_signal = True

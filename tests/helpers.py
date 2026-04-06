@@ -32,6 +32,19 @@ def make_config():
             "vwap_reclaim": {
                 "weight": 0.15,
             },
+            "gap": {
+                "min_gap_pct": 1.5,
+                "strong_gap_pct": 3.0,
+                "weight": 0.15,
+            },
+            "liquidity_sweep": {
+                "pivot_lookback": 5,
+                "sweep_tolerance_pct": 0.005,
+                "min_wick_body_ratio": 2.0,
+                "min_volume_ratio": 1.5,
+                "min_confluence": 3,
+                "weight": 0.20,
+            },
         },
         "signals": {
             "min_composite_score": 0.25,

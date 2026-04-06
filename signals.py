@@ -18,6 +18,7 @@ class Opportunity:
     direction: str  # "buy" or "sell"
     strategy_scores: dict
     num_agreeing: int  # how many strategies are bullish
+    contributing_strategies: list = None  # strategies that fired (|score| > 0.1)
 
 
 def aggregate_signals(all_signals: dict[str, dict[str, float]],

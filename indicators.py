@@ -303,3 +303,148 @@ def vwap_bands(df: pd.DataFrame, num_deviations: list[float] = [1.0, 2.0]):
         result[f"lower_{i}"] = vwap - mult * std
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# Order Flow Imbalance — buy/sell pressure from OHLCV
+# ═══════════════════════════════════════════════════════════════
+
+def order_flow_imbalance(df: pd.DataFrame, lookback: int = 20) -> dict:
+    """
+    Estimate order flow imbalance from OHLCV data using CLV (Close Location Value).
+
+    CLV = (close - low) - (high - close) / (high - low)
+    Ranges from -1 (closed at low = selling pressure) to +1 (closed at high = buying pressure).
+    Volume-weighted CLV over lookback bars gives net order flow direction.
+
+    Returns:
+        {
+            "imbalance": float,       # -1 to +1, volume-weighted CLV
+            "buy_pressure": float,    # 0-1, fraction of volume that's "buying"
+            "is_bullish_flow": bool,  # imbalance > threshold
+            "is_bearish_flow": bool,  # imbalance < -threshold
+            "flow_strength": float,   # abs(imbalance), 0=neutral, 1=extreme
+        }
+    """
+    if len(df) < lookback:
+        return {"imbalance": 0.0, "buy_pressure": 0.5,
+                "is_bullish_flow": False, "is_bearish_flow": False,
+                "flow_strength": 0.0}
+
+    high = df["high"].values[-lookback:]
+    low = df["low"].values[-lookback:]
+    close = df["close"].values[-lookback:]
+    volume = df["volume"].values[-lookback:].astype(float)
+
+    # CLV per bar
+    hl_range = high - low
+    # Avoid division by zero (doji bars)
+    safe_range = np.where(hl_range > 0, hl_range, 1.0)
+    clv = ((close - low) - (high - close)) / safe_range
+
+    # Volume-weighted average CLV
+    total_vol = volume.sum()
+    if total_vol > 0:
+        imbalance = float(np.sum(clv * volume) / total_vol)
+    else:
+        imbalance = 0.0
+
+    # Buy pressure: fraction of volume on "buy" side
+    buy_vol = np.sum(volume * np.clip((clv + 1) / 2, 0, 1))
+    buy_pressure = float(buy_vol / total_vol) if total_vol > 0 else 0.5
+
+    threshold = 0.15  # significant imbalance threshold
+    return {
+        "imbalance": round(imbalance, 4),
+        "buy_pressure": round(buy_pressure, 4),
+        "is_bullish_flow": imbalance > threshold,
+        "is_bearish_flow": imbalance < -threshold,
+        "flow_strength": round(abs(imbalance), 4),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Classic Daily Pivot Points
+# ═══════════════════════════════════════════════════════════════
+
+def daily_pivot_points(df: pd.DataFrame) -> dict | None:
+    if len(df) < 2:
+        return None
+
+    idx = df.index
+    is_intraday = False
+    try:
+        if hasattr(idx, 'hour') or (hasattr(idx[0], 'hour') and not all(
+            t.hour == 0 and t.minute == 0 for t in idx[-10:]
+        )):
+            is_intraday = True
+    except (AttributeError, TypeError):
+        pass
+
+    if is_intraday:
+        dates = pd.Series(idx).dt.date
+        unique_dates = dates.unique()
+        if len(unique_dates) < 2:
+            return None
+        prev_date = unique_dates[-2]
+        mask = dates.values == prev_date
+        prev_day = df.iloc[mask]
+        if len(prev_day) == 0:
+            return None
+        H = float(prev_day["high"].max())
+        L = float(prev_day["low"].min())
+        C = float(prev_day["close"].iloc[-1])
+    else:
+        H = float(df["high"].iloc[-2])
+        L = float(df["low"].iloc[-2])
+        C = float(df["close"].iloc[-2])
+
+    P = (H + L + C) / 3
+    return {
+        "pivot": round(P, 4),
+        "r1": round(2 * P - L, 4),
+        "r2": round(P + (H - L), 4),
+        "s1": round(2 * P - H, 4),
+        "s2": round(P - (H - L), 4),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Keltner Channel Squeeze Detection
+# ═══════════════════════════════════════════════════════════════
+
+def keltner_squeeze(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.0,
+                    kc_period: int = 20, kc_mult: float = 1.5) -> dict:
+    if len(df) < max(bb_period, kc_period) + 10:
+        return {"is_squeeze": False, "squeeze_bars": 0, "just_fired": False}
+
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+
+    bb = ta_lib.volatility.BollingerBands(close, window=bb_period, window_dev=bb_std)
+    bb_upper = bb.bollinger_hband()
+    bb_lower = bb.bollinger_lband()
+
+    kc_mid = ta_lib.trend.EMAIndicator(close, window=kc_period).ema_indicator()
+    atr = ta_lib.volatility.AverageTrueRange(high, low, close, window=kc_period).average_true_range()
+    kc_upper = kc_mid + kc_mult * atr
+    kc_lower = kc_mid - kc_mult * atr
+
+    in_squeeze = (bb_upper < kc_upper) & (bb_lower > kc_lower)
+
+    squeeze_bars = 0
+    for val in reversed(in_squeeze.values):
+        if val:
+            squeeze_bars += 1
+        else:
+            break
+
+    is_squeeze = bool(in_squeeze.iloc[-1])
+    just_fired = not is_squeeze and len(in_squeeze) >= 2 and bool(in_squeeze.iloc[-2])
+
+    return {
+        "is_squeeze": is_squeeze,
+        "squeeze_bars": squeeze_bars,
+        "just_fired": just_fired,
+    }

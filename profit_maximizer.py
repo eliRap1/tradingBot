@@ -36,7 +36,8 @@ class ProfitMaximizer:
             "consumer": ["AMZN", "TSLA", "HD", "COST", "PEP", "KO", "DIS", "NFLX"],
             "fintech": ["V", "MA", "PYPL", "SQ", "COIN"],
             "software": ["CRM", "ADBE", "NOW", "PANW", "SNOW", "PLTR"],
-            "healthcare": ["UNH", "JPM"],
+            "healthcare": ["UNH"],
+            "financials": ["JPM"],
             "travel": ["UBER", "ABNB"],
             "crypto": ["BTC/USD", "ETH/USD"],
         }
@@ -207,7 +208,7 @@ class ProfitMaximizer:
         now = datetime.now()
         
         # Cache for 1 hour
-        if self._sector_cache_time and (now - self._sector_cache_time).seconds < 3600:
+        if self._sector_cache_time and (now - self._sector_cache_time).total_seconds() < 3600:
             return self._sector_cache
         
         sector_scores = {}

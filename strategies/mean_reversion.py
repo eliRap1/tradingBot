@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import ta
-from indicators import rvol
+from indicators import rvol, vwap_bands
 from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
@@ -65,9 +65,19 @@ class MeanReversionStrategy:
         bw_avg = bw_series.tail(20).mean()
         is_squeeze = band_width < bw_avg * 0.7
 
-        # Squeeze = big move coming, don't trade
-        if is_squeeze:
+        # Detect squeeze-to-expansion: was squeezing, now expanding = breakout
+        prev_bw = bw_series.iloc[-2] if len(bw_series) > 1 else band_width
+        was_squeezing = prev_bw < bw_avg * 0.7
+        squeeze_breakout = was_squeezing and not is_squeeze
+
+        # Pure squeeze (still contracting) = big move coming, skip mean reversion
+        if is_squeeze and not squeeze_breakout:
             return 0.0
+
+        # VWAP distance: how far price is from VWAP (for mean reversion strength)
+        vwap_data = vwap_bands(df)
+        vwap_val = vwap_data["vwap"].iloc[-1] if not vwap_data["vwap"].empty else middle
+        vwap_dist = (current_price - vwap_val) / vwap_val if vwap_val > 0 else 0
 
         # Z-score
         rolling_mean = close.rolling(self.cfg["bb_period"]).mean()
@@ -117,6 +127,14 @@ class MeanReversionStrategy:
         if long_score > 0 and not ctx["above_vwap"]:
             long_score += 0.05
 
+        # VWAP proximity: price well below VWAP strengthens long mean reversion
+        if long_score > 0 and vwap_dist < -0.01:
+            long_score += min(0.15, abs(vwap_dist) * 5)
+
+        # Squeeze breakout bonus: expansion after squeeze + going long
+        if squeeze_breakout and current_price > middle:
+            long_score += 0.15
+
         if ctx["trending"]:
             long_score *= 0.6
 
@@ -147,6 +165,14 @@ class MeanReversionStrategy:
         # Above VWAP = overpriced
         if short_score < 0 and ctx["above_vwap"]:
             short_score -= 0.05
+
+        # VWAP proximity: price well above VWAP strengthens short mean reversion
+        if short_score < 0 and vwap_dist > 0.01:
+            short_score -= min(0.15, vwap_dist * 5)
+
+        # Squeeze breakout bonus: expansion after squeeze + going short
+        if squeeze_breakout and current_price < middle:
+            short_score -= 0.15
 
         if ctx["trending"]:
             short_score *= 0.6

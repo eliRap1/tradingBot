@@ -9,6 +9,13 @@ log = setup_logger("data")
 CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
 
 
+def _normalize_crypto(symbol: str) -> str:
+    """Normalize crypto symbol to slash format (ETHUSD → ETH/USD) for Alpaca data API."""
+    if symbol in CRYPTO_SYMBOLS and "/" not in symbol:
+        return symbol[:-3] + "/" + symbol[-3:]
+    return symbol
+
+
 class DataFetcher:
     """Data fetching with rate limiting and exponential backoff.
     
@@ -74,6 +81,8 @@ class DataFetcher:
     def get_bars(self, symbols: list[str], timeframe: str = "1Day",
                  days: int = 60) -> dict[str, pd.DataFrame]:
         """Fetch historical bars for multiple symbols with rate limiting."""
+        # Normalize crypto symbols to slash format for Alpaca API
+        symbols = [_normalize_crypto(s) for s in symbols]
         end = datetime.now()
         start = end - timedelta(days=days)
 
@@ -158,6 +167,7 @@ class DataFetcher:
 
     def get_latest_price(self, symbol: str) -> float | None:
         try:
+            symbol = _normalize_crypto(symbol)
             if symbol in CRYPTO_SYMBOLS:
                 # Try multiple methods for crypto price (API versions vary)
                 # Method 1: get_latest_crypto_quotes (plural, newer API)

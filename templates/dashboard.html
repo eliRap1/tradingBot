@@ -193,6 +193,10 @@
             <div class="metric-row"><span>SPY RSI</span><span id="spy-rsi">--</span></div>
             <div class="metric-row"><span>Allow Longs</span><span id="allow-longs">--</span></div>
             <div class="metric-row"><span>Size Mult</span><span id="size-mult">--</span></div>
+            <div class="metric-row"><span>HMM Regime</span><span id="hmm-regime">--</span></div>
+            <div class="metric-row"><span>HMM Confidence</span><span id="hmm-conf">--</span></div>
+            <div class="metric-row"><span>ATR Regime</span><span id="atr-regime">--</span></div>
+            <div class="metric-row"><span>Breadth (>50 EMA)</span><span id="breadth-pct">--</span></div>
         </div>
     </div>
 </div>
@@ -202,7 +206,7 @@
     <div class="card wide">
         <h2>Open Positions (<span id="pos-count">0</span>)</h2>
         <table>
-            <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th><th>Value</th><th>P&L</th></tr></thead>
+            <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th><th>Value</th><th>P&L</th><th>R-Mult</th><th>Strategies</th></tr></thead>
             <tbody id="pos-body"></tbody>
         </table>
         <div id="no-pos" style="text-align:center;padding:16px;color:#4b5563;">No open positions</div>
@@ -222,7 +226,9 @@
                     <th>Score</th>
                     <th>Confluence</th>
                     <th>Regime</th>
+                    <th>1H Bias</th>
                     <th>Strategies (score / weight)</th>
+                    <th>Indicators</th>
                     <th>ADX</th>
                     <th>Trend</th>
                     <th>Candles</th>
@@ -239,7 +245,7 @@
     <div class="card wide">
         <h2>Trade History</h2>
         <table>
-            <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>%</th><th>Reason</th></tr></thead>
+            <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>%</th><th>R</th><th>Reason</th></tr></thead>
             <tbody id="trades-body"></tbody>
         </table>
         <div id="no-trades" style="text-align:center;padding:16px;color:#4b5563;">No trades yet</div>
@@ -278,15 +284,16 @@ function statusBadge(s) {
     return `<span class="badge ${map[s]||'gray'}">${s}</span>`;
 }
 
-function stratCell(scores, weights) {
-    const names = ['supertrend','momentum','mean_reversion','breakout','stoch_rsi'];
-    const short = {supertrend:'ST',momentum:'MOM',mean_reversion:'MR',breakout:'BRK',stoch_rsi:'SRSI'};
+function stratCell(scores, weights, decaying) {
+    const names = ['momentum','mean_reversion','breakout','supertrend','stoch_rsi','vwap_reclaim','gap','liquidity_sweep'];
+    const short = {momentum:'MOM',mean_reversion:'MR',breakout:'BRK',supertrend:'ST',stoch_rsi:'SRSI',vwap_reclaim:'VWAP',gap:'GAP',liquidity_sweep:'LIQ'};
     return names.map(n => {
         const sc = scores[n]; const wt = weights[n];
         if(wt===0 || wt===undefined) return `<span style="color:#374151" title="${n}: OFF">${short[n]}:off</span>`;
         const color = scoreColor(sc||0);
         const wtPct = Math.round((wt||0)*100);
-        return `<span style="color:${color}" title="${n}: score=${(sc||0).toFixed(2)} weight=${wtPct}%">${short[n]}:${(sc||0).toFixed(2)}<span style="color:#4b5563;font-size:9px">/${wtPct}%</span></span>`;
+        const decay = decaying && decaying[n] !== undefined ? ` <span style="color:#ef4444;font-size:8px" title="Alpha decay: ${decaying[n]}x">▼</span>` : '';
+        return `<span style="color:${color}" title="${n}: score=${(sc||0).toFixed(2)} weight=${wtPct}%">${short[n]}:${(sc||0).toFixed(2)}<span style="color:#4b5563;font-size:9px">/${wtPct}%</span>${decay}</span>`;
     }).join(' ');
 }
 
@@ -315,11 +322,42 @@ function update(data) {
     const r = data.regime||{};
     $('regime-bar').textContent = r.description||'';
     $('regime-bar').className = 'regime-bar regime-'+(r.regime||'chop');
-    $('regime-detail').innerHTML = `<span class="badge ${r.regime==='bull'?'green':r.regime==='bear'?'red':'yellow'}">${(r.regime||'--').toUpperCase()}</span>`;
+    var regDetail = $('regime-detail');
+    regDetail.textContent = '';
+    var regBadge = document.createElement('span');
+    regBadge.className = 'badge ' + (r.regime==='bull'?'green':r.regime==='bear'?'red':'yellow');
+    regBadge.textContent = (r.regime||'--').toUpperCase();
+    regDetail.appendChild(regBadge);
     $('spy-trend').textContent = r.spy_trend||'--';
     $('spy-rsi').textContent = fmt(r.spy_rsi,1);
-    $('allow-longs').innerHTML = r.allow_longs?'<span class="badge green">YES</span>':'<span class="badge red">NO</span>';
+    var alEl = $('allow-longs');
+    alEl.textContent = '';
+    var alBadge = document.createElement('span');
+    alBadge.className = 'badge ' + (r.allow_longs ? 'green' : 'red');
+    alBadge.textContent = r.allow_longs ? 'YES' : 'NO';
+    alEl.appendChild(alBadge);
     $('size-mult').textContent = (r.size_multiplier||1)+'x';
+    var hmm = r.hmm_regime;
+    var hmmConf = r.hmm_confidence;
+    var hmmEl = $('hmm-regime');
+    hmmEl.textContent = '';
+    if (hmm) {
+        var hmmBadge = document.createElement('span');
+        hmmBadge.className = 'badge ' + (hmm==='bull'?'green':hmm==='bear'?'red':'yellow');
+        hmmBadge.textContent = hmm.toUpperCase();
+        hmmEl.appendChild(hmmBadge);
+    } else { hmmEl.textContent = 'N/A'; }
+    $('hmm-conf').textContent = hmmConf != null ? (hmmConf*100).toFixed(0)+'%' : '--';
+    var atrR = r.atr_regime;
+    var atrEl = $('atr-regime');
+    atrEl.textContent = '';
+    if (atrR) {
+        var atrBadge = document.createElement('span');
+        atrBadge.className = 'badge ' + (atrR==='high_vol'?'red':atrR==='low_vol'?'yellow':'gray');
+        atrBadge.textContent = atrR.replace('_',' ').toUpperCase();
+        atrEl.appendChild(atrBadge);
+    } else { atrEl.textContent = '--'; }
+    $('breadth-pct').textContent = r.breadth_pct != null ? r.breadth_pct.toFixed(1)+'%' : '--';
     $('regime-text').textContent = (r.regime||'--').toUpperCase();
     $('status-dot').className = 'dot '+(r.regime==='bear'?'red':r.regime==='bull'?'green':'yellow');
 
@@ -330,62 +368,242 @@ function update(data) {
     const pos = data.positions||[];
     $('pos-count').textContent = pos.length;
     $('no-pos').style.display = pos.length?'none':'block';
-    $('pos-body').innerHTML = pos.map(p=>`
-        <tr>
-            <td><a href="/chart/${p.symbol}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(p.symbol)}</a></td>
-            <td><span class="badge blue">${p.side}</span></td>
-            <td>${p.qty}</td>
-            <td>$${fmt(p.entry_price)}</td>
-            <td>$${fmt(p.current_price)}</td>
-            <td>$${fmt(p.market_value)}</td>
-            <td class="${pnlC(p.pnl)}">$${fmt(p.pnl)} (${fmt(p.pnl_pct)}%)</td>
-        </tr>`).join('');
+    $('pos-body').textContent = '';
+    pos.forEach(function(p) {
+        var tr = document.createElement('tr');
+        var symTd = document.createElement('td');
+        var symA = document.createElement('a');
+        symA.href = '/chart/' + p.symbol;
+        symA.style.cssText = 'color:#f9fafb;text-decoration:none;font-weight:700';
+        symA.textContent = p.symbol;
+        symTd.appendChild(symA);
+        tr.appendChild(symTd);
+
+        var sideTd = document.createElement('td');
+        var sideBadge = document.createElement('span');
+        sideBadge.className = 'badge blue';
+        sideBadge.textContent = p.side;
+        sideTd.appendChild(sideBadge);
+        tr.appendChild(sideTd);
+
+        var qtyTd = document.createElement('td'); qtyTd.textContent = p.qty; tr.appendChild(qtyTd);
+        var entryTd = document.createElement('td'); entryTd.textContent = '$'+fmt(p.entry_price); tr.appendChild(entryTd);
+        var curTd = document.createElement('td'); curTd.textContent = '$'+fmt(p.current_price); tr.appendChild(curTd);
+        var valTd = document.createElement('td'); valTd.textContent = '$'+fmt(p.market_value); tr.appendChild(valTd);
+
+        var pnlTd = document.createElement('td');
+        pnlTd.className = pnlC(p.pnl);
+        pnlTd.textContent = '$'+fmt(p.pnl)+' ('+fmt(p.pnl_pct)+'%)';
+        tr.appendChild(pnlTd);
+
+        var rTd = document.createElement('td');
+        if (p.r_multiple != null) {
+            var rBadge = document.createElement('span');
+            rBadge.className = 'badge ' + (p.r_multiple >= 1 ? 'green' : p.r_multiple >= 0 ? 'yellow' : 'red');
+            rBadge.textContent = (p.r_multiple >= 0 ? '+' : '') + p.r_multiple.toFixed(2) + 'R';
+            rTd.appendChild(rBadge);
+        } else { rTd.textContent = '--'; }
+        tr.appendChild(rTd);
+
+        var stratTd = document.createElement('td');
+        stratTd.style.fontSize = '10px';
+        stratTd.textContent = (p.strategies || []).join(', ') || '--';
+        tr.appendChild(stratTd);
+
+        $('pos-body').appendChild(tr);
+    });
 
     // Watchers
     const w = data.watchers||[];
     $('watcher-count').textContent = w.length;
-    $('watcher-body').innerHTML = w.map(t => {
-        const dotColor = t.status==='signal'?'#22c55e':t.status==='pending'?'#a78bfa':t.status==='watching'?'#3b82f6':t.status==='analyzing'?'#eab308':'#4b5563';
-        const candles = (t.candle_patterns||[]).map(c =>
-            `<span class="candle-tag ${bearishCandles.includes(c)?'bearish':''}">${c.replace(/_/g,' ')}</span>`
-        ).join('')||'-';
+    var wb = $('watcher-body');
+    wb.textContent = '';
+    w.forEach(function(t) {
+        var tr = document.createElement('tr');
+        var dotColor = t.status==='signal'?'#22c55e':t.status==='pending'?'#a78bfa':t.status==='watching'?'#3b82f6':t.status==='analyzing'?'#eab308':'#4b5563';
 
-        const regimeBadge = t.regime ?
-            `<span class="badge ${t.regime==='trending'?'cyan':t.regime==='ranging'?'yellow':t.regime==='breakout'?'purple':'gray'}" title="${t.regime_reason}">${t.regime}</span>` : '-';
+        if (t.score > 0.1) { tr.style.borderLeft = '3px solid #22c55e'; }
+        else if (t.score < -0.1) { tr.style.borderLeft = '3px solid #ef4444'; }
 
-        return `<tr>
-            <td><span class="thread-indicator" style="background:${dotColor}"></span><a href="/chart/${t.symbol}" style="color:#f9fafb;text-decoration:none;font-weight:700">${escapeHtml(t.symbol)}</a></td>
-            <td>${statusBadge(t.status)}</td>
-            <td>$${t.last_price?fmt(t.last_price):'-'}</td>
-            <td><span class="score-cell" style="color:${scoreColor(t.score)}">${t.score.toFixed(3)}</span></td>
-            <td><span class="badge ${t.num_agreeing>=3?'green':t.num_agreeing>=2?'yellow':'gray'}">${t.num_agreeing}/5</span>${t.confirmed?' <span class="badge green">CONFIRMED</span>':''}</td>
-            <td>${regimeBadge}</td>
-            <td style="font-size:10px;font-family:monospace">${stratCell(t.strategy_scores||{}, t.strategy_weights||{})}</td>
-            <td>${t.adx||'-'}</td>
-            <td><span class="badge ${t.trend==='up'?'green':t.trend==='down'?'red':'gray'}">${t.trend||'-'}</span></td>
-            <td>${candles}</td>
-            <td style="color:#4b5563;font-size:10px">${t.last_update||'-'}</td>
-        </tr>`;
-    }).join('');
+        var symTd = document.createElement('td');
+        var dot = document.createElement('span');
+        dot.className = 'thread-indicator';
+        dot.style.background = dotColor;
+        symTd.appendChild(dot);
+        var symA = document.createElement('a');
+        symA.href = '/chart/' + t.symbol;
+        symA.style.cssText = 'color:#f9fafb;text-decoration:none;font-weight:700';
+        symA.textContent = t.symbol;
+        symTd.appendChild(symA);
+        tr.appendChild(symTd);
+
+        var statusTd = document.createElement('td');
+        var sBadge = document.createElement('span');
+        var sMap = {signal:'green',pending:'purple',watching:'blue',analyzing:'yellow',idle:'gray',error:'red',no_data:'gray',stopped:'gray'};
+        sBadge.className = 'badge ' + (sMap[t.status]||'gray');
+        sBadge.textContent = t.status;
+        statusTd.appendChild(sBadge);
+        tr.appendChild(statusTd);
+
+        var priceTd = document.createElement('td');
+        priceTd.textContent = t.last_price ? '$'+fmt(t.last_price) : '-';
+        tr.appendChild(priceTd);
+
+        var scoreTd = document.createElement('td');
+        var scoreSpan = document.createElement('span');
+        scoreSpan.className = 'score-cell';
+        scoreSpan.style.color = scoreColor(t.score);
+        scoreSpan.textContent = t.score.toFixed(3);
+        scoreTd.appendChild(scoreSpan);
+        tr.appendChild(scoreTd);
+
+        var totalStrats = Object.keys(t.strategy_weights||{}).length || 8;
+        var confTd = document.createElement('td');
+        var confBadge = document.createElement('span');
+        confBadge.className = 'badge ' + (t.num_agreeing>=3?'green':t.num_agreeing>=2?'yellow':'gray');
+        confBadge.textContent = t.num_agreeing + '/' + totalStrats;
+        confTd.appendChild(confBadge);
+        if (t.confirmed) {
+            var cBadge = document.createElement('span');
+            cBadge.className = 'badge green';
+            cBadge.style.marginLeft = '4px';
+            cBadge.textContent = 'CONFIRMED';
+            confTd.appendChild(cBadge);
+        } else if (t.prev_signal) {
+            var pBadge = document.createElement('span');
+            pBadge.className = 'badge purple';
+            pBadge.style.marginLeft = '4px';
+            pBadge.textContent = 'PENDING 1/2';
+            confTd.appendChild(pBadge);
+        }
+        tr.appendChild(confTd);
+
+        var regTd = document.createElement('td');
+        if (t.regime) {
+            var rBadge = document.createElement('span');
+            rBadge.className = 'badge ' + (t.regime==='trending'?'cyan':t.regime==='ranging'?'yellow':t.regime==='breakout'?'purple':'gray');
+            rBadge.title = t.regime_reason || '';
+            rBadge.textContent = t.regime;
+            regTd.appendChild(rBadge);
+        } else { regTd.textContent = '-'; }
+        tr.appendChild(regTd);
+
+        var biasTd = document.createElement('td');
+        var biasBadge = document.createElement('span');
+        var hb = t.hourly_bias || 'neutral';
+        biasBadge.className = 'badge ' + (hb==='bullish'?'green':hb==='bearish'?'red':'gray');
+        biasBadge.textContent = hb.toUpperCase();
+        biasTd.appendChild(biasBadge);
+        tr.appendChild(biasTd);
+
+        var stratTd = document.createElement('td');
+        stratTd.style.cssText = 'font-size:10px;font-family:monospace';
+        stratTd.innerHTML = stratCell(t.strategy_scores||{}, t.strategy_weights||{}, t.decaying_strategies||{});
+        tr.appendChild(stratTd);
+
+        var indTd = document.createElement('td');
+        indTd.style.fontSize = '10px';
+        var indicators = [];
+        if (t.keltner_squeeze && t.keltner_squeeze.is_squeeze) {
+            var sqB = document.createElement('span');
+            sqB.className = 'badge cyan';
+            sqB.textContent = 'SQUEEZE(' + (t.keltner_squeeze.squeeze_bars||0) + ')';
+            sqB.title = 'Keltner squeeze: ' + t.keltner_squeeze.squeeze_bars + ' bars';
+            indTd.appendChild(sqB);
+        }
+        if (t.pivot_levels) {
+            var pvB = document.createElement('span');
+            pvB.className = 'badge blue';
+            pvB.style.marginLeft = '2px';
+            pvB.textContent = 'P:' + t.pivot_levels.pivot.toFixed(1);
+            pvB.title = 'S2:'+t.pivot_levels.s2.toFixed(1)+' S1:'+t.pivot_levels.s1.toFixed(1)+' P:'+t.pivot_levels.pivot.toFixed(1)+' R1:'+t.pivot_levels.r1.toFixed(1)+' R2:'+t.pivot_levels.r2.toFixed(1);
+            indTd.appendChild(pvB);
+        }
+        if (!indTd.hasChildNodes()) { indTd.textContent = '-'; }
+        tr.appendChild(indTd);
+
+        var adxTd = document.createElement('td'); adxTd.textContent = t.adx || '-'; tr.appendChild(adxTd);
+
+        var trendTd = document.createElement('td');
+        var tBadge = document.createElement('span');
+        tBadge.className = 'badge ' + (t.trend==='up'?'green':t.trend==='down'?'red':'gray');
+        tBadge.textContent = t.trend || '-';
+        trendTd.appendChild(tBadge);
+        tr.appendChild(trendTd);
+
+        var candleTd = document.createElement('td');
+        (t.candle_patterns||[]).forEach(function(c) {
+            var ct = document.createElement('span');
+            ct.className = 'candle-tag' + (bearishCandles.includes(c) ? ' bearish' : '');
+            ct.textContent = c.replace(/_/g, ' ');
+            candleTd.appendChild(ct);
+        });
+        if (!candleTd.hasChildNodes()) { candleTd.textContent = '-'; }
+        tr.appendChild(candleTd);
+
+        var updTd = document.createElement('td');
+        updTd.style.cssText = 'color:#4b5563;font-size:10px';
+        updTd.textContent = t.last_update || '-';
+        tr.appendChild(updTd);
+
+        wb.appendChild(tr);
+    });
 
     // Trades
     const tr = data.trades||[];
     $('no-trades').style.display = tr.length?'none':'block';
-    $('trades-body').innerHTML = tr.map(t=>`
-        <tr>
-            <td>${t.closed_at?t.closed_at.substring(5,16).replace('T',' '):'--'}</td>
-            <td><strong>${t.symbol}</strong></td>
-            <td>${t.side}</td><td>${t.qty}</td>
-            <td>$${fmt(t.entry_price)}</td><td>$${fmt(t.exit_price)}</td>
-            <td class="${pnlC(t.pnl)}">$${fmt(t.pnl)}</td>
-            <td class="${pnlC(t.pnl_pct)}">${(t.pnl_pct*100).toFixed(1)}%</td>
-            <td><span class="badge gray">${t.reason}</span></td>
-        </tr>`).join('');
+    var tb = $('trades-body');
+    tb.textContent = '';
+    tr.forEach(function(t) {
+        var row = document.createElement('tr');
+        var timeTd = document.createElement('td');
+        timeTd.textContent = t.closed_at ? t.closed_at.substring(5,16).replace('T',' ') : '--';
+        row.appendChild(timeTd);
+        var symTd = document.createElement('td');
+        var strong = document.createElement('strong');
+        strong.textContent = t.symbol;
+        symTd.appendChild(strong);
+        row.appendChild(symTd);
+        var sideTd = document.createElement('td'); sideTd.textContent = t.side; row.appendChild(sideTd);
+        var qtyTd = document.createElement('td'); qtyTd.textContent = t.qty; row.appendChild(qtyTd);
+        var entTd = document.createElement('td'); entTd.textContent = '$'+fmt(t.entry_price); row.appendChild(entTd);
+        var exTd = document.createElement('td'); exTd.textContent = '$'+fmt(t.exit_price); row.appendChild(exTd);
+        var pnlTd = document.createElement('td'); pnlTd.className = pnlC(t.pnl); pnlTd.textContent = '$'+fmt(t.pnl); row.appendChild(pnlTd);
+        var pctTd = document.createElement('td'); pctTd.className = pnlC(t.pnl_pct); pctTd.textContent = (t.pnl_pct*100).toFixed(1)+'%'; row.appendChild(pctTd);
+        var rTd = document.createElement('td');
+        if (t.r_multiple != null) {
+            var rB = document.createElement('span');
+            rB.className = 'badge ' + (t.r_multiple >= 0 ? 'green' : 'red');
+            rB.textContent = (t.r_multiple >= 0 ? '+' : '') + t.r_multiple.toFixed(2) + 'R';
+            rTd.appendChild(rB);
+        } else { rTd.textContent = '--'; }
+        row.appendChild(rTd);
+        var resTd = document.createElement('td');
+        var resBadge = document.createElement('span');
+        resBadge.className = 'badge gray';
+        resBadge.textContent = t.reason;
+        resTd.appendChild(resBadge);
+        row.appendChild(resTd);
+        tb.appendChild(row);
+    });
 
     // Logs
-    $('log-box').innerHTML = (data.logs||[]).map(l=>
-        `<div class="log-entry"><span class="log-time">${l.time}</span> <span class="log-${l.level}">${l.msg}</span></div>`
-    ).join('');
+    var logBox = $('log-box');
+    logBox.textContent = '';
+    (data.logs||[]).forEach(function(l) {
+        var div = document.createElement('div');
+        div.className = 'log-entry';
+        var timeSpan = document.createElement('span');
+        timeSpan.className = 'log-time';
+        timeSpan.textContent = l.time;
+        div.appendChild(timeSpan);
+        div.appendChild(document.createTextNode(' '));
+        var msgSpan = document.createElement('span');
+        msgSpan.className = 'log-' + l.level;
+        msgSpan.textContent = l.msg;
+        div.appendChild(msgSpan);
+        logBox.appendChild(div);
+    });
 
     $('last-update').textContent = data.last_update||'--';
 

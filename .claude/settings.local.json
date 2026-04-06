@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(gh auth:*)",
+      "Bash(git config:*)",
+      "Bash(git init:*)",
+      "Bash(git:*)",
+      "Bash(winget install:*)",
+      "Bash(export PATH=\"$PATH:/c/Program Files/GitHub CLI\")",
+      "Bash(gh repo:*)",
+      "Bash(ls C:\\\\Users\\\\eli08\\\\Videos\\\\tradingBot/*.py)",
+      "Bash(grep -n \"score.*-\\\\|bearish\\\\|short\\\\|negative\" \"C:\\\\Users\\\\eli08\\\\Videos\\\\tradingBot\\\\strategies/\"*.py)",
+      "Bash(grep -rn \"get_latest_trade\\\\|get_latest_crypto\" /c/Users/eli08/Videos/tradingBot/*.py)",
+      "Bash(ls -la C:\\\\Users\\\\eli08\\\\Videos\\\\tradingBot/*.py C:\\\\Users\\\\eli08\\\\Videos\\\\tradingBot/strategies/*.py)",
+      "Bash(sort -t/ -k6)",
+      "Bash(timeout 120)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(pip show:*)"
+    ]
+  }
+}

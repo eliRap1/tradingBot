@@ -152,6 +152,84 @@ def get_weekly_trend(df: pd.DataFrame) -> dict:
     }
 
 
+def get_hourly_bias(df: pd.DataFrame) -> dict:
+    """
+    Analyze 1-hour bars for intermediate-timeframe bias.
+
+    Used as a confirmation layer between daily trend and 5-min entries.
+    A long entry on 5-min should have hourly bias agreeing (bullish or neutral).
+
+    Returns:
+        {
+            "bias": str,          # "bullish", "bearish", "neutral"
+            "ema_fast": float,    # 8-period EMA on 1H
+            "ema_slow": float,    # 21-period EMA on 1H
+            "macd_hist": float,   # MACD histogram value
+            "above_vwap": bool,   # price above hourly VWAP
+        }
+    """
+    if len(df) < 25:
+        return {"bias": "neutral", "ema_fast": 0, "ema_slow": 0,
+                "macd_hist": 0, "above_vwap": True}
+
+    close = df["close"]
+    current_price = close.iloc[-1]
+
+    # EMAs
+    ema8 = ta.trend.EMAIndicator(close, window=8).ema_indicator()
+    ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+    ema8_val = ema8.iloc[-1]
+    ema21_val = ema21.iloc[-1]
+
+    # MACD histogram for momentum confirmation
+    macd = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
+    macd_hist = macd.macd_diff().iloc[-1]
+
+    # VWAP check
+    above_vwap = True
+    if "vwap" in df.columns and df["vwap"].notna().any():
+        above_vwap = current_price > df["vwap"].iloc[-1]
+
+    # Scoring: EMA alignment + MACD direction
+    bullish_points = 0
+    bearish_points = 0
+
+    if ema8_val > ema21_val:
+        bullish_points += 1
+    else:
+        bearish_points += 1
+
+    if current_price > ema8_val:
+        bullish_points += 1
+    else:
+        bearish_points += 1
+
+    if macd_hist > 0:
+        bullish_points += 1
+    else:
+        bearish_points += 1
+
+    if above_vwap:
+        bullish_points += 1
+    else:
+        bearish_points += 1
+
+    if bullish_points >= 3:
+        bias = "bullish"
+    elif bearish_points >= 3:
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    return {
+        "bias": bias,
+        "ema_fast": ema8_val,
+        "ema_slow": ema21_val,
+        "macd_hist": macd_hist,
+        "above_vwap": above_vwap,
+    }
+
+
 def _check_lower_lows(low: pd.Series, window: int = 5, count: int = 3) -> bool:
     """Check if the last `count` local lows are descending."""
     if len(low) < window * count:

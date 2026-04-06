@@ -5,7 +5,7 @@ Improvements:
 - Direction-aware trailing stops (long: high watermark, short: low watermark)
 - Time-based stops (close zombie trades after 5 days with <0.5R profit)
 - Breakeven stop (move stop to entry after 0.75R profit, persisted)
-- Partial exit scaling (close 50% at 1.5R)
+- Partial exit scaling (1st: 40% at 1.2R, 2nd: 30% at 2.5R)
 - Position reconciliation with broker state
 - Trade recording for performance tracking
 """
@@ -40,7 +40,7 @@ class PortfolioManager:
         positions = {}
         for pos in self.broker.get_positions():
             positions[pos.symbol] = {
-                "qty": int(pos.qty),
+                "qty": float(pos.qty),
                 "entry_price": float(pos.avg_entry_price),
                 "current_price": float(pos.current_price),
                 "market_value": float(pos.market_value),
@@ -61,23 +61,28 @@ class PortfolioManager:
         return positions
 
     def check_trailing_stops(self, positions: dict,
-                              prices: dict[str, float]) -> tuple[list[str], list[dict]]:
+                              prices: dict[str, float],
+                              bars: dict[str, "pd.DataFrame"] = None
+                              ) -> tuple[list[str], list[dict]]:
         """Check trailing stops, partial exits, return symbols to close and partial exits.
 
-        Direction-aware:
-        - Long: high watermark tracks price peaks, trail triggers on drop from peak
-        - Short: low watermark tracks price troughs, trail triggers on rise from trough
+        Uses ATR Chandelier trailing stop (highest-high - 3*ATR for longs,
+        lowest-low + 3*ATR for shorts) with fallback to percentage-based.
+        Time stop: exit if no 1R profit after configurable number of check cycles.
         """
+        import ta as ta_lib
         default_trail_pct = self.config["risk"]["trailing_stop_pct"]
         crypto_trail_pct = self.config.get("screener", {}).get(
             "crypto_risk", {}).get("trailing_stop_pct", default_trail_pct)
+        chandelier_mult = self.config["risk"].get("chandelier_atr_mult", 3.0)
         to_close = []
-        partial_exits = []  # [{"symbol": str, "qty": int, "reason": str}]
+        partial_exits = []
 
         # Partial exit config
         partial_enabled = self.config["risk"].get("partial_exit_enabled", False)
         partial_r = self.config["risk"].get("partial_exit_r", 1.5)
         partial_pct = self.config["risk"].get("partial_exit_pct", 0.50)
+        bars = bars or {}
 
         for sym, pos in positions.items():
             if sym not in prices:
@@ -89,36 +94,52 @@ class PortfolioManager:
             meta = self.position_meta.get(sym, {})
             trail_pct = crypto_trail_pct if sym in CRYPTO_SYMBOLS else default_trail_pct
 
-            # === DIRECTION-AWARE WATERMARK ===
+            # === CHANDELIER ATR TRAILING STOP ===
+            # Use ATR-based trail if bars available, else fall back to % trail
+            atr_val = None
+            if sym in bars and len(bars[sym]) >= 15:
+                df = bars[sym]
+                atr_series = ta_lib.volatility.AverageTrueRange(
+                    df["high"], df["low"], df["close"], window=14
+                ).average_true_range()
+                atr_val = atr_series.iloc[-1] if len(atr_series) > 0 else None
+
             if is_long:
                 if sym not in self.high_watermarks:
                     self.high_watermarks[sym] = max(entry_price, current_price)
                 else:
                     self.high_watermarks[sym] = max(self.high_watermarks[sym], current_price)
                 watermark = self.high_watermarks[sym]
-                trail_price = watermark * (1 - trail_pct)
+                if atr_val and atr_val > 0:
+                    trail_price = watermark - (chandelier_mult * atr_val)
+                else:
+                    trail_price = watermark * (1 - trail_pct)
             else:
-                # Short: track the lowest price (best for short)
                 if sym not in self.low_watermarks:
                     self.low_watermarks[sym] = min(entry_price, current_price)
                 else:
                     self.low_watermarks[sym] = min(self.low_watermarks[sym], current_price)
                 watermark = self.low_watermarks[sym]
-                trail_price = watermark * (1 + trail_pct)
+                if atr_val and atr_val > 0:
+                    trail_price = watermark + (chandelier_mult * atr_val)
+                else:
+                    trail_price = watermark * (1 + trail_pct)
 
             # === PARTIAL EXIT at 1.2R (first partial) ===
             if partial_enabled and not meta.get("partial_done", False):
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
                 if initial_risk > 0 and qty > 1:
-                    risk_per_share = initial_risk / qty
+                    original_qty = meta.get("original_qty", qty)
+                    risk_per_share = initial_risk / original_qty if original_qty > 0 else 0
                     if is_long:
                         current_r = (current_price - entry_price) / risk_per_share if risk_per_share > 0 else 0
                     else:
                         current_r = (entry_price - current_price) / risk_per_share if risk_per_share > 0 else 0
 
                     if current_r >= partial_r:
-                        close_qty = max(1, int(qty * partial_pct))
+                        is_crypto = sym in CRYPTO_SYMBOLS
+                        close_qty = qty * partial_pct if is_crypto else max(1, int(qty * partial_pct))
                         partial_exits.append({
                             "symbol": sym,
                             "qty": close_qty,
@@ -130,6 +151,8 @@ class PortfolioManager:
                             f"closing {close_qty}/{qty} shares ({partial_pct:.0%})"
                         )
                         meta["partial_done"] = True
+                        if "original_qty" not in meta:
+                            meta["original_qty"] = qty
                         self.position_meta[sym] = meta
                         self._save_meta()
 
@@ -142,8 +165,8 @@ class PortfolioManager:
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
                 if initial_risk > 0 and qty > 1:
-                    # Recalculate risk per share with remaining quantity
-                    original_qty = meta.get("original_qty", qty * 2)  # Estimate original qty
+                    # Use saved original_qty for accurate R-multiple
+                    original_qty = meta.get("original_qty", qty)
                     risk_per_share = initial_risk / original_qty if original_qty > 0 else 0
                     if is_long:
                         current_r = (current_price - entry_price) / risk_per_share if risk_per_share > 0 else 0
@@ -151,7 +174,8 @@ class PortfolioManager:
                         current_r = (entry_price - current_price) / risk_per_share if risk_per_share > 0 else 0
 
                     if current_r >= second_partial_r:
-                        close_qty = max(1, int(qty * second_partial_pct))
+                        is_crypto = sym in CRYPTO_SYMBOLS
+                        close_qty = qty * second_partial_pct if is_crypto else max(1, int(qty * second_partial_pct))
                         if close_qty < qty:  # Don't close everything
                             partial_exits.append({
                                 "symbol": sym,
@@ -208,10 +232,34 @@ class PortfolioManager:
                     )
                     to_close.append(sym)
 
-            # === TIME-BASED STOP ===
+            # === TIME-BASED STOP (cycle count + days) ===
             if not breakeven_triggered and sym not in to_close:
+                # Increment check count (tracks how many cycles this position has been evaluated)
+                check_count = meta.get("check_count", 0) + 1
+                meta["check_count"] = check_count
+                self.position_meta[sym] = meta
+
+                # Fast time stop: no 1R profit after N checks (~10 cycles = ~50 min on 5-min)
+                max_checks_no_profit = self.config["risk"].get("max_checks_no_1r", 60)
+                initial_risk = meta.get("initial_risk", 0.0)
+                original_qty = meta.get("original_qty", pos["qty"])
+                if initial_risk > 0 and original_qty > 0:
+                    risk_per_share = initial_risk / original_qty
+                    if is_long:
+                        current_r = (current_price - entry_price) / risk_per_share if risk_per_share > 0 else 0
+                    else:
+                        current_r = (entry_price - current_price) / risk_per_share if risk_per_share > 0 else 0
+
+                    if check_count >= max_checks_no_profit and current_r < 1.0:
+                        log.info(
+                            f"TIME STOP: {sym} — {check_count} checks, only {current_r:.1f}R profit. "
+                            f"Closing stale trade."
+                        )
+                        to_close.append(sym)
+
+                # Legacy day-based stop (catches anything the cycle counter misses)
                 opened_str = meta.get("opened_at", "")
-                if opened_str:
+                if sym not in to_close and opened_str:
                     try:
                         opened = datetime.fromisoformat(opened_str)
                         days_held = (datetime.now() - opened).days
@@ -249,7 +297,7 @@ class PortfolioManager:
                     entry_price=pos["entry_price"],
                     exit_price=pos["current_price"],
                     reason=partial["reason"],
-                    risk_dollars=self.position_meta.get(sym, {}).get("initial_risk", 0.0) * (qty / pos["qty"]),
+                    risk_dollars=self.position_meta.get(sym, {}).get("initial_risk", 0.0) * (qty / self.position_meta.get(sym, {}).get("original_qty", pos["qty"])),
                 )
             except Exception as e:
                 log.error(f"Failed partial exit for {sym}: {e}")
@@ -303,6 +351,7 @@ class PortfolioManager:
                         exit_price=pos["current_price"],
                         reason=reason,
                         risk_dollars=risk_dollars,
+                        strategies=meta.get("strategies", []),
                     )
 
                 # Pop meta AFTER using it
@@ -314,30 +363,41 @@ class PortfolioManager:
         self._save_meta()
 
     def log_portfolio_status(self, positions: dict):
-        """Log current portfolio state."""
+        """Log current portfolio state with visual formatting."""
         if not positions:
-            log.info("No open positions")
+            log.info("  [no open positions]")
             return
 
         total_pl = sum(p["unrealized_pl"] for p in positions.values())
         total_value = sum(p["market_value"] for p in positions.values())
+        pl_icon = "+" if total_pl >= 0 else "-"
 
-        log.info(f"--- Portfolio: {len(positions)} positions | "
-                 f"Value=${total_value:,.2f} | P&L=${total_pl:+,.2f} ---")
-        for sym, pos in positions.items():
+        log.info(f"  PORTFOLIO: {len(positions)} positions | "
+                 f"Value ${total_value:,.0f} | P&L=${total_pl:+,.2f}")
+        log.info(f"  {'Symbol':<10} {'Side':<6} {'Qty':>8} {'Entry':>10} "
+                 f"{'Now':>10} {'P&L':>12} {'%':>8} {'Days':>5}")
+        log.info(f"  {'------':<10} {'----':<6} {'---':>8} {'-----':>10} "
+                 f"{'---':>10} {'---':>12} {'--':>8} {'----':>5}")
+
+        for sym, pos in sorted(positions.items(), key=lambda x: x[1]["unrealized_pl"], reverse=True):
             days_held = ""
             meta = self.position_meta.get(sym, {})
             if meta.get("opened_at"):
                 try:
                     d = (datetime.now() - datetime.fromisoformat(meta["opened_at"])).days
-                    days_held = f" | {d}d"
+                    days_held = f"{d}"
                 except (ValueError, TypeError):
                     pass
 
+            side = pos.get("side", "long").upper()
+            qty_str = f"{pos['qty']:.4f}" if isinstance(pos['qty'], float) and pos['qty'] < 10 else f"{pos['qty']:.0f}"
+            pl_str = f"${pos['unrealized_pl']:+,.2f}"
+            pct_str = f"{pos['unrealized_plpc']:+.1%}"
+
             log.info(
-                f"  {sym}: {pos['qty']} shares @ ${pos['entry_price']:.2f} | "
-                f"Now ${pos['current_price']:.2f} | "
-                f"P&L=${pos['unrealized_pl']:+.2f} ({pos['unrealized_plpc']:+.1%}){days_held}"
+                f"  {sym:<10} {side:<6} {qty_str:>8} "
+                f"${pos['entry_price']:>9,.2f} ${pos['current_price']:>9,.2f} "
+                f"{pl_str:>12} {pct_str:>8} {days_held:>5}"
             )
 
     def set_position_risk(self, symbol: str, entry_price: float,
@@ -350,9 +410,12 @@ class PortfolioManager:
                 "opened_at": datetime.now().isoformat(),
                 "entry_price": entry_price,
                 "initial_risk": risk_dollars,
+                "original_qty": qty,
             }
         else:
             self.position_meta[symbol]["initial_risk"] = risk_dollars
+            if "original_qty" not in self.position_meta[symbol]:
+                self.position_meta[symbol]["original_qty"] = qty
         self._save_meta()
 
     def _save_watermarks(self):

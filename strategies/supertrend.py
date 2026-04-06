@@ -10,16 +10,15 @@ log = setup_logger("strategy.supertrend")
 
 class SuperTrendStrategy:
     """
-    SuperTrend trend-following — works for both LONG and SHORT.
+    SuperTrend as TREND FILTER — does not generate entry signals on its own.
 
-    LONG setup:
-    - SuperTrend flips bullish (price crosses above ST line)
-    - Above 200 EMA, ADX confirms trend, volume surge
+    Requires:
+    - SuperTrend direction stable for >= 3 bars (anti-whipsaw on 5-min)
+    - ADX > 20 confirming a real trend exists
+    - Price momentum agreeing with direction
+    - Candle/volume confirmation layered on top
 
-    SHORT setup:
-    - SuperTrend flips bearish (price crosses below ST line)
-    - Below 200 EMA, ADX confirms downtrend, volume surge
-    - Bearish candle confirmation
+    Scores are intentionally muted when ADX < 25 (choppy regime).
     """
 
     def __init__(self, config: dict):
@@ -45,7 +44,6 @@ class SuperTrendStrategy:
         close = df["close"]
         volume = df["volume"]
 
-        # SuperTrend
         st_line, direction = supertrend(
             df,
             period=self.cfg["atr_period"],
@@ -53,118 +51,135 @@ class SuperTrendStrategy:
         )
 
         current_dir = direction.iloc[-1]
-        prev_dir = direction.iloc[-2]
-        flip_bullish = (current_dir == -1 and prev_dir == 1)
-        flip_bearish = (current_dir == 1 and prev_dir == -1)
-
-        recent_flip_bull = any(
-            direction.iloc[-j] == -1 and direction.iloc[-j - 1] == 1
-            for j in range(1, min(4, len(direction) - 1))
-        )
-        recent_flip_bear = any(
-            direction.iloc[-j] == 1 and direction.iloc[-j - 1] == -1
-            for j in range(1, min(4, len(direction) - 1))
-        )
-
         is_bullish = current_dir == -1
         is_bearish = current_dir == 1
 
-        # Trend context
+        stable_bars = self._direction_stability(direction)
+        if stable_bars < 3:
+            return 0.0
+
         ctx = get_trend_context(df)
 
-        # 200 EMA
+        if ctx["adx"] < 20:
+            return 0.0
+
         ema_window = min(200, len(df) - 1)
         ema_200 = ta.trend.EMAIndicator(close, window=ema_window).ema_indicator()
         above_ema200 = close.iloc[-1] > ema_200.iloc[-1]
 
-        # RVOL (time-of-day adjusted volume)
+        momentum_up = close.iloc[-1] > close.iloc[-3]
+        momentum_down = close.iloc[-1] < close.iloc[-3]
+
         vol_ratio = rvol(df)
 
-        # Candles
         patterns = detect_patterns(df)
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
 
-        # ── LONG SCORING ─────────────────────────────────────
-        if flip_bullish or (recent_flip_bull and is_bullish) or is_bullish:
-            score = 0.0
+        choppy = ctx["adx"] < 25
 
-            if flip_bullish:
-                score += 0.4
-            elif recent_flip_bull and is_bullish:
-                score += 0.2
-            elif is_bullish:
-                score += 0.05
-
-            if above_ema200:
-                score += 0.1
-            else:
-                score *= 0.5
-
-            if ctx["adx"] > 25 and ctx["direction"] == "up":
-                score += 0.1
-            elif ctx["adx"] < 15:
-                score *= 0.7
-
-            if vol_ratio >= 1.5:
-                score += 0.15
-            elif vol_ratio >= 1.2:
-                score += 0.05
-            elif flip_bullish and vol_ratio < 1.0:
+        if is_bullish and momentum_up:
+            score = self._score_long(
+                ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars
+            )
+            if choppy:
                 score *= 0.6
-
-            if candle_bull > 0.2:
-                score += candle_bull * 0.15
-            if candle_bear > 0.3:
-                score *= 0.7
-
-            if ctx["above_vwap"]:
-                score += 0.05
-
             return max(0.0, min(1.0, score))
 
-        # ── SHORT SCORING ────────────────────────────────────
-        if flip_bearish or (recent_flip_bear and is_bearish) or is_bearish:
-            score = 0.0
-
-            # Core signal: SuperTrend flip bearish
-            if flip_bearish:
-                score -= 0.4
-            elif recent_flip_bear and is_bearish:
-                score -= 0.2
-            elif is_bearish:
-                score -= 0.05
-
-            # Below 200 EMA = downtrend confirmed
-            if not above_ema200:
-                score -= 0.1
-            else:
-                score *= 0.5  # Above 200 EMA = risky short
-
-            # ADX confirms downtrend
-            if ctx["adx"] > 25 and ctx["direction"] == "down":
-                score -= 0.1
-            elif ctx["adx"] < 15:
-                score *= 0.7
-
-            # Volume on the breakdown
-            if vol_ratio >= 1.5:
-                score -= 0.15
-            elif vol_ratio >= 1.2:
-                score -= 0.05
-            elif flip_bearish and vol_ratio < 1.0:
+        if is_bearish and momentum_down:
+            score = self._score_short(
+                ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars
+            )
+            if choppy:
                 score *= 0.6
-
-            # Bearish candle confirmation
-            if candle_bear > 0.2:
-                score -= candle_bear * 0.15
-            if candle_bull > 0.3:
-                score *= 0.7  # Bullish candle contradicts short
-
-            # Below VWAP = selling pressure
-            if not ctx["above_vwap"]:
-                score -= 0.05
-
             return max(-1.0, min(0.0, score))
 
         return 0.0
+
+    def _direction_stability(self, direction: pd.Series) -> int:
+        current = direction.iloc[-1]
+        count = 0
+        for i in range(1, len(direction)):
+            if direction.iloc[-i] == current:
+                count += 1
+            else:
+                break
+        return count
+
+    def _score_long(self, ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars):
+        if not (ctx["adx"] > 20 and candle_bull > 0.15):
+            return 0.0
+
+        score = 0.0
+
+        if ctx["adx"] > 30 and ctx["direction"] == "up":
+            score += 0.25
+        elif ctx["adx"] > 20 and ctx["direction"] == "up":
+            score += 0.15
+
+        if above_ema200:
+            score += 0.10
+        else:
+            score *= 0.5
+
+        if stable_bars >= 6:
+            score += 0.10
+        elif stable_bars >= 3:
+            score += 0.05
+
+        if vol_ratio >= 1.5:
+            score += 0.15
+        elif vol_ratio >= 1.2:
+            score += 0.05
+
+        if candle_bull > 0.3:
+            score += candle_bull * 0.15
+        elif candle_bull > 0.15:
+            score += candle_bull * 0.10
+
+        if candle_bear > 0.3:
+            score *= 0.6
+
+        if ctx["above_vwap"]:
+            score += 0.05
+
+        return score
+
+    def _score_short(self, ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars):
+        if not (ctx["adx"] > 20 and candle_bear > 0.15):
+            return 0.0
+
+        score = 0.0
+
+        if ctx["adx"] > 30 and ctx["direction"] == "down":
+            score -= 0.25
+        elif ctx["adx"] > 20 and ctx["direction"] == "down":
+            score -= 0.15
+
+        if not above_ema200:
+            score -= 0.10
+        else:
+            score *= 0.5
+
+        if stable_bars >= 6:
+            score -= 0.10
+        elif stable_bars >= 3:
+            score -= 0.05
+
+        if vol_ratio >= 1.5:
+            score -= 0.15
+        elif vol_ratio >= 1.2:
+            score -= 0.05
+
+        if candle_bear > 0.3:
+            score -= candle_bear * 0.15
+        elif candle_bear > 0.15:
+            score -= candle_bear * 0.10
+
+        if candle_bull > 0.3:
+            score *= 0.6
+
+        if not ctx["above_vwap"]:
+            score -= 0.05
+
+        return score

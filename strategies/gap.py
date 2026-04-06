@@ -63,61 +63,54 @@ class GapStrategy:
         low = df["low"]
         open_price = df["open"]
 
-        # Need at least 2 days of data
         if len(df) < 2:
             return 0.0
 
-        # Today's open vs yesterday's close
         prev_close = close.iloc[-2]
         prev_high = high.iloc[-2]
         prev_low = low.iloc[-2]
         today_open = open_price.iloc[-1]
         current_price = close.iloc[-1]
 
-        # Calculate gap
         gap_pct = (today_open - prev_close) / prev_close * 100
         abs_gap = abs(gap_pct)
 
         min_gap = self.cfg.get("min_gap_pct", 1.5)
         strong_gap = self.cfg.get("strong_gap_pct", 3.0)
 
-        # No significant gap
         if abs_gap < min_gap:
             return 0.0
 
-        # Gap classification
         gap_up = gap_pct > 0
         gap_down = gap_pct < 0
         full_gap_up = today_open > prev_high
         full_gap_down = today_open < prev_low
 
-        # Current position relative to gap
         if gap_up:
-            # Gap up: is price holding above open?
-            holding_gap = current_price >= today_open * 0.995  # Within 0.5% of open
-            fading = current_price < today_open * 0.99  # More than 1% below open
-            filled = current_price <= prev_close * 1.002  # Back to previous close
+            holding_gap = current_price >= today_open * 0.995
+            fading = current_price < today_open * 0.99
+            filled = current_price <= prev_close * 1.002
         else:
             holding_gap = current_price <= today_open * 1.005
             fading = current_price > today_open * 1.01
             filled = current_price >= prev_close * 0.998
 
-        # Volume analysis
         vol_ratio = rvol(df)
         high_volume = vol_ratio > 1.5
         very_high_volume = vol_ratio > 2.5
 
-        # Trend context
         ctx = get_trend_context(df)
 
-        # RSI
         rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
         current_rsi = rsi.iloc[-1]
 
-        # Candle patterns
         patterns = detect_patterns(df)
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
+
+        orb_score = self._orb_signal(df, gap_up, gap_down, abs_gap, strong_gap, vol_ratio, ctx)
+        if orb_score != 0.0:
+            return orb_score
 
         # ══════════════════════════════════════════════════════
         # GAP AND GO (Continuation) - Long on gap up, Short on gap down
@@ -256,5 +249,78 @@ class GapStrategy:
             if score > 0.15:
                 log.debug(f"GAP FADE LONG: gap={gap_pct:.1f}% bouncing")
                 return max(0.0, min(1.0, score))
+
+        return 0.0
+
+    def _orb_signal(self, df: pd.DataFrame, gap_up: bool, gap_down: bool,
+                    abs_gap: float, strong_gap: float, vol_ratio: float,
+                    ctx: dict) -> float:
+        if len(df) < 5:
+            return 0.0
+
+        orb_bars = df.iloc[-4:-1]
+        or_high = orb_bars["high"].max()
+        or_low = orb_bars["low"].min()
+        or_vol_avg = orb_bars["volume"].mean()
+
+        vol_avg_50 = df["volume"].rolling(50).mean().iloc[-1]
+        or_volume_strong = or_vol_avg > vol_avg_50 if not np.isnan(vol_avg_50) else False
+
+        if not or_volume_strong:
+            return 0.0
+
+        current_price = df["close"].iloc[-1]
+
+        if gap_up and current_price > or_high:
+            score = 0.30
+            if abs_gap >= strong_gap:
+                score += 0.15
+            if vol_ratio > 1.5:
+                score += 0.20
+            elif vol_ratio > 1.0:
+                score += 0.10
+            if ctx["direction"] == "up":
+                score += 0.10
+            if ctx["above_vwap"]:
+                score += 0.05
+            log.debug(f"ORB LONG: gap_up, price>{or_high:.2f}, vol={vol_ratio:.1f}x")
+            return max(0.0, min(1.0, score))
+
+        if gap_up and current_price < or_low:
+            score = -0.20
+            if abs_gap < strong_gap:
+                score -= 0.10
+            if vol_ratio > 1.5:
+                score -= 0.10
+            if not ctx["above_vwap"]:
+                score -= 0.05
+            log.debug(f"ORB GAP FADE SHORT: gap_up but price<{or_low:.2f}")
+            return max(-1.0, min(0.0, score))
+
+        if gap_down and current_price < or_low:
+            score = -0.30
+            if abs_gap >= strong_gap:
+                score -= 0.15
+            if vol_ratio > 1.5:
+                score -= 0.20
+            elif vol_ratio > 1.0:
+                score -= 0.10
+            if ctx["direction"] == "down":
+                score -= 0.10
+            if not ctx["above_vwap"]:
+                score -= 0.05
+            log.debug(f"ORB SHORT: gap_down, price<{or_low:.2f}, vol={vol_ratio:.1f}x")
+            return max(-1.0, min(0.0, score))
+
+        if gap_down and current_price > or_high:
+            score = 0.20
+            if abs_gap < strong_gap:
+                score += 0.10
+            if vol_ratio > 1.5:
+                score += 0.10
+            if ctx["above_vwap"]:
+                score += 0.05
+            log.debug(f"ORB GAP FADE LONG: gap_down but price>{or_high:.2f}")
+            return max(0.0, min(1.0, score))
 
         return 0.0

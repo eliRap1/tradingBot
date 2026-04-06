@@ -8,9 +8,13 @@ Regimes:
   BULL:   SPY above 200 EMA, 50 EMA > 200 EMA → full size, longs allowed
   BEAR:   SPY below 200 EMA, 50 EMA < 200 EMA → reduce size, avoid longs
   CHOP:   Mixed signals → reduce size, be selective
+
+HMM layer: 3-state Hidden Markov Model on returns + volatility for
+probabilistic regime transitions. Overrides EMA regime when high confidence.
 """
 
 import pandas as pd
+import numpy as np
 import ta
 from utils import setup_logger
 
@@ -22,6 +26,8 @@ class RegimeFilter:
         self.data = data_fetcher
         self._last_regime = None
         self._universe = universe or []
+        self._hmm_model = None
+        self._hmm_state_map = {}  # maps HMM state index → "bull"/"bear"/"chop"
 
     def get_regime(self) -> dict:
         """
@@ -102,6 +108,43 @@ class RegimeFilter:
             size_mult = 0.2
             desc += " (Strong downtrend — minimal exposure)"
 
+        # ── HMM regime overlay ────────────────────────────────
+        hmm = self._get_hmm_regime(df)
+        if hmm and hmm["confidence"] > 0.7:
+            hmm_state = hmm["state"]
+            if hmm_state != regime:
+                # HMM disagrees with EMA regime — reduce size (conflicting signals)
+                size_mult *= 0.7
+                desc += f" (HMM says {hmm_state.upper()} @ {hmm['confidence']:.0%})"
+            else:
+                # HMM confirms EMA regime — slight size boost
+                size_mult = min(size_mult * 1.1, 1.0)
+                desc += f" (HMM confirms @ {hmm['confidence']:.0%})"
+
+            # HMM override: if EMA says bull but HMM strongly says bear, block longs
+            if hmm_state == "bear" and hmm["confidence"] > 0.85 and regime == "bull":
+                allow_longs = False
+                size_mult = 0.4
+                desc += " [HMM OVERRIDE: blocking longs]"
+
+        # ── ATR volatility regime ─────────────────────────────
+        atr_ind = ta.volatility.AverageTrueRange(
+            df["high"], df["low"], close, window=14
+        ).average_true_range()
+        atr_pct = (atr_ind / close) * 100
+        atr_pct_current = atr_pct.iloc[-1]
+        atr_pct_avg = atr_pct.iloc[-60:].mean() if len(atr_pct) >= 60 else atr_pct.mean()
+
+        if atr_pct_avg > 0 and atr_pct_current > 1.5 * atr_pct_avg:
+            atr_regime = "high_vol"
+            size_mult *= 0.8
+            desc += " (HIGH VOL — ATR elevated, tighter stops recommended)"
+        elif atr_pct_avg > 0 and atr_pct_current < 0.5 * atr_pct_avg:
+            atr_regime = "low_vol"
+            desc += " (LOW VOL — signals may be false breakouts)"
+        else:
+            atr_regime = "normal"
+
         # ── Market breadth: % of universe above 50 EMA ────────
         breadth = self._get_market_breadth()
         breadth_pct = breadth["pct_above_50ema"]
@@ -124,6 +167,9 @@ class RegimeFilter:
             "spy_trend": trend,
             "spy_rsi": round(spy_rsi, 1),
             "breadth_pct": round(breadth_pct, 1),
+            "hmm_regime": hmm["state"] if hmm else None,
+            "hmm_confidence": hmm["confidence"] if hmm else None,
+            "atr_regime": atr_regime,
             "description": desc,
         }
 
@@ -133,6 +179,87 @@ class RegimeFilter:
             self._last_regime = regime
 
         return result
+
+    def _get_hmm_regime(self, df: pd.DataFrame) -> dict | None:
+        """
+        Fit a 3-state Gaussian HMM on SPY returns + realized volatility.
+
+        Returns:
+            {"state": "bull"|"bear"|"chop", "confidence": float, "probs": [p0, p1, p2]}
+            or None if HMM fails (not enough data, library issue).
+
+        States are identified by their mean return:
+          - Highest mean return → bull
+          - Lowest mean return → bear
+          - Middle → chop
+        """
+        try:
+            from hmmlearn.hmm import GaussianHMM
+        except ImportError:
+            return None
+
+        if len(df) < 100:
+            return None
+
+        try:
+            close = df["close"].values
+            returns = np.diff(np.log(close))  # log returns
+
+            # Rolling 20-day realized volatility
+            vol_window = 20
+            if len(returns) < vol_window + 10:
+                return None
+            vol = pd.Series(returns).rolling(vol_window).std().values
+
+            # Align: drop NaN from rolling vol
+            valid = ~np.isnan(vol)
+            returns_valid = returns[valid]
+            vol_valid = vol[valid]
+
+            if len(returns_valid) < 60:
+                return None
+
+            features = np.column_stack([returns_valid, vol_valid])
+
+            # Fit HMM (3 states, diagonal covariance for speed)
+            model = GaussianHMM(
+                n_components=3,
+                covariance_type="diag",
+                n_iter=50,
+                random_state=42,
+            )
+            model.fit(features)
+
+            # Predict current state
+            state_seq = model.predict(features)
+            current_state = state_seq[-1]
+
+            # State probabilities for the last observation
+            probs = model.predict_proba(features[-1:].reshape(1, -1))[0]
+
+            # Map states by mean return: highest=bull, lowest=bear, middle=chop
+            mean_returns = model.means_[:, 0]
+            sorted_indices = np.argsort(mean_returns)
+            state_map = {
+                sorted_indices[0]: "bear",
+                sorted_indices[1]: "chop",
+                sorted_indices[2]: "bull",
+            }
+
+            self._hmm_model = model
+            self._hmm_state_map = state_map
+
+            regime = state_map[current_state]
+            confidence = float(probs[current_state])
+
+            return {
+                "state": regime,
+                "confidence": confidence,
+                "probs": [float(p) for p in probs],
+            }
+        except Exception as e:
+            log.warning(f"HMM regime detection failed: {e}")
+            return None
 
     def _get_market_breadth(self) -> dict:
         """Calculate % of universe stocks above their 50 EMA."""

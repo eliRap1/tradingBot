@@ -13,7 +13,7 @@ CRITICAL: This prevents trading on old/stale data!
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -68,7 +68,7 @@ class LiveTradingManager:
         # Cache for 1 minute to reduce API calls
         now = datetime.now()
         if (self._last_market_check and 
-            (now - self._last_market_check).seconds < 60 and
+            (now - self._last_market_check).total_seconds() < 60 and
             self._cached_status):
             return self._cached_status
         
@@ -239,7 +239,8 @@ class LiveTradingManager:
         
         # If we have a timestamp, check age
         if timestamp:
-            age = (datetime.now(UTC) - timestamp.replace(tzinfo=UTC)).total_seconds()
+            ts = timestamp.astimezone(UTC) if timestamp.tzinfo else timestamp.replace(tzinfo=UTC)
+            age = (datetime.now(UTC) - ts).total_seconds()
             if age > max_age:
                 return False, f"stale_price_age_{int(age)}s"
         
@@ -294,27 +295,13 @@ class LiveTradingManager:
         status = self.get_market_status()
         now_et = datetime.now(ET)
         
-        # Always run for crypto
-        if status.crypto_open:
-            # But skip stocks-only checks
-            pass
-        
         # Market completely closed (not even pre/post)
         if status.session == "closed":
             return False, "crypto_only_mode"  # Still run for crypto
-        
-        # Skip first 15 minutes (opening volatility)
-        if status.is_open:
-            market_open = now_et.replace(
-                hour=self.MARKET_OPEN[0],
-                minute=self.MARKET_OPEN[1],
-                second=0
-            )
-            minutes_since_open = (now_et - market_open).total_seconds() / 60
-            
-            if minutes_since_open < 15:
-                return True, f"opening_volatility_{int(minutes_since_open)}min"
-        
+
+        # Note: Opening delay is handled by coordinator's market_open_delay_min
+        # to avoid double-skipping the first 30 minutes.
+
         # Skip last 15 minutes (closing spreads)
         if status.is_open and status.next_close:
             try:

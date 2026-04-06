@@ -46,7 +46,6 @@ class BreakoutStrategy:
         current_price = close.iloc[-1]
         current_volume = volume.iloc[-1]
 
-        # Pivot-based support/resistance
         ph = pivot_high(high, left_bars=5, right_bars=5)
         pl = pivot_low(low, left_bars=5, right_bars=5)
 
@@ -60,7 +59,6 @@ class BreakoutStrategy:
         if support is None:
             support = low.iloc[-lookback - 1:-1].min()
 
-        # Second pivots for retest detection
         ph_valid = ph.dropna()
         pl_valid = pl.dropna()
         prev_resistance = ph_valid.iloc[-2] if len(ph_valid) >= 2 else resistance
@@ -68,17 +66,24 @@ class BreakoutStrategy:
 
         ctx = get_trend_context(df)
 
-        # RVOL (time-of-day adjusted volume)
         vol_ratio = rvol(df)
+        vol_avg_50 = volume.rolling(50).mean().iloc[-1]
 
-        # ATR
         atr = ta.volatility.AverageTrueRange(
             high=high, low=low, close=close,
             window=self.cfg["atr_period"]
         ).average_true_range()
         current_atr = atr.iloc[-1]
 
-        # Consolidation
+        adx_ind = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14)
+        adx_val = adx_ind.adx().iloc[-1]
+
+        if adx_val <= 20:
+            return 0.0
+
+        if current_volume < 1.2 * vol_avg_50:
+            return 0.0
+
         recent_range = (high.iloc[-5:].max() - low.iloc[-5:].min()) / current_price
         lookback_range = (high.iloc[-lookback:].max() - low.iloc[-lookback:].min()) / current_price
         range_compressed = recent_range < lookback_range * 0.5
@@ -93,7 +98,6 @@ class BreakoutStrategy:
         candle_bull = bullish_score(patterns)
         candle_bear = bearish_score(patterns)
 
-        # Candle quality
         if "open" in df.columns:
             candle_body = abs(close.iloc[-1] - df["open"].iloc[-1])
             candle_range = high.iloc[-1] - low.iloc[-1]
@@ -106,8 +110,11 @@ class BreakoutStrategy:
             strong_bull_candle = False
             strong_bear_candle = False
 
+        n_bar_high = high.iloc[-lookback - 1:-1].max()
+        n_bar_low = low.iloc[-lookback - 1:-1].min()
+
         # ── LONG: BREAKOUT ABOVE RESISTANCE ──────────────────
-        if current_price > resistance:
+        if current_price > resistance and current_price > n_bar_high + 0.5 * current_atr:
             score = 0.0
 
             if close.iloc[-1] > resistance:
@@ -163,7 +170,7 @@ class BreakoutStrategy:
             return max(0.0, min(1.0, score))
 
         # ── SHORT: BREAKDOWN BELOW SUPPORT ───────────────────
-        elif current_price < support:
+        elif current_price < support and current_price < n_bar_low - 0.5 * current_atr:
             score = 0.0
 
             # Close below support (not just wick)

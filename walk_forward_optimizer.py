@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from typing import Optional
 import pandas as pd
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from utils import setup_logger, load_config
 
@@ -122,48 +121,47 @@ class WalkForwardOptimizer:
         )
         
         log.info(f"Generated {len(windows)} train/test windows")
-        
-        # Run optimization for each window
-        all_test_results = []
-        
-        for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
-            log.info(f"\n=== Window {i+1}/{len(windows)} ===")
-            log.info(f"Train: {train_start} to {train_end}")
-            log.info(f"Test:  {test_start} to {test_end}")
-            
-            # Find best params on training data
-            best_train_params, train_result = self._optimize_window(
-                train_start, train_end
-            )
-            
-            if not best_train_params:
-                log.warning(f"No valid params found for window {i+1}")
-                continue
-            
-            log.info(f"Best train params: Sharpe={train_result.sharpe_ratio:.2f}, "
-                     f"WinRate={train_result.win_rate:.1f}%")
-            
-            # Validate on test data
-            test_result = self._backtest_params(
-                best_train_params, test_start, test_end
-            )
-            
-            if test_result:
-                log.info(f"Test result: Sharpe={test_result.sharpe_ratio:.2f}, "
-                         f"WinRate={test_result.win_rate:.1f}%, "
-                         f"Trades={test_result.total_trades}")
-                all_test_results.append(test_result)
-        
-        # Aggregate results and find robust parameters
+
+        # Generate all param combos once
+        param_combos = self._generate_param_combinations()
+        log.info(f"Testing {len(param_combos)} param combos × {len(windows)} windows")
+
+        # For each param combo, find which ones pass training, then test OOS
+        # This ensures aggregation has multiple data points per param set
+        all_test_results = []  # (params, [test_results across windows])
+
+        for pi, params in enumerate(param_combos):
+            if pi % 20 == 0:
+                log.info(f"Param combo {pi}/{len(param_combos)}...")
+
+            test_results_for_param = []
+
+            for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
+                # Train: does this param set work in-sample?
+                train_result = self._backtest_params(params, train_start, train_end)
+                if not train_result or train_result.total_trades < 10:
+                    continue
+                if train_result.sharpe_ratio < 0.5 or train_result.max_drawdown > 0.15:
+                    continue  # Doesn't pass training bar
+
+                # Test: validate out-of-sample
+                test_result = self._backtest_params(params, test_start, test_end)
+                if test_result and test_result.total_trades >= 5:
+                    test_results_for_param.append(test_result)
+
+            # Only keep params that worked in multiple windows
+            if len(test_results_for_param) >= max(2, len(windows) // 2):
+                all_test_results.append((params, test_results_for_param))
+
         if not all_test_results:
             log.error("No valid test results - optimization failed")
             return None
-        
+
         best_params = self._aggregate_results(all_test_results)
-        
+
         # Save optimized parameters
         self._save_optimized_params(best_params)
-        
+
         return best_params
     
     def _generate_windows(self, start_date: str, end_date: str,
@@ -196,55 +194,27 @@ class WalkForwardOptimizer:
         
         return windows
     
-    def _optimize_window(self, start_date: str, end_date: str) -> tuple:
-        """Find best parameters for a training window."""
-        
-        # Generate parameter combinations
-        param_combos = self._generate_param_combinations()
-        
-        log.info(f"Testing {len(param_combos)} parameter combinations...")
-        
-        best_result = None
-        best_params = None
-        
-        for i, params in enumerate(param_combos):
-            if i % 20 == 0:
-                log.info(f"Progress: {i}/{len(param_combos)}")
-            
-            result = self._backtest_params(params, start_date, end_date)
-            
-            if result and result.total_trades >= 10:  # Minimum trades
-                if best_result is None or result.sharpe_ratio > best_result.sharpe_ratio:
-                    # Also check drawdown constraint
-                    if result.max_drawdown < 0.15:  # Max 15% drawdown
-                        best_result = result
-                        best_params = params
-        
-        return best_params, best_result
-    
     def _generate_param_combinations(self) -> list:
-        """Generate all parameter combinations to test."""
-        combos = []
-        
-        # Flatten the grid
+        """Generate parameter combinations to test (random sample if too many)."""
+        import random
+
         signal_combos = list(itertools.product(
             PARAM_GRID["signals"]["min_composite_score"],
             PARAM_GRID["signals"]["min_agreeing_strategies"],
         ))
-        
+
         risk_combos = list(itertools.product(
             PARAM_GRID["risk"]["stop_loss_atr_mult"],
             PARAM_GRID["risk"]["take_profit_atr_mult"],
             PARAM_GRID["risk"]["trailing_stop_pct"],
             PARAM_GRID["risk"]["max_portfolio_risk_pct"],
         ))
-        
-        # Limit combinations to avoid explosion
-        max_combos = 200
-        
+
+        # Build full cartesian product
+        all_combos = []
         for sig in signal_combos:
             for risk in risk_combos:
-                params = {
+                all_combos.append({
                     "signals": {
                         "min_composite_score": sig[0],
                         "min_agreeing_strategies": sig[1],
@@ -255,73 +225,89 @@ class WalkForwardOptimizer:
                         "trailing_stop_pct": risk[2],
                         "max_portfolio_risk_pct": risk[3],
                     },
-                }
-                combos.append(params)
-                
-                if len(combos) >= max_combos:
-                    break
-            if len(combos) >= max_combos:
-                break
-        
-        return combos
+                })
+
+        # Random sample to cap compute, avoiding bias toward early grid points
+        max_combos = 200
+        if len(all_combos) > max_combos:
+            random.seed(42)  # Reproducible
+            all_combos = random.sample(all_combos, max_combos)
+
+        return all_combos
     
-    def _backtest_params(self, params: dict, start_date: str, 
-                         end_date: str) -> Optional[BacktestResult]:
-        """Run backtest with specific parameters."""
+    def _fetch_all_data(self):
+        """Fetch full date range of data once, cache for all windows."""
+        if hasattr(self, '_all_bars') and self._all_bars:
+            return self._all_bars
+
         try:
-            # Merge params with base config
+            from data import DataFetcher
+            from broker import Broker
+
+            broker = Broker(self.config)
+            data_fetcher = DataFetcher(broker)
+
+            # Fetch maximum history needed (18 months + buffer)
+            symbols = self.config["screener"]["universe"][:15]
+            raw_bars = data_fetcher.get_bars(symbols, timeframe="1Day", days=600)
+
+            bars_dict = {}
+            for sym, bar_list in raw_bars.items():
+                if isinstance(bar_list, list) and len(bar_list) >= 30:
+                    df = pd.DataFrame(bar_list)
+                    if 'timestamp' in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        df.set_index('timestamp', inplace=True)
+                    bars_dict[sym] = df
+                elif isinstance(bar_list, pd.DataFrame) and len(bar_list) >= 30:
+                    bars_dict[sym] = bar_list
+
+            self._all_bars = bars_dict
+            log.info(f"Fetched data for {len(bars_dict)} symbols")
+            return bars_dict
+        except Exception as e:
+            log.warning(f"Could not fetch data: {e}")
+            return {}
+
+    def _slice_bars(self, bars_dict: dict, start_date: str, end_date: str) -> dict:
+        """Slice cached bars to a specific date range."""
+        sliced = {}
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+
+        for sym, df in bars_dict.items():
+            idx = df.index
+            # Handle timezone-aware indexes
+            if hasattr(idx, 'tz') and idx.tz is not None:
+                start_tz = start.tz_localize(idx.tz)
+                end_tz = end.tz_localize(idx.tz)
+            else:
+                start_tz = start
+                end_tz = end
+
+            window = df.loc[(idx >= start_tz) & (idx <= end_tz)]
+            if len(window) >= 30:
+                sliced[sym] = window
+
+        return sliced
+
+    def _backtest_params(self, params: dict, start_date: str,
+                         end_date: str) -> Optional[BacktestResult]:
+        """Run backtest with specific parameters on date-sliced data."""
+        try:
             config = self._merge_params(params)
-            
-            # Import here to avoid circular imports
+
             from backtester import Backtester
-            
-            # Use cached data if available, otherwise fetch
-            cache_key = f"{start_date}_{end_date}"
-            
-            if not hasattr(self, '_data_cache'):
-                self._data_cache = {}
-            
-            if cache_key not in self._data_cache:
-                # Try to fetch data
-                try:
-                    from data import DataFetcher
-                    from broker import Broker
-                    
-                    broker = Broker(config)
-                    data_fetcher = DataFetcher(broker)
-                    
-                    # Calculate days needed
-                    start = datetime.strptime(start_date, "%Y-%m-%d")
-                    end = datetime.strptime(end_date, "%Y-%m-%d")
-                    days_needed = (end - start).days + 60  # Extra buffer
-                    
-                    symbols = config["screener"]["universe"][:15]
-                    raw_bars = data_fetcher.get_bars(symbols, timeframe="1Day", days=days_needed)
-                    
-                    # Convert to DataFrames with proper index
-                    bars_dict = {}
-                    for sym, bar_list in raw_bars.items():
-                        if isinstance(bar_list, list) and len(bar_list) >= 30:
-                            df = pd.DataFrame(bar_list)
-                            if 'timestamp' in df.columns:
-                                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                                df.set_index('timestamp', inplace=True)
-                            bars_dict[sym] = df
-                        elif isinstance(bar_list, pd.DataFrame) and len(bar_list) >= 30:
-                            bars_dict[sym] = bar_list
-                    
-                    self._data_cache[cache_key] = bars_dict
-                    
-                except Exception as e:
-                    log.warning(f"Could not fetch data: {e}")
-                    return None
-            
-            bars_dict = self._data_cache.get(cache_key, {})
-            
+
+            all_bars = self._fetch_all_data()
+            if not all_bars:
+                return None
+
+            # Slice to the specific window date range
+            bars_dict = self._slice_bars(all_bars, start_date, end_date)
             if not bars_dict:
                 return None
-            
-            # Run backtest
+
             bt = Backtester(config)
             result = bt.run(bars_dict, min_bars=30)
             
@@ -359,51 +345,43 @@ class WalkForwardOptimizer:
         return config
     
     def _aggregate_results(self, results: list) -> dict:
-        """Aggregate results from all test windows to find robust params."""
-        
-        # Group by parameter set
-        param_performance = {}
-        
-        for result in results:
-            param_key = json.dumps(result.params, sort_keys=True)
-            
-            if param_key not in param_performance:
-                param_performance[param_key] = {
-                    "params": result.params,
-                    "sharpes": [],
-                    "win_rates": [],
-                    "drawdowns": [],
-                    "returns": [],
-                }
-            
-            param_performance[param_key]["sharpes"].append(result.sharpe_ratio)
-            param_performance[param_key]["win_rates"].append(result.win_rate)
-            param_performance[param_key]["drawdowns"].append(result.max_drawdown)
-            param_performance[param_key]["returns"].append(result.total_return)
-        
-        # Find most robust parameters (consistent across windows)
+        """Aggregate results from all test windows to find robust params.
+
+        Args:
+            results: list of (params_dict, [BacktestResult, ...]) tuples.
+                     Each tuple has one param set and its OOS results across windows.
+        """
         best_score = -float('inf')
         best_params = None
-        
-        for param_key, perf in param_performance.items():
-            # Robustness score: average Sharpe - std(Sharpe) + win_rate bonus
-            avg_sharpe = np.mean(perf["sharpes"])
-            std_sharpe = np.std(perf["sharpes"])
-            avg_win_rate = np.mean(perf["win_rates"])
-            max_dd = max(perf["drawdowns"])
-            
-            # Penalize inconsistent results and high drawdown
-            score = avg_sharpe - 0.5 * std_sharpe + 0.01 * avg_win_rate - 0.5 * max_dd
-            
+
+        for params, test_results in results:
+            sharpes = [r.sharpe_ratio for r in test_results]
+            win_rates = [r.win_rate for r in test_results]
+            drawdowns = [r.max_drawdown for r in test_results]
+
+            avg_sharpe = np.mean(sharpes)
+            std_sharpe = np.std(sharpes) if len(sharpes) > 1 else 999.0
+            avg_win_rate = np.mean(win_rates)
+            max_dd = max(drawdowns)
+            n_windows = len(test_results)
+
+            # Robustness score: consistent performance across windows
+            # Penalize: high variance, high drawdown, few passing windows
+            score = (avg_sharpe
+                     - 0.5 * std_sharpe
+                     + 0.01 * avg_win_rate
+                     - 0.5 * max_dd
+                     + 0.1 * n_windows)  # Bonus for working across more windows
+
             if score > best_score:
                 best_score = score
-                best_params = perf["params"]
-        
+                best_params = params
+
         if best_params:
             log.info("\n=== OPTIMIZED PARAMETERS ===")
             log.info(f"Score: {best_score:.3f}")
             log.info(json.dumps(best_params, indent=2))
-        
+
         return {
             "params": best_params,
             "score": best_score,

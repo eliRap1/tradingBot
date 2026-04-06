@@ -28,6 +28,7 @@ from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context, get_weekly_trend
 from data import CRYPTO_SYMBOLS
 from strategies import ALL_STRATEGIES
+from indicators import keltner_squeeze, daily_pivot_points
 
 log = setup_logger("dashboard")
 
@@ -125,18 +126,31 @@ def refresh_data():
                               if float(account.last_equity) > 0 else 0),
         }
 
-        # Positions
+        # Positions (with position_meta for R-multiple)
         positions = []
+        state_data = load_state()
+        pos_meta = state_data.get("position_meta", {})
         for pos in _broker.get_positions():
+            meta = pos_meta.get(pos.symbol, {})
+            initial_risk = meta.get("initial_risk", 0)
+            entry_price = float(pos.avg_entry_price)
+            pnl = float(pos.unrealized_pl)
+            r_multiple = None
+            if initial_risk and initial_risk > 0:
+                r_multiple = round(pnl / initial_risk, 2)
             positions.append({
                 "symbol": pos.symbol,
-                "qty": int(pos.qty),
-                "entry_price": float(pos.avg_entry_price),
+                "qty": float(pos.qty),
+                "entry_price": entry_price,
                 "current_price": float(pos.current_price),
                 "market_value": float(pos.market_value),
-                "pnl": float(pos.unrealized_pl),
+                "pnl": pnl,
                 "pnl_pct": float(pos.unrealized_plpc) * 100,
                 "side": pos.side,
+                "r_multiple": r_multiple,
+                "opened_at": meta.get("opened_at"),
+                "breakeven_armed": meta.get("breakeven_armed", False),
+                "strategies": meta.get("strategies", []),
             })
         _state["positions"] = positions
 
@@ -155,6 +169,20 @@ def refresh_data():
         watcher_states = []
         for sym, w in sorted(_watchers.items()):
             s = w.state
+            hourly_bias = getattr(w, "_hourly_bias", {}).get("bias", "neutral")
+            alpha_decay = getattr(w, "_alpha_decay", {})
+            decaying = {k: round(v, 2) for k, v in alpha_decay.items() if v < 0.8}
+
+            squeeze_info = None
+            pivot_info = None
+            try:
+                bars = getattr(w, "_bars", None)
+                if bars is not None and len(bars) >= 30:
+                    squeeze_info = keltner_squeeze(bars)
+                    pivot_info = daily_pivot_points(bars)
+            except Exception:
+                pass
+
             watcher_states.append({
                 "symbol": s.symbol,
                 "status": s.status,
@@ -173,7 +201,13 @@ def refresh_data():
                 "last_price": float(s.last_price),
                 "last_update": s.last_update,
                 "confirmed": bool(s.confirmed),
+                "prev_signal": bool(s.prev_signal),
                 "error": s.error,
+                "hourly_bias": hourly_bias,
+                "alpha_decay": alpha_decay,
+                "decaying_strategies": decaying,
+                "keltner_squeeze": squeeze_info,
+                "pivot_levels": pivot_info,
             })
         _state["watchers"] = watcher_states
         _state["thread_count"] = len(_watchers)
@@ -345,13 +379,14 @@ def _build_analysis(symbol: str, daily_df, intraday_df, trend_ctx: dict) -> dict
             })
 
         composite = weighted_sum / total_weight if total_weight > 0 else 0.0
+        total_strats = len(strat_weights)
         steps.append({
             "step": 5,
             "name": "Strategy Signals (Entry TF)",
             "status": "bullish" if num_bullish >= 2 else "bearish" if num_bearish >= 2 else "neutral",
             "details": strat_step_details,
             "summary": f"Composite: {composite:+.4f} | "
-                       f"Bullish: {num_bullish}/5, Bearish: {num_bearish}/5",
+                       f"Bullish: {num_bullish}/{total_strats}, Bearish: {num_bearish}/{total_strats}",
         })
 
         # Step 6: Confluence Check
@@ -365,9 +400,9 @@ def _build_analysis(symbol: str, daily_df, intraday_df, trend_ctx: dict) -> dict
         has_short = num_bearish >= min_agreeing and composite <= -min_score
 
         confluence_details = [
-            {"label": "Bullish Strategies", "value": f"{num_bullish}/5 (need {min_agreeing})",
+            {"label": "Bullish Strategies", "value": f"{num_bullish}/{total_strats} (need {min_agreeing})",
              "signal": num_bullish >= min_agreeing},
-            {"label": "Bearish Strategies", "value": f"{num_bearish}/5 (need {min_agreeing})",
+            {"label": "Bearish Strategies", "value": f"{num_bearish}/{total_strats} (need {min_agreeing})",
              "signal": num_bearish >= min_agreeing},
             {"label": "Composite Score", "value": f"{composite:+.4f} (need {'+' if composite >= 0 else ''}{min_score})",
              "signal": abs(composite) >= min_score},
@@ -409,10 +444,10 @@ def _build_analysis(symbol: str, daily_df, intraday_df, trend_ctx: dict) -> dict
 
         # Step 7: Final Decision
         if has_long and confirmed:
-            decision = {"action": "BUY", "reason": f"{num_bullish}/5 agree, score={composite:+.3f}, confirmed",
+            decision = {"action": "BUY", "reason": f"{num_bullish}/{total_strats} agree, score={composite:+.3f}, confirmed",
                         "score": round(composite, 4), "confluence": num_bullish}
         elif has_short and confirmed:
-            decision = {"action": "SHORT", "reason": f"{num_bearish}/5 agree, score={composite:+.3f}, confirmed",
+            decision = {"action": "SHORT", "reason": f"{num_bearish}/{total_strats} agree, score={composite:+.3f}, confirmed",
                         "score": round(composite, 4), "confluence": num_bearish}
         elif has_long or has_short:
             direction_word = "LONG" if has_long else "SHORT"
@@ -644,13 +679,13 @@ def api_chart(symbol):
                 markers.append({
                     "time": current_time, "position": "belowBar",
                     "color": "#00ff00", "shape": "arrowUp",
-                    "text": f">>> LIVE BUY {s.score:.2f} ({s.num_agreeing}/5) <<<"
+                    "text": f">>> LIVE BUY {s.score:.2f} ({s.num_agreeing}/{len(ALL_STRATEGIES)}) <<<"
                 })
             elif s.action.value == "short":
                 markers.append({
                     "time": current_time, "position": "aboveBar",
                     "color": "#ff0000", "shape": "arrowDown",
-                    "text": f">>> LIVE SHORT {s.score:.2f} ({s.num_agreeing}/5) <<<"
+                    "text": f">>> LIVE SHORT {s.score:.2f} ({s.num_agreeing}/{len(ALL_STRATEGIES)}) <<<"
                 })
 
     # Trend context

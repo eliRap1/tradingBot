@@ -11,7 +11,7 @@ log = setup_logger("risk")
 @dataclass
 class SizedOrder:
     symbol: str
-    qty: int
+    qty: float  # float for crypto fractional shares, int for stocks
     side: str
     entry_price: float
     stop_loss: float
@@ -29,9 +29,6 @@ class RiskManager:
         self.peak_equity = state.get("peak_equity", 0.0)
         self.daily_pnl = 0.0
         self.starting_equity = 0.0
-        
-        # Track recent volatility for adaptive sizing
-        self._vol_cache = {}
 
     def set_starting_equity(self, equity: float):
         """Call at start of day to track daily loss limit."""
@@ -43,7 +40,8 @@ class RiskManager:
                     num_existing: int,
                     regime_size_mult: float = 1.0,
                     tracker_stats: dict = None,
-                    profit_enhancements: dict = None) -> list[SizedOrder]:
+                    profit_enhancements: dict = None,
+                    tracker=None) -> list[SizedOrder]:
         """
         Convert opportunities into sized orders with stops.
 
@@ -55,7 +53,7 @@ class RiskManager:
         - Profit maximizer size boosts
         """
         orders = []
-        max_new = max(0, self.cfg.get("max_positions", 12) - num_existing)
+        max_new = max(0, self.cfg.get("max_positions", 10) - num_existing)
         profit_enhancements = profit_enhancements or {}
 
         # Daily loss limit check
@@ -139,18 +137,34 @@ class RiskManager:
                 kelly_min_trades = self.cfg.get("kelly_min_trades", 30)
                 total_trades = tracker_stats.get("total_trades", 0)
 
-                if total_trades >= kelly_min_trades:
+                # Try per-strategy Kelly first (more granular)
+                strat_kelly = None
+                contributing = getattr(opp, "contributing_strategies", None)
+                if tracker and contributing:
+                    strat_kelly = tracker.get_strategy_kelly(contributing)
+
+                if strat_kelly is not None and strat_kelly > 0:
+                    # Per-strategy Kelly available — use it
+                    kelly_f = min(strat_kelly, self.cfg["max_portfolio_risk_pct"])
+                    max_risk_dollars = equity * kelly_f
+                    log.info(f"Strategy Kelly: f={kelly_f:.4f} for {contributing}")
+                elif total_trades >= kelly_min_trades:
                     p = tracker_stats.get("win_pct", 50) / 100
                     avg_win = abs(tracker_stats.get("avg_win", 1))
                     avg_loss = abs(tracker_stats.get("avg_loss", 1))
-                    
+
                     # Cap the win/loss ratio to prevent extreme sizing
                     b = avg_win / avg_loss if avg_loss > 0 else 1.0
                     b = min(b, 5.0)
-                    
+
                     kelly_f = p - ((1 - p) / b) if b > 0 else 0
                     kelly_f *= self.cfg.get("kelly_fraction", 0.5)
-                    kelly_f = max(0.005, min(kelly_f, self.cfg["max_portfolio_risk_pct"]))
+
+                    if kelly_f <= 0:
+                        log.warning(f"Kelly fraction negative ({kelly_f:.4f}) — system is losing, skipping trade")
+                        continue
+
+                    kelly_f = min(kelly_f, self.cfg["max_portfolio_risk_pct"])
 
                     max_risk_dollars = equity * kelly_f
                     log.info(f"Kelly sizing: f={kelly_f:.4f} (p={p:.2f} b={b:.2f})")
@@ -159,18 +173,19 @@ class RiskManager:
             else:
                 max_risk_dollars = equity * self.cfg["max_portfolio_risk_pct"]
 
-            qty_by_risk = int(max_risk_dollars / risk_per_share)
-
+            is_crypto = opp.symbol in CRYPTO_SYMBOLS
+            qty_by_risk = max_risk_dollars / risk_per_share
             max_position_dollars = equity * self.cfg["max_position_pct"]
-            qty_by_size = int(max_position_dollars / entry_price)
+            qty_by_size = max_position_dollars / entry_price
 
             qty = min(qty_by_risk, qty_by_size)
 
-            # Apply regime size multiplier
-            qty = int(qty * regime_size_mult)
-            
-            # Apply profit maximizer size boost
-            qty = int(qty * size_boost)
+            # Apply regime size multiplier and profit boost
+            qty = qty * regime_size_mult * size_boost
+
+            # Round: crypto keeps fractional, stocks round to int
+            if not is_crypto:
+                qty = int(qty)
 
             if qty <= 0:
                 continue
