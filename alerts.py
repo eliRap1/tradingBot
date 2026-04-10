@@ -226,6 +226,51 @@ class AlertManager:
         msg = f"🔥 *BOT ERROR*\n`{error_msg[:500]}`"
         self._send(msg)
 
+    def send_regime_change(self, old_regime: str, new_regime: str, description: str):
+        """Notify when market regime changes (bull/bear/chop transition)."""
+        if not self.enabled:
+            return
+        emoji = {"bull": "🟢", "bear": "🔴", "chop": "🟡"}.get(new_regime, "📊")
+        msg = (
+            f"{emoji} *REGIME CHANGE*\n"
+            f"`{old_regime.upper()} → {new_regime.upper()}`\n"
+            f"{description}"
+        )
+        self._send(msg)
+
+    _ETF_NAMES = {
+        "XLK": "Tech/Semi/Cloud", "XLE": "Energy",       "XLF": "Financials",
+        "XLV": "Healthcare",      "XLY": "Consumer Disc", "XLP": "Consumer Staples",
+        "XLI": "Industrials",     "XLRE": "REITs",        "XLU": "Utilities",
+        "crypto": "Crypto",
+    }
+
+    def send_sector_regime_change(self, etf_key: str, old_regime: str,
+                                   new_regime: str, description: str = ""):
+        """Discord alert when a sector ETF regime transitions."""
+        if not self.enabled:
+            return
+        emoji = {"bull": "🟢", "bear": "🔴", "chop": "🟡"}.get(new_regime, "📊")
+        name = self._ETF_NAMES.get(etf_key, etf_key)
+        msg = (
+            f"{emoji} *SECTOR CHANGE: {etf_key} ({name})*\n"
+            f"`{old_regime.upper()} -> {new_regime.upper()}`\n"
+            f"{description}"
+        )
+        self._send(msg)
+
+    def send_hmm_caution(self, confidence: float, hmm_state: str,
+                         ema_state: str, size_mult: float):
+        """Notify when HMM disagrees with EMA and position sizes are capped."""
+        if not self.enabled:
+            return
+        msg = (
+            f"⚠️ *HMM CAUTION*\n"
+            f"EMA: `{ema_state.upper()}` | HMM: `{hmm_state.upper()} @ {confidence:.0%}`\n"
+            f"Position sizes capped at `{size_mult:.0%}` — elevated volatility detected"
+        )
+        self._send(msg)
+
     def _send(self, message: str):
         """Send message via Discord webhook with rate limiting."""
         if not self.enabled or not self.webhook_url:
@@ -264,9 +309,10 @@ class DiscordBot:
     Requires DISCORD_BOT_TOKEN in .env.
     """
 
-    def __init__(self, tracker, broker=None):
+    def __init__(self, tracker, broker=None, coordinator=None):
         self.tracker = tracker
         self.broker = broker
+        self.coordinator = coordinator
         self._thread = None
         self.token = os.getenv("DISCORD_BOT_TOKEN", "")
 
@@ -296,23 +342,23 @@ class DiscordBot:
 
             tracker = self.tracker
             broker = self.broker
+            coordinator = self.coordinator
 
             @client.event
             async def on_ready():
                 log.info(f"Discord bot connected as {client.user}")
+                log.info(f"Discord bot intents: message_content={client.intents.message_content}")
 
             @client.event
             async def on_message(message):
                 if message.author == client.user:
                     return
 
+                safe_content = message.content.encode("ascii", errors="replace").decode("ascii")
+                log.debug(f"Discord message from {message.author}: '{safe_content}'")
                 if message.content.strip().lower() in ("!stat", "!stats", "!status"):
-                    stats = tracker.get_stats()
-                    if not stats:
-                        await message.channel.send("📊 No trades recorded yet.")
-                        return
-
-                    # Get equity if broker available
+                    # Get equity first so APR uses real starting equity
+                    eq = 100_000.0
                     equity_str = ""
                     positions_str = ""
                     if broker:
@@ -323,6 +369,11 @@ class DiscordBot:
                             positions_str = f"\n📌 **Open positions:** `{len(positions)}`"
                         except Exception:
                             pass
+
+                    stats = tracker.get_stats(starting_equity=eq)
+                    if not stats:
+                        await message.channel.send("📊 No trades recorded yet.")
+                        return
 
                     # Today's trades
                     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -369,9 +420,161 @@ class DiscordBot:
 
                     await message.channel.send(msg)
 
+                elif message.content.strip().lower() == "!help":
+                    msg = (
+                        "📖 **Bot Commands**\n"
+                        "`!stat` / `!stats` — full performance stats\n"
+                        "`!positions` — open positions with live P&L\n"
+                        "`!regime` — current market regime + HMM state\n"
+                        "`!top` — top 5 pending/confirmed signals\n"
+                        "`!risk` — drawdown, daily P&L, exposure\n"
+                        "`!pause` — pause new trade entries\n"
+                        "`!resume` — resume trading"
+                    )
+                    await message.channel.send(msg)
+
+                elif message.content.strip().lower() == "!positions":
+                    if not broker:
+                        await message.channel.send("❌ Broker not connected.")
+                        return
+                    try:
+                        positions = broker.get_positions()
+                        if not positions:
+                            await message.channel.send("📭 No open positions.")
+                            return
+                        eq = broker.get_equity()
+                        msg = f"📌 **Open Positions** ({len(positions)})\n"
+                        total_unreal = 0.0
+                        for p in positions:
+                            side = getattr(p, "side", "long")
+                            qty = float(getattr(p, "qty", 0))
+                            entry = float(getattr(p, "avg_entry_price", 0))
+                            unreal = float(getattr(p, "unrealized_pl", 0))
+                            unreal_pct = float(getattr(p, "unrealized_plpc", 0)) * 100
+                            total_unreal += unreal
+                            e = "🟢" if unreal >= 0 else "🔴"
+                            msg += (
+                                f"{e} `{p.symbol}` {side.upper()} {qty:.4g} "
+                                f"@ ${entry:.2f} | "
+                                f"P&L: `${unreal:+,.2f}` (`{unreal_pct:+.1f}%`)\n"
+                            )
+                        sign = "+" if total_unreal >= 0 else ""
+                        msg += f"\n**Total unrealized:** `${sign}{total_unreal:,.2f}`"
+                        msg += f"\n**Equity:** `${eq:,.2f}`"
+                    except Exception as e:
+                        msg = f"❌ Error fetching positions: `{e}`"
+                    await message.channel.send(msg)
+
+                elif message.content.strip().lower() == "!regime":
+                    if not coordinator or not hasattr(coordinator, "regime"):
+                        await message.channel.send("❌ Regime data unavailable.")
+                        return
+                    try:
+                        r = coordinator.regime.get_regime()
+                        paused = getattr(coordinator, "_trading_paused", False)
+                        hmm_line = ""
+                        if r.get("hmm_regime"):
+                            hmm_line = (
+                                f"\nHMM: `{r['hmm_regime'].upper()} "
+                                f"@ {r['hmm_confidence']:.0%}`"
+                            )
+                        msg = (
+                            f"📊 **Market Regime**\n"
+                            f"Regime: `{r['regime'].upper()}`\n"
+                            f"SPY trend: `{r['spy_trend'].upper()}` | "
+                            f"RSI: `{r['spy_rsi']:.0f}`\n"
+                            f"Breadth: `{r['breadth_pct']:.0f}%` above 50 EMA"
+                            f"{hmm_line}\n"
+                            f"Allow longs: `{'YES' if r['allow_longs'] else 'NO'}`\n"
+                            f"Size mult: `{r['size_multiplier']:.0%}`\n"
+                            f"ATR: `{r.get('atr_regime', 'normal').upper()}`\n"
+                            f"Trading: `{'⏸ PAUSED' if paused else '▶ ACTIVE'}`\n"
+                            f"Detail: _{r['description']}_"
+                        )
+                    except Exception as e:
+                        msg = f"❌ Error fetching regime: `{e}`"
+                    await message.channel.send(msg)
+
+                elif message.content.strip().lower() == "!top":
+                    if not coordinator or not hasattr(coordinator, "watchers"):
+                        await message.channel.send("❌ Watcher data unavailable.")
+                        return
+                    try:
+                        watchers = list(coordinator.watchers.values())
+                        active = [
+                            w for w in watchers
+                            if w.state.status in ("signal", "pending", "analyzing")
+                            and w.state.score != 0
+                        ]
+                        active.sort(key=lambda w: abs(w.state.score), reverse=True)
+                        top = active[:5]
+                        if not top:
+                            await message.channel.send("🔍 No active signals right now.")
+                            return
+                        msg = f"🔍 **Top Signals** ({len(active)} active watchers)\n"
+                        for w in top:
+                            direction = "LONG" if w.state.score > 0 else "SHORT"
+                            status_emoji = "✅" if w.state.status == "signal" else "⏳"
+                            msg += (
+                                f"{status_emoji} `{w.symbol}` {direction} "
+                                f"score=`{w.state.score:+.3f}` "
+                                f"conf=`{w.state.num_agreeing}` "
+                                f"regime=`{w.state.regime}` "
+                                f"[{w.state.status}]\n"
+                            )
+                    except Exception as e:
+                        msg = f"❌ Error fetching signals: `{e}`"
+                    await message.channel.send(msg)
+
+                elif message.content.strip().lower() == "!risk":
+                    try:
+                        eq = 100_000.0
+                        peak = eq
+                        if broker:
+                            eq = broker.get_equity()
+                        if coordinator and hasattr(coordinator, "risk"):
+                            peak = coordinator.risk.peak_equity
+                        dd_pct = (peak - eq) / peak if peak > 0 else 0
+                        today_str = datetime.now().strftime("%Y-%m-%d")
+                        today_trades = [t for t in tracker.trades
+                                        if t.get("closed_at", "").startswith(today_str)]
+                        daily_pnl = sum(t["pnl"] for t in today_trades)
+                        max_dd = coordinator.config["risk"]["max_drawdown_pct"] if coordinator else 0.10
+                        daily_limit = coordinator.config["risk"].get("daily_loss_limit_pct", 0.025) * eq if coordinator else 0
+                        positions = broker.get_positions() if broker else []
+                        max_pos = coordinator.config["signals"].get("max_positions", 10) if coordinator else 10
+                        msg = (
+                            f"⚖️ **Risk Dashboard**\n"
+                            f"Equity: `${eq:,.2f}` | Peak: `${peak:,.2f}`\n"
+                            f"Drawdown: `{dd_pct:.1%}` / max `{max_dd:.0%}`\n"
+                            f"Daily P&L: `${daily_pnl:+,.2f}` | "
+                            f"Daily limit: `${daily_limit:,.0f}`\n"
+                            f"Positions: `{len(positions)}/{max_pos}`\n"
+                            f"Daily trades: `{len(today_trades)}`"
+                        )
+                    except Exception as e:
+                        msg = f"❌ Error fetching risk data: `{e}`"
+                    await message.channel.send(msg)
+
+                elif message.content.strip().lower() == "!pause":
+                    if coordinator:
+                        coordinator._trading_paused = True
+                        await message.channel.send("⏸ **Trading PAUSED** — no new entries until `!resume`")
+                        log.info("Trading paused via Discord !pause command")
+                    else:
+                        await message.channel.send("❌ Coordinator not connected.")
+
+                elif message.content.strip().lower() == "!resume":
+                    if coordinator:
+                        coordinator._trading_paused = False
+                        await message.channel.send("▶ **Trading RESUMED** — new entries enabled")
+                        log.info("Trading resumed via Discord !resume command")
+                    else:
+                        await message.channel.send("❌ Coordinator not connected.")
+
             # Run the bot
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(client.start(self.token))
         except Exception as e:
-            log.error(f"Discord bot error: {e}")
+            log.error(f"Discord bot error: {e}", exc_info=True)
