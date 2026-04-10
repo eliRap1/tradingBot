@@ -127,7 +127,11 @@ class Coordinator:
                     symbol=sym,
                     config=self.config,
                     data_fetcher=self.data,
-                    interval=watcher_interval
+                    interval=watcher_interval,
+                    sector_regime_getter=(
+                        self.sector_regime.get_regime_for_sector
+                        if self._sector_regime_enabled and self.sector_regime else None
+                    ),
                 )
                 self.watchers[sym] = watcher
                 watcher.start()

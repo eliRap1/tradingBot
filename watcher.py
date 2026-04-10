@@ -70,13 +70,14 @@ class StockWatcher:
     """
 
     def __init__(self, symbol: str, config: dict, data_fetcher,
-                 interval: int = 60):
+                 interval: int = 60, sector_regime_getter=None):
         self.symbol = symbol
         self.config = config
         self.data = data_fetcher
         self.interval = interval
         self.state = WatcherState(symbol=symbol)
         self.log = setup_logger(f"watcher.{symbol}")
+        self._sector_regime_getter = sector_regime_getter
 
         # Initialize strategy instances (one per watcher)
         self.strategies = {
@@ -180,8 +181,17 @@ class StockWatcher:
         patterns = detect_patterns(intraday_df)
         self.state.candle_patterns = [k for k, v in patterns.items() if v]
 
-        # 4. Pick strategies based on DAILY regime
-        selection = select_strategies(daily_df, self.symbol)
+        # 4. Pick strategies based on DAILY regime (+ sector context if available)
+        _sector_reg = None
+        if self._sector_regime_getter is not None:
+            try:
+                from filters import SECTOR_MAP
+                _sector_label = SECTOR_MAP.get(self.symbol, "other")
+                if _sector_label != "other":
+                    _sector_reg = self._sector_regime_getter(_sector_label)
+            except Exception:
+                _sector_reg = None
+        selection = select_strategies(daily_df, self.symbol, sector_regime=_sector_reg)
         self.state.regime = selection["regime"]
         self.state.regime_reason = selection["reason"]
         self.state.strategy_weights = selection["strategies"]
