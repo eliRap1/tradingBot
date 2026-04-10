@@ -16,29 +16,84 @@ from utils import setup_logger
 log = setup_logger("filters")
 
 # Sector mapping for correlation filtering (max 2 per sector)
+# Labels aligned with ETF proxies used by SectorRegimeFilter.
 SECTOR_MAP = {
-    # Tech
-    "AAPL": "tech", "MSFT": "tech", "GOOGL": "tech", "META": "tech",
-    "ADBE": "tech", "CRM": "tech", "NOW": "tech", "INTC": "tech", "CSCO": "tech",
-    # Semiconductors
-    "NVDA": "semi", "AMD": "semi", "AVGO": "semi", "QCOM": "semi",
-    "TXN": "semi", "MU": "semi", "AMAT": "semi", "LRCX": "semi",
-    "KLAC": "semi", "MRVL": "semi",
-    # Consumer Internet / E-commerce
-    "AMZN": "ecom", "TSLA": "auto", "NFLX": "media", "DIS": "media",
-    "UBER": "transport", "ABNB": "travel", "SHOP": "ecom",
-    # Fintech / Crypto
-    "PYPL": "fintech", "SQ": "fintech", "COIN": "fintech",
-    # Cloud / SaaS
-    "SNOW": "cloud", "PLTR": "cloud", "PANW": "cyber",
-    # Finance
-    "JPM": "finance", "V": "finance", "MA": "finance",
-    # Healthcare
-    "UNH": "health",
-    # Consumer
-    "HD": "retail", "COST": "retail", "PEP": "consumer", "KO": "consumer",
-    # Crypto
-    "BTC/USD": "crypto", "ETH/USD": "crypto",
+    # ── Tech / Mega-cap (XLK) ─────────────────────────────────
+    "AAPL": "tech",  "MSFT": "tech",  "GOOGL": "tech", "META": "tech",
+    "ADBE": "tech",  "CRM":  "tech",  "NOW":   "tech", "INTC": "tech",
+    "CSCO": "tech",  "ORCL": "tech",  "IBM":   "tech", "HPQ":  "tech",
+    "DELL": "tech",
+    # ── Semiconductors (XLK) ──────────────────────────────────
+    "NVDA": "semi",  "AMD":  "semi",  "AVGO": "semi",  "QCOM": "semi",
+    "TXN":  "semi",  "MU":   "semi",  "AMAT": "semi",  "LRCX": "semi",
+    "KLAC": "semi",  "MRVL": "semi",  "ASML": "semi",  "NXPI": "semi",
+    "ON":   "semi",  "SWKS": "semi",  "MPWR": "semi",
+    # ── Cloud / SaaS (XLK) ────────────────────────────────────
+    "SNOW": "cloud", "PLTR": "cloud", "DDOG": "cloud", "WDAY": "cloud",
+    "TEAM": "cloud", "ZS":   "cloud", "NET":  "cloud", "OKTA": "cloud",
+    "VEEV": "cloud", "MDB":  "cloud", "BILL": "cloud", "HUBS": "cloud",
+    "GTLB": "cloud", "PATH": "cloud", "DOCU": "cloud",
+    # ── Cybersecurity (XLK) ───────────────────────────────────
+    "PANW": "cyber", "CRWD": "cyber",
+    # ── Energy (XLE) ──────────────────────────────────────────
+    "XOM":  "energy", "CVX": "energy", "COP": "energy", "SLB": "energy",
+    "OXY":  "energy", "HAL": "energy", "EOG": "energy", "MPC": "energy",
+    "VLO":  "energy", "PSX": "energy",
+    # ── Financials (XLF) ──────────────────────────────────────
+    "JPM":  "finance", "BAC":  "finance", "GS":   "finance", "MS":   "finance",
+    "WFC":  "finance", "C":    "finance", "V":    "finance", "MA":   "finance",
+    "AXP":  "finance", "BLK":  "finance", "SCHW": "finance", "COF":  "finance",
+    "PYPL": "finance", "SQ":   "finance", "AFRM": "finance", "COIN": "finance",
+    # ── Healthcare (XLV) ──────────────────────────────────────
+    "UNH":  "health", "LLY":  "health", "ABT":  "health", "TMO":  "health",
+    "ISRG": "health", "AMGN": "health", "GILD": "health", "VRTX": "health",
+    "DHR":  "health", "SYK":  "health", "BSX":  "health", "REGN": "health",
+    "BIIB": "health", "DXCM": "health", "IDXX": "health", "PFE":  "health",
+    "MRK":  "health", "CVS":  "health", "ELV":  "health",
+    # ── Consumer Discretionary (XLY) ──────────────────────────
+    "AMZN": "consumer_disc", "TSLA": "consumer_disc", "HD":   "consumer_disc",
+    "LOW":  "consumer_disc", "TGT":  "consumer_disc", "NKE":  "consumer_disc",
+    "MCD":  "consumer_disc", "SBUX": "consumer_disc", "CMG":  "consumer_disc",
+    "YUM":  "consumer_disc", "TJX":  "consumer_disc", "LULU": "consumer_disc",
+    "ETSY": "consumer_disc", "NFLX": "consumer_disc", "DIS":  "consumer_disc",
+    "ROKU": "consumer_disc", "SNAP": "consumer_disc", "PINS": "consumer_disc",
+    "RBLX": "consumer_disc", "DASH": "consumer_disc", "LYFT": "consumer_disc",
+    "ABNB": "consumer_disc", "SHOP": "consumer_disc", "MELI": "consumer_disc",
+    "ZM":   "consumer_disc", "UBER": "consumer_disc",
+    # ── Consumer Staples (XLP) ────────────────────────────────
+    "PEP":  "consumer_stap", "KO":   "consumer_stap", "PG":   "consumer_stap",
+    "CL":   "consumer_stap", "MDLZ": "consumer_stap", "PM":   "consumer_stap",
+    "MO":   "consumer_stap", "COST": "consumer_stap", "WMT":  "consumer_stap",
+    # ── Industrials (XLI) ─────────────────────────────────────
+    "CAT":  "industrial", "HON": "industrial", "GE":  "industrial",
+    "RTX":  "industrial", "BA":  "industrial", "LMT": "industrial",
+    "NOC":  "industrial", "UPS": "industrial", "FDX": "industrial",
+    "DE":   "industrial", "MMM": "industrial", "CSX": "industrial",
+    "NSC":  "industrial", "WM":  "industrial",
+    # ── REITs (XLRE) ──────────────────────────────────────────
+    "AMT":  "reit", "EQIX": "reit", "PLD":  "reit",
+    # ── Utilities (XLU) ───────────────────────────────────────
+    "NEE":  "utility", "DUK": "utility", "SO": "utility",
+    # ── Crypto (BTC/USD direct proxy) ─────────────────────────
+    "BTC/USD":  "crypto", "ETH/USD":  "crypto", "SOL/USD":  "crypto",
+    "AVAX/USD": "crypto", "LINK/USD": "crypto", "DOGE/USD": "crypto",
+}
+
+# Maps internal sector label → ETF ticker used by SectorRegimeFilter
+SECTOR_ETF_MAP = {
+    "tech":          "XLK",
+    "semi":          "XLK",
+    "cloud":         "XLK",
+    "cyber":         "XLK",
+    "energy":        "XLE",
+    "finance":       "XLF",
+    "health":        "XLV",
+    "consumer_disc": "XLY",
+    "consumer_stap": "XLP",
+    "industrial":    "XLI",
+    "reit":          "XLRE",
+    "utility":       "XLU",
+    "crypto":        None,   # crypto handled via BTC/USD directly
 }
 
 CONFIRMATION_FILE = os.path.join(os.path.dirname(__file__), "pending_signals.json")
