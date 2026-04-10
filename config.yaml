@@ -5,54 +5,175 @@ alpaca:
 
 screener:
   min_price: 10.0
-  max_price: 1000.0
-  min_avg_volume: 500000
-  # Top liquid stocks - the bot will also filter dynamically
+  max_price: 999999.0
+  min_avg_volume: 300000
+  # S&P 500 + Nasdaq 100 — top liquid names across all sectors
   universe:
+    # Mega-cap tech
     - AAPL
     - MSFT
+    - NVDA
     - GOOGL
     - AMZN
-    - NVDA
     - META
     - TSLA
     - AMD
-    - NFLX
-    - JPM
-    - V
-    - MA
-    - UNH
-    - HD
-    - DIS
-    - PYPL
-    - CRM
-    - ADBE
-    - INTC
+    - ORCL
     - CSCO
-    - PEP
-    - KO
-    - COST
+    - IBM
+    - HPQ
+    - DELL
+    # Semiconductors
     - AVGO
     - QCOM
-    - TXN
     - MU
+    - INTC
     - AMAT
+    - TXN
+    - MRVL
     - LRCX
     - KLAC
-    - MRVL
-    - PANW
+    - ASML
+    - NXPI
+    - "ON"
+    - SWKS
+    - MPWR
+    # Software / Cloud
+    - CRM
+    - ADBE
     - NOW
-    - UBER
-    - ABNB
-    - SQ
-    - SHOP
-    - SNOW
-    - COIN
+    - PANW
+    - CRWD
     - PLTR
+    - DDOG
+    - WDAY
+    - TEAM
+    - ZS
+    - NET
+    - OKTA
+    - VEEV
+    - SNOW
+    - MDB
+    - BILL
+    - HUBS
+    - GTLB
+    - PATH
+    - DOCU
+    # Consumer tech / Media
+    - NFLX
+    - DIS
+    - ROKU
+    - SNAP
+    - PINS
+    - RBLX
+    - DASH
+    - UBER
+    - LYFT
+    - ABNB
+    - SHOP
+    - MELI
+    - ZM
+    - COIN
+    # Consumer / Retail
+    - COST
+    - HD
+    - LOW
+    - TGT
+    - WMT
+    - AMZN
+    - NKE
+    - MCD
+    - SBUX
+    - CMG
+    - YUM
+    - TJX
+    - LULU
+    - ETSY
+    # Financials
+    - JPM
+    - BAC
+    - GS
+    - MS
+    - WFC
+    - C
+    - V
+    - MA
+    - AXP
+    - BLK
+    - SCHW
+    - COF
+    - PYPL
+    - SQ
+    - AFRM
+    # Healthcare
+    - UNH
+    - LLY
+    - ABT
+    - TMO
+    - ISRG
+    - AMGN
+    - GILD
+    - VRTX
+    - DHR
+    - SYK
+    - BSX
+    - REGN
+    - BIIB
+    - DXCM
+    - IDXX
+    - PFE
+    - MRK
+    - CVS
+    - ELV
+    # Energy
+    - XOM
+    - CVX
+    - COP
+    - SLB
+    - OXY
+    - HAL
+    - EOG
+    - MPC
+    - VLO
+    - PSX
+    # Industrials / Defense
+    - CAT
+    - HON
+    - GE
+    - RTX
+    - BA
+    - LMT
+    - NOC
+    - UPS
+    - FDX
+    - DE
+    - MMM
+    - CSX
+    - NSC
+    - WM
+    # Consumer staples
+    - PEP
+    - KO
+    - PG
+    - CL
+    - MDLZ
+    - PM
+    - MO
+    # REITs / Utilities
+    - AMT
+    - EQIX
+    - PLD
+    - NEE
+    - DUK
+    - SO
   # Crypto (traded 24/7 on Alpaca)
   crypto:
     - BTC/USD
     - ETH/USD
+    - SOL/USD
+    - AVAX/USD
+    - LINK/USD
+    - DOGE/USD
   # Crypto-specific risk overrides (wider stops for higher volatility)
   crypto_risk:
     stop_loss_atr_mult: 2.5       # wider SL for crypto volatility
@@ -107,7 +228,7 @@ strategies:
     weight: 0.15
 
   liquidity_sweep:
-    pivot_lookback: 5            # bars each side for swing high/low detection
+    pivot_lookback: 10           # bars each side for swing high/low detection
     sweep_tolerance_pct: 0.005   # max 0.5% beyond level (more = real breakout)
     min_wick_body_ratio: 2.0     # rejection wick must be 2x the candle body
     min_volume_ratio: 1.5        # volume must be 1.5x average on sweep
@@ -118,7 +239,7 @@ signals:
   min_composite_score: 0.25        # Restored — 0.20 lets too many marginal signals through
   max_positions: 10                # Balanced (12 × 10% = 120% exposure was too high)
   min_agreeing_strategies: 3       # Restored — 2/7 agreement is coin-flip territory
-  max_crypto_positions: 2          # Keep crypto slots
+  max_crypto_positions: 3          # Up to 3 crypto positions
   min_crypto_agreeing: 2           # crypto needs only 2/5 strategies
   min_crypto_score: 0.15           # Restored — 0.12 too loose for volatile crypto
   allow_shorts_in_bull: false      # Shorts in bull regime rarely pays off
@@ -172,6 +293,10 @@ alerts:
   notify_trades: true            # new trade entries/exits
   notify_drawdown: true          # drawdown warnings
   notify_daily_summary: true     # end-of-day performance
+
+sector_regime:
+  enabled: true           # set false to disable sector layer entirely
+  cache_ttl_sec: 900      # how long to cache sector ETF results (15 min)
 
 optimization:
   train_days: 180
