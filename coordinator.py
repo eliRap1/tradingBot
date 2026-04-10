@@ -195,6 +195,11 @@ class Coordinator:
                         daily_trades=len(today_trades),
                     )
 
+                    # Run one immediate cycle to catch any signals confirmed
+                    # right before/at market close (e.g. crypto signals that fired
+                    # during the close-buffer skip window).
+                    self._coordinator_cycle()
+
                     # Market-closed loop: keep running crypto cycles
                     interval = self.config["schedule"]["cycle_interval_sec"]
                     cycle_count = 0
