@@ -143,21 +143,19 @@ class StockWatcher:
             if now - self._bars_cache_time > self._max_cache_age_seconds:
                 self._bars = None  # Force refresh
 
-        # 1a. Fetch DAILY bars for trend context
-        daily_bars = self.data.get_bars([self.symbol], timeframe="1Day", days=250)
-        if self.symbol not in daily_bars or len(daily_bars[self.symbol]) < 30:
+        # 1a. Fetch DAILY bars for trend context (served from cache primed by coordinator)
+        daily_df = self.data.get_intraday_bars(self.symbol, timeframe="1Day", days=250)
+        if daily_df is None or len(daily_df) < 30:
             self.state.status = "no_data"
             return
 
-        daily_df = daily_bars[self.symbol]
-
-        # 1b. Fetch 5-MINUTE bars for entry signals
+        # 1b. Fetch 5-MINUTE bars for entry signals (served from cache primed by coordinator)
         intraday_df = self.data.get_intraday_bars(self.symbol, timeframe="5Min", days=5)
         if intraday_df is None or len(intraday_df) < 30:
             # Fall back to daily if intraday not available (market closed, etc.)
             intraday_df = daily_df
 
-        # 1c. Fetch 1-HOUR bars for intermediate confirmation
+        # 1c. Fetch 1-HOUR bars for intermediate confirmation (served from cache primed by coordinator)
         hourly_df = self.data.get_intraday_bars(self.symbol, timeframe="1Hour", days=10)
         if hourly_df is not None and len(hourly_df) >= 25:
             self._hourly_bias = get_hourly_bias(hourly_df)
@@ -250,9 +248,11 @@ class StockWatcher:
         has_long = (num_bullish >= min_agreeing and composite >= min_score
                     and not flow["is_bearish_flow"]
                     and not crypto_penalize_long)
-        # Check for SHORT signal (blocked if strong bullish order flow or crypto extreme fear)
+        # Check for SHORT signal — only block if shorts are already overcrowded
+        # (extreme bearish flow = squeeze risk). Bullish flow on a bearish signal
+        # means trapped longs — that IS the short setup, do NOT block it.
         has_short = (num_bearish >= min_agreeing and composite <= -min_score
-                     and not flow["is_bullish_flow"]
+                     and not (flow["is_bearish_flow"] and flow.get("flow_strength", 0) > 0.40)
                      and not crypto_penalize_short)
 
         self.state.num_agreeing = num_bullish if has_long else num_bearish if has_short else max(num_bullish, num_bearish)
