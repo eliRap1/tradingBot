@@ -116,7 +116,7 @@ class PortfolioManager:
                     trail_price = watermark * (1 - trail_pct)
             else:
                 if sym not in self.low_watermarks:
-                    self.low_watermarks[sym] = min(entry_price, current_price)
+                    self.low_watermarks[sym] = entry_price  # start at entry; update tracks price down
                 else:
                     self.low_watermarks[sym] = min(self.low_watermarks[sym], current_price)
                 watermark = self.low_watermarks[sym]
