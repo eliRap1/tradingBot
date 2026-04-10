@@ -58,10 +58,19 @@ class Coordinator:
         self.risk = RiskManager(self.config)
         self.portfolio = PortfolioManager(self.config, self.broker)
         self.regime = RegimeFilter(self.data, universe=self.config["screener"]["universe"])
+        self._sector_regime_enabled = self.config.get("sector_regime", {}).get("enabled", True)
+        if self._sector_regime_enabled:
+            from sector_regime import SectorRegimeFilter
+            self.sector_regime = SectorRegimeFilter(self.data, config=self.config)
+        else:
+            self.sector_regime = None
+        self._last_sector_regimes: dict = {}
         self.filters = SmartFilters(tracker=self.portfolio.tracker, config=self.config)
         self.alerts = AlertManager(self.config)
+        self._trading_paused = False  # can be set via !pause Discord command
+        self._last_regime_str = ""    # track regime changes for alerts
         self.discord_bot = DiscordBot(
-            tracker=self.portfolio.tracker, broker=self.broker
+            tracker=self.portfolio.tracker, broker=self.broker, coordinator=self
         )
         self.discord_bot.start()
         self.ml_model = MLMetaModel()
@@ -100,7 +109,8 @@ class Coordinator:
             universe = self.config["screener"].get("crypto", [])
         else:
             universe = self.screener.get_universe()
-            if not universe:
+            if len(universe) < 10:
+                log.warning(f"Screener returned only {len(universe)} stocks — using full config universe")
                 universe = self.config["screener"]["universe"]
             # Add crypto symbols
             universe = list(universe) + self.config["screener"].get("crypto", [])
@@ -121,7 +131,7 @@ class Coordinator:
                 )
                 self.watchers[sym] = watcher
                 watcher.start()
-                time.sleep(0.5)
+                time.sleep(2)  # stagger to avoid API rate limits
 
         log.info(f"All {len(self.watchers)} watchers running")
 
@@ -169,7 +179,7 @@ class Coordinator:
                     # Send ONE Discord alert with Israel time + full stats
                     equity = self.broker.get_equity()
                     positions = self.portfolio.get_current_positions()
-                    stats = self.portfolio.tracker.get_stats()
+                    stats = self.portfolio.tracker.get_stats(starting_equity=equity)
                     # Count today's trades
                     today_str = datetime.now().strftime("%Y-%m-%d")
                     today_trades = [t for t in self.portfolio.tracker.trades
@@ -286,8 +296,39 @@ class Coordinator:
         else:
             log.info(f"Market: {market_status.session.upper()} session - stocks limited, crypto OK")
 
-        # 0c. Check crypto exit fills (manual OCO behavior)
-        self.broker.check_crypto_exit_fills()
+        # 0c. Check crypto exit fills (manual OCO behavior) — record any that filled
+        crypto_fills = self.broker.check_crypto_exit_fills()
+        for sym, reason in crypto_fills.items():
+            meta = self.portfolio.position_meta.get(sym, {})
+            pos = self.portfolio.get_position(sym) if hasattr(self.portfolio, "get_position") else None
+            entry = meta.get("entry_price", 0.0)
+            exit_price = meta.get("take_profit" if reason == "take_profit" else "stop_loss", 0.0)
+            qty = meta.get("original_qty", meta.get("qty", 0.0))
+            side = meta.get("side", "long")
+            risk = meta.get("initial_risk", 0.0)
+            strategies = meta.get("strategies", [])
+            if entry > 0 and exit_price > 0:
+                self.portfolio.tracker.record_trade(
+                    symbol=sym, side=side, qty=qty,
+                    entry_price=entry, exit_price=exit_price,
+                    reason=reason, risk_dollars=risk, strategies=strategies,
+                )
+                self.portfolio.position_meta.pop(sym, None)
+                self.portfolio._save_meta()
+
+        # 0d. Prime bar cache for all watchers (one bulk fetch per timeframe instead of N individual calls)
+        all_symbols = list(self.watchers.keys())
+        if all_symbols:
+            self.data.prime_intraday_cache(all_symbols, timeframe="5Min", days=5)
+            self.data.prime_intraday_cache(all_symbols, timeframe="1Hour", days=10)
+            spy_symbols = list(set(all_symbols) | {"SPY"})
+            self.data.prime_intraday_cache(spy_symbols, timeframe="1Day", days=250)
+            # Prime sector ETF daily bars (Layer 2 regime)
+            if self._sector_regime_enabled:
+                from sector_regime import SECTOR_ETFS
+                self.data.prime_intraday_cache(
+                    list(set(SECTOR_ETFS) | {"BTC/USD"}), timeframe="1Day", days=120
+                )
 
         # 1. Check drawdown
         equity = self.broker.get_equity()
@@ -302,7 +343,49 @@ class Coordinator:
         regime = self.regime.get_regime()
         log.info(f"Market: {regime['description']}")
 
-        # 2b. Retrain ML meta-model periodically (every 50 cycles)
+        # 2a. Send regime-change and HMM-caution alerts
+        new_regime_str = regime["regime"]
+        if self._last_regime_str and self._last_regime_str != new_regime_str:
+            self.alerts.send_regime_change(
+                self._last_regime_str, new_regime_str, regime["description"]
+            )
+        elif (regime.get("hmm_confidence") and regime["hmm_confidence"] > 0.92
+              and regime.get("hmm_regime") == "bear" and new_regime_str == "bull"
+              and "HMM CAUTION" in regime["description"]
+              and self._last_regime_str == new_regime_str):
+            # Only send once per regime session (when str hasn't changed but HMM fires)
+            self.alerts.send_hmm_caution(
+                regime["hmm_confidence"], regime["hmm_regime"],
+                new_regime_str, regime["size_multiplier"]
+            )
+        self._last_regime_str = new_regime_str
+
+        # 2d. Sector regimes (Layer 2)
+        sector_regimes = {}
+        if self._sector_regime_enabled and self.sector_regime:
+            sector_regimes = self.sector_regime.get_sector_regimes()
+            for etf_key, sdata in sector_regimes.items():
+                prev = self._last_sector_regimes.get(etf_key)
+                curr = sdata["regime"]
+                if prev is not None and prev != curr:
+                    self.alerts.send_sector_regime_change(
+                        etf_key=etf_key, old_regime=prev,
+                        new_regime=curr, description=sdata["description"],
+                    )
+                self._last_sector_regimes[etf_key] = curr
+            # Log non-bull sectors to keep logs concise
+            non_bull = {k: v["regime"] for k, v in sector_regimes.items() if v["regime"] != "bull"}
+            if non_bull:
+                log.info(f"Sector regimes (non-bull): {non_bull}")
+
+        # 2b. Check pause flag (set via !pause Discord command)
+        if self._trading_paused:
+            log.info("Trading PAUSED via Discord command — skipping signal processing")
+            self.portfolio.tracker.log_stats()
+            self._log_watcher_status()
+            return
+
+        # 2c. Retrain ML meta-model periodically (every 50 cycles)
         self._ml_train_counter += 1
         if self._ml_train_counter % 50 == 1:
             self.ml_model.train(self.portfolio.tracker.trades)
@@ -473,14 +556,14 @@ class Coordinator:
         if held_symbols:
             all_bars = {}
             for w in filtered:
-                daily = self.data.get_bars([w.symbol], timeframe="1Day", days=60)
-                if w.symbol in daily:
-                    all_bars[w.symbol] = daily[w.symbol]
+                df = self.data.get_intraday_bars(w.symbol, timeframe="1Day", days=60)
+                if df is not None:
+                    all_bars[w.symbol] = df
             for sym in held_symbols:
                 if sym not in all_bars:
-                    daily = self.data.get_bars([sym], timeframe="1Day", days=60)
-                    if sym in daily:
-                        all_bars[sym] = daily[sym]
+                    df = self.data.get_intraday_bars(sym, timeframe="1Day", days=60)
+                    if df is not None:
+                        all_bars[sym] = df
 
             candidate_syms = [w.symbol for w in filtered]
             passed_syms = self.filters.filter_correlated(
@@ -550,7 +633,25 @@ class Coordinator:
 
             # Apply correlation-adjusted sizing
             corr_mult = self.filters.get_corr_size_mult(sym)
-            size_mult = base_size_mult * corr_mult
+
+            # Layer 2: sector regime multiplier
+            sector_mult = 1.0
+            if self._sector_regime_enabled and self.sector_regime:
+                from filters import SECTOR_MAP
+                sector_label = SECTOR_MAP.get(sym, "other")
+                if sector_label != "other":
+                    sector_mult = self.sector_regime.compute_size_mult(
+                        sector_label, regime["regime"]
+                    )
+                    # Veto: macro BEAR + sector BEAR blocks new longs
+                    if sector_mult == 0.0 and watcher.state.action == Action.BUY:
+                        log.info(
+                            f"SECTOR VETO: Skipping {sym} long -- "
+                            f"macro={regime['regime']} + sector({sector_label})=bear"
+                        )
+                        continue
+
+            size_mult = base_size_mult * sector_mult * corr_mult
 
             orders = self.risk.size_orders(
                 opportunities=[_make_opportunity(watcher)],
@@ -607,10 +708,17 @@ class Coordinator:
                         order.symbol, order.entry_price,
                         order.stop_loss, order.qty
                     )
-                    # Store which strategies fired for alpha decay tracking
+                    # Store which strategies fired + full trade context for crypto exit recording
                     contributing = [s for s, v in watcher.state.strategy_scores.items()
                                     if abs(v) > 0.1]
-                    self.portfolio.position_meta.setdefault(order.symbol, {})["strategies"] = contributing
+                    self.portfolio.position_meta.setdefault(order.symbol, {}).update({
+                        "strategies": contributing,
+                        "entry_price": order.entry_price,
+                        "take_profit": order.take_profit,
+                        "stop_loss": order.stop_loss,
+                        "original_qty": order.qty,
+                        "side": order.side,
+                    })
                     log.info(
                         f"ORDER: {order.side} {order.qty} {order.symbol} "
                         f"@ ~${order.entry_price:.2f} | "
