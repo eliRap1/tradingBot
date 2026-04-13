@@ -56,46 +56,92 @@ class ContractManager:
         return contract
 
     def _resolve_front_month(self, root: str):
-        """Query IB for available contracts and pick the nearest expiry."""
+        """Query IB for available contracts and pick the nearest non-expired expiry.
+
+        IMPORTANT: Always returns a real FUT contract (secType='FUT'), never CONTFUT.
+        reqHistoricalData with secType='CONTFUT' times out on many NYMEX/COMEX products
+        (notably CL crude oil) and is not reliable for historical bar requests.
+        """
         from ib_insync import Future, ContFuture
+        from datetime import date
 
         spec = self._specs.get(root)
         if not spec:
             log.error(f"No contract spec for {root}")
             return None
 
+        today_str = date.today().strftime("%Y%m%d")
+
         try:
-            # Use ContFuture to get the continuous/front-month contract details
-            cont = ContFuture(root, spec["exchange"], currency=spec["currency"])
-            details = self._ib.reqContractDetails(cont)
+            # ── Strategy 1: enumerate real FUT contracts, pick nearest expiry ──
+            # Query with no expiry so IB returns all listed contracts.
+            fut = Future(root, exchange=spec["exchange"], currency=spec["currency"])
+            details = self._ib.reqContractDetails(fut)
 
-            if not details:
-                log.warning(f"No ContFuture details for {root}, trying explicit Future")
-                fut = Future(root, exchange=spec["exchange"], currency=spec["currency"])
-                details = self._ib.reqContractDetails(fut)
+            if details:
+                # Drop spreads / combos (their localSymbol contains '-' or '/')
+                std = [d for d in details
+                       if not any(c in d.contract.localSymbol for c in ("-", "/", " "))]
+                pool = std if std else details
 
-            if not details:
-                log.error(f"Cannot resolve contract for {root}")
-                return None
+                # Keep only non-expired contracts
+                active = [d for d in pool
+                          if d.contract.lastTradeDateOrContractMonth >= today_str]
+                pool = active if active else pool
 
-            # Pick the contract with nearest expiry
-            sorted_details = sorted(
-                details,
-                key=lambda d: d.contract.lastTradeDateOrContractMonth
-            )
-            front = sorted_details[0].contract
+                sorted_details = sorted(
+                    pool,
+                    key=lambda d: d.contract.lastTradeDateOrContractMonth
+                )
+                front = sorted_details[0].contract
 
-            # Qualify the contract (fills in conId, trading class, etc.)
-            self._ib.qualifyContracts(front)
-            log.info(
-                f"Front-month {root}: {front.localSymbol} "
-                f"exp={front.lastTradeDateOrContractMonth}"
-            )
-            return front
+                qualified = self._ib.qualifyContracts(front)
+                if qualified:
+                    front = qualified[0]
+
+                log.info(
+                    f"Front-month {root}: {front.localSymbol} "
+                    f"exp={front.lastTradeDateOrContractMonth}"
+                )
+                return front
 
         except Exception as e:
-            log.error(f"Failed to resolve front-month for {root}: {e}")
-            return None
+            log.warning(f"FUT enumeration failed for {root}: {e} — trying CONTFUT")
+
+        try:
+            # ── Strategy 2: use CONTFUT to discover expiry, then build real FUT ──
+            # CONTFUT is useful only for discovery; we never return a CONTFUT
+            # object because reqHistoricalData is unreliable with secType='CONTFUT'.
+            cont = ContFuture(root, spec["exchange"], currency=spec["currency"])
+            cont_details = self._ib.reqContractDetails(cont)
+
+            if cont_details:
+                cd = cont_details[0].contract
+                expiry = cd.lastTradeDateOrContractMonth
+
+                # Build an explicit FUT using the discovered expiry
+                actual = Future(
+                    symbol=root,
+                    lastTradeDateOrContractMonth=expiry,
+                    exchange=spec["exchange"],
+                    currency=spec["currency"],
+                    multiplier=str(spec.get("multiplier", "")),
+                )
+                qualified = self._ib.qualifyContracts(actual)
+                if qualified:
+                    actual = qualified[0]
+
+                log.info(
+                    f"Front-month {root} (via CONTFUT discovery): "
+                    f"{actual.localSymbol} exp={expiry}"
+                )
+                return actual
+
+        except Exception as e:
+            log.error(f"CONTFUT discovery also failed for {root}: {e}")
+
+        log.error(f"Cannot resolve any contract for {root}")
+        return None
 
     def invalidate(self, root: str):
         """Force re-resolution on next get_contract call (e.g., after roll)."""

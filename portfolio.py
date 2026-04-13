@@ -56,13 +56,20 @@ class PortfolioManager:
         positions = {}
         for pos in self.broker.get_positions():
             sym = _normalize_symbol(pos.symbol)
+            qty = float(pos.qty)
+            avg_price = float(pos.avg_price)
+            market_value = float(pos.market_value)
+            # Derive current_price from market_value/qty; fall back to avg_price if qty=0
+            current_price = (market_value / qty) if qty else avg_price
+            unrealized_pl = float(pos.unrealized_pl)
+            unrealized_plpc = (unrealized_pl / (avg_price * abs(qty))) if avg_price and qty else 0.0
             positions[sym] = {
-                "qty": float(pos.qty),
-                "entry_price": float(pos.avg_entry_price),
-                "current_price": float(pos.current_price),
-                "market_value": float(pos.market_value),
-                "unrealized_pl": float(pos.unrealized_pl),
-                "unrealized_plpc": float(pos.unrealized_plpc),
+                "qty": qty,
+                "entry_price": avg_price,
+                "current_price": current_price,
+                "market_value": market_value,
+                "unrealized_pl": unrealized_pl,
+                "unrealized_plpc": unrealized_plpc,
                 "side": pos.side,
             }
 
@@ -71,7 +78,7 @@ class PortfolioManager:
             if sym not in self.position_meta:
                 self.position_meta[sym] = {
                     "opened_at": datetime.now().isoformat(),
-                    "entry_price": float(pos.avg_entry_price),
+                    "entry_price": avg_price,
                     "initial_risk": 0.0,  # Will be set by set_position_risk()
                 }
                 self._save_meta()
@@ -417,53 +424,17 @@ class PortfolioManager:
             if meta.get("opened_at"):
                 try:
                     d = (datetime.now() - datetime.fromisoformat(meta["opened_at"])).days
-                    days_held = f"{d}"
-                except (ValueError, TypeError):
-                    pass
+                    days_held = str(d)
+                except Exception:
+                    days_held = ""
 
-            side = pos.get("side", "long").upper()
-            qty_str = f"{pos['qty']:.4f}" if isinstance(pos['qty'], float) and pos['qty'] < 10 else f"{pos['qty']:.0f}"
-            pl_str = f"${pos['unrealized_pl']:+,.2f}"
-            pct_str = f"{pos['unrealized_plpc']:+.1%}"
-
+            cur = pos.get("current_price") or pos.get("avg_price", 0)
+            entry = pos.get("avg_price", 0)
+            qty = pos.get("qty", 0)
+            pl = pos.get("unrealized_pl", 0)
+            pct = (pl / (abs(entry * qty) or 1)) * 100
+            side = pos.get("side", "")
             log.info(
-                f"  {raw_sym:<10} {side:<6} {qty_str:>8} "
-                f"${pos['entry_price']:>9,.2f} ${pos['current_price']:>9,.2f} "
-                f"{pl_str:>12} {pct_str:>8} {days_held:>5}"
+                f"  {sym:<10} {side:<6} {qty:>8.2f} {entry:>10.2f} "
+                f"{cur:>10.2f} {pl:>+12.2f} {pct:>+7.1f}% {days_held:>5}"
             )
-
-    def set_position_risk(self, symbol: str, entry_price: float,
-                          stop_loss: float, qty):
-        """Record the initial risk for a position (for R-multiple tracking)."""
-        sym = _normalize_symbol(symbol)
-        risk_per_share = abs(entry_price - stop_loss)
-        risk_dollars = risk_per_share * qty
-        if risk_dollars <= 0:
-            log.warning(f"set_position_risk: {sym} risk_dollars={risk_dollars:.2f} "
-                        f"(entry={entry_price:.2f} SL={stop_loss:.2f}) — check stop placement")
-        if sym not in self.position_meta:
-            self.position_meta[sym] = {
-                "opened_at": datetime.now().isoformat(),
-                "entry_price": entry_price,
-                "initial_risk": risk_dollars,
-                "original_qty": qty,
-            }
-        else:
-            self.position_meta[sym]["initial_risk"] = risk_dollars
-            if "original_qty" not in self.position_meta[sym]:
-                self.position_meta[sym]["original_qty"] = qty
-        log.info(f"Position risk set: {sym} initial_risk=${risk_dollars:.2f} qty={qty}")
-        self._save_meta()
-
-    def _save_watermarks(self):
-        """Persist watermarks to state file."""
-        state = load_state()
-        state["high_watermarks"] = self.high_watermarks
-        state["low_watermarks"] = self.low_watermarks
-        save_state(state)
-
-    def _save_meta(self):
-        """Persist position metadata to state file."""
-        state = load_state()
-        state["position_meta"] = self.position_meta
-        save_state(state)

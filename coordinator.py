@@ -16,12 +16,8 @@ import threading
 from datetime import datetime
 
 from utils import load_config, setup_logger
-from alpaca_broker import AlpacaBroker, CRYPTO_SYMBOLS
-from alpaca_data import AlpacaDataFetcher
 from ib_broker import IBBroker
 from ib_data import IBDataFetcher
-from routing_broker import RoutingBroker
-from routing_data import RoutingDataFetcher
 from instrument_classifier import InstrumentClassifier
 from strategy_router import StrategyRouter
 from portfolio import _normalize_symbol
@@ -59,20 +55,14 @@ class Coordinator:
         # Apply optimized parameters if available
         self.config = apply_optimized_params(self.config)
         
-        # Build broker abstraction layer
-        self._alpaca_broker = AlpacaBroker(self.config)
-        self._ib_broker = IBBroker(self.config)
+        # Build broker + data layers — IB only, no Alpaca
         self._clf = InstrumentClassifier(self.config)
-        self.broker = RoutingBroker(self._ib_broker, self._alpaca_broker, self._clf)
-
-        # Build data abstraction layer
-        self._alpaca_data = AlpacaDataFetcher(self._alpaca_broker)
-        self._ib_data = IBDataFetcher(
-            self._ib_broker._ib,
-            self._ib_broker._contracts,
+        self.broker = IBBroker(self.config)
+        self.data = IBDataFetcher(
+            self.broker._ib,
+            self.broker._contracts,
             self.config
         )
-        self.data = RoutingDataFetcher(self._alpaca_data, self._ib_data, self._clf)
 
         # Strategy router — assigns optimal strategy set per instrument type
         self._strategy_router = StrategyRouter(self.config)
@@ -126,10 +116,46 @@ class Coordinator:
         if market_status.next_open:
             log.info(f"Next market open: {market_status.next_open}")
 
-    def start_watchers(self, crypto_only: bool = False):
-        """Spawn a watcher thread for each stock/crypto/futures in the universe."""
-        if crypto_only:
-            universe = self.config["screener"].get("crypto", [])
+        # Pre-validate stock universe against IB — log skipped symbols once at boot
+        self._validate_ib_universe()
+
+    def _validate_ib_universe(self):
+        """Pre-qualify all stock symbols against IB at startup.
+
+        Symbols that can't be resolved are added to ib_data/_bad_contracts
+        immediately so they never spam the log during normal operation.
+        Prints one clean summary line instead of per-symbol errors.
+        """
+        stocks = [s for s in self.config["screener"].get("universe", [])
+                  if self._clf.classify(s) == "stock"]
+        skipped = []
+        for sym in stocks:
+            contract = self.data._resolve_contract(sym)
+            if contract is None:
+                skipped.append(sym)
+        if skipped:
+            log.warning(f"IB: {len(skipped)} symbol(s) not available — will be skipped: "
+                        f"{', '.join(skipped)}")
+        ok = len(stocks) - len(skipped)
+        log.info(f"IB universe validation: {ok}/{len(stocks)} stocks OK"
+                 + (f", {len(skipped)} skipped" if skipped else ""))
+
+    def start_watchers(self, crypto_only: bool = False, non_stock_only: bool = False):
+        """Spawn a watcher thread for each stock/crypto/futures in the universe.
+
+        Args:
+            crypto_only:    (legacy) start only crypto symbols
+            non_stock_only: start crypto + futures but NOT stocks (used when NYSE is closed)
+        """
+        if crypto_only or non_stock_only:
+            # Crypto symbols
+            universe = list(self.config["screener"].get("crypto", []))
+            if non_stock_only:
+                # Also include futures so they trade during their CME session
+                futures_roots = [
+                    c["root"] for c in self.config.get("futures", {}).get("contracts", [])
+                ]
+                universe = list(dict.fromkeys(universe + futures_roots))
         else:
             universe = self.screener.get_universe()
             if len(universe) < 10:
@@ -206,7 +232,7 @@ class Coordinator:
                         self._clf.classify(s) in ("crypto", "futures") for s in self.watchers
                     )
                     if not crypto_running:
-                        self.start_watchers(crypto_only=True)
+                        self.start_watchers(non_stock_only=True)
 
                     next_open = clock.next_open
                     log.info(f"Market closed. Crypto watchers active. "
@@ -323,41 +349,27 @@ class Coordinator:
         log.info(f"  CYCLE @ {datetime.now():%H:%M:%S}")
         log.info("=" * 50)
 
-        # 0a. Check if we should skip this cycle (market hours check)
+        # 0a. Check if we should skip this cycle entirely.
+        # We only skip during the last 15 min of NYSE close (widening spreads).
+        # Futures and crypto continue to run 24/7 regardless of NYSE hours.
         should_skip, skip_reason = self.live_manager.should_skip_cycle()
         if should_skip:
             log.info(f"Skipping cycle: {skip_reason}")
             return
-        
+
         # 0b. Log market status
         market_status = self.live_manager.get_market_status()
+        from live_trading import _is_cme_futures_open, _is_crypto_open
+        open_sessions = []
         if market_status.is_open:
-            log.info("Market: OPEN (regular session)")
-        else:
-            log.info(f"Market: {market_status.session.upper()} session - stocks limited, crypto OK")
+            open_sessions.append("NYSE")
+        if _is_cme_futures_open():
+            open_sessions.append("CME")
+        if _is_crypto_open():
+            open_sessions.append("PAXOS")
+        log.info(f"Sessions open: {', '.join(open_sessions) if open_sessions else 'NONE'}")
 
-        # 0c. Check crypto exit fills (manual OCO behavior) — record any that filled
-        crypto_fills = self.broker.check_crypto_exit_fills()
-        for raw_sym, reason in crypto_fills.items():
-            norm_sym = _normalize_symbol(raw_sym)
-            meta = self.portfolio.position_meta.get(norm_sym, self.portfolio.position_meta.get(raw_sym, {}))
-            entry = meta.get("entry_price", 0.0)
-            exit_price = meta.get("take_profit" if reason == "take_profit" else "stop_loss", 0.0)
-            qty = meta.get("original_qty", meta.get("qty", 0.0))
-            side = meta.get("side", "long")
-            risk = meta.get("initial_risk", 0.0)
-            strategies = meta.get("strategies", [])
-            if entry > 0 and exit_price > 0:
-                self.portfolio.tracker.record_trade(
-                    symbol=norm_sym, side=side, qty=qty,
-                    entry_price=entry, exit_price=exit_price,
-                    reason=reason, risk_dollars=risk, strategies=strategies,
-                )
-                self.portfolio.position_meta.pop(norm_sym, None)
-                self.portfolio.position_meta.pop(raw_sym, None)
-                self.portfolio._save_meta()
-
-        # 0d. Prime bar cache for all watchers (one bulk fetch per timeframe instead of N individual calls)
+        # 0c. Prime bar cache for all watchers (one bulk fetch per timeframe instead of N individual calls)
         all_symbols = list(self.watchers.keys())
         if all_symbols:
             self.data.prime_intraday_cache(all_symbols, timeframe="5Min", days=5)
@@ -515,22 +527,29 @@ class Coordinator:
             if not watcher.state.confirmed:
                 continue
 
-            # Crypto is NOT gated by SPY regime — it trades independently
-            # Futures DO correlate with SPY so they are gated by regime
-            is_crypto = self._clf.classify(sym) == "crypto"
+            asset_type = self._clf.classify(sym)
+            is_crypto  = asset_type == "crypto"
+            is_futures = asset_type == "futures"
 
+            # Long signals ─────────────────────────────────────────────────
+            # Crypto:  always allowed (24/7, independent of equity regime)
+            # Futures: always allowed — futures can hedge, not purely directional
+            # Stocks:  blocked in bear regime (SPY breadth failing)
             if watcher.state.action == Action.BUY:
-                if not is_crypto and not regime["allow_longs"]:
-                    continue  # Bear regime blocks stock longs only
+                if not is_crypto and not is_futures and not regime["allow_longs"]:
+                    continue
                 trade_signals.append(watcher)
 
+            # Short signals ─────────────────────────────────────────────────
+            # Crypto:  NOT supported on IB PAXOS — hard block
+            # Futures: always allowed (ES/NQ shorts are standard hedging tools)
+            # Stocks:  blocked in pure-bull regime by default (configurable)
             elif watcher.state.action == Action.SHORT:
-                # Alpaca crypto is long-only — no short selling supported
                 if is_crypto:
-                    continue
-                # Shorts allowed in bear/chop regime, restricted in bull
-                if regime["regime"] == "bull" and not self.config["signals"].get("allow_shorts_in_bull", False):
-                    continue
+                    continue   # IB PAXOS does not support crypto shorts
+                if not is_futures:
+                    if regime["regime"] == "bull" and not self.config["signals"].get("allow_shorts_in_bull", False):
+                        continue
                 trade_signals.append(watcher)
 
         if not trade_signals:
@@ -715,15 +734,7 @@ class Coordinator:
                 try:
                     use_smart = self.config.get("execution", {}).get("smart_orders", False)
 
-                    if self._clf.classify(order.symbol) == "crypto":
-                        self.broker.submit_crypto_order(
-                            symbol=order.symbol,
-                            qty=order.qty,
-                            side=order.side,
-                            take_profit=order.take_profit,
-                            stop_loss=order.stop_loss
-                        )
-                    elif use_smart:
+                    if use_smart:
                         self.broker.submit_smart_order(
                             symbol=order.symbol,
                             qty=order.qty,
@@ -877,38 +888,19 @@ class Coordinator:
                 "strategy_scores": s.strategy_scores,
                 "strategy_weights": s.strategy_weights,
                 "regime": s.regime,
+                "regime": s.regime,
                 "regime_reason": s.regime_reason,
-                "candle_patterns": s.candle_patterns,
-                "adx": s.adx,
-                "trend": s.trend_direction,
-                "above_200ema": s.above_200ema,
-                "above_vwap": s.above_vwap,
-                "weekly_trend_up": s.weekly_trend_up,
-                "last_price": s.last_price,
-                "last_update": s.last_update,
+                "action": s.action.name if hasattr(s.action, 'name') else str(s.action),
                 "confirmed": s.confirmed,
                 "error": s.error,
             })
         return states
 
-    def _wait_until(self, target_time):
-        while True:
-            now = datetime.now(target_time.tzinfo)
-            remaining = (target_time - now).total_seconds()
-            if remaining <= 0:
-                break
-            if remaining > 300:
-                log.info(f"Waiting... {remaining / 60:.0f} minutes until market open")
-                time.sleep(300)
-            elif remaining > 60:
-                time.sleep(60)
-            else:
-                time.sleep(remaining)
 
-
-def _make_opportunity(watcher: StockWatcher):
-    """Convert a watcher's signal into an Opportunity for the risk manager."""
+def _make_opportunity(watcher):
+    """Convert a watcher signal into an Opportunity for the risk manager."""
     from signals import Opportunity
+    from watcher import Action
     direction = "sell" if watcher.state.action == Action.SHORT else "buy"
     contributing = [s for s, v in watcher.state.strategy_scores.items() if abs(v) > 0.1]
     return Opportunity(

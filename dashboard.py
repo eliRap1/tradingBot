@@ -133,19 +133,23 @@ def refresh_data():
         for pos in _broker.get_positions():
             meta = pos_meta.get(pos.symbol, {})
             initial_risk = meta.get("initial_risk", 0)
-            entry_price = float(pos.avg_entry_price)
+            entry_price = float(pos.avg_price)
+            qty_val = float(pos.qty)
+            market_value = float(pos.market_value)
             pnl = float(pos.unrealized_pl)
+            current_price = (market_value / qty_val) if qty_val else entry_price
+            pnl_pct = (pnl / (entry_price * abs(qty_val)) * 100) if entry_price and qty_val else 0.0
             r_multiple = None
             if initial_risk and initial_risk > 0:
                 r_multiple = round(pnl / initial_risk, 2)
             positions.append({
                 "symbol": pos.symbol,
-                "qty": float(pos.qty),
+                "qty": qty_val,
                 "entry_price": entry_price,
-                "current_price": float(pos.current_price),
-                "market_value": float(pos.market_value),
+                "current_price": current_price,
+                "market_value": market_value,
                 "pnl": pnl,
-                "pnl_pct": float(pos.unrealized_plpc) * 100,
+                "pnl_pct": pnl_pct,
                 "side": pos.side,
                 "r_multiple": r_multiple,
                 "opened_at": meta.get("opened_at"),

@@ -370,10 +370,15 @@ class DiscordBot:
                             try:
                                 eq = broker.get_equity()
                                 equity_str = f"\n💰 **Equity:** `${eq:,.2f}`"
+                            except Exception as e:
+                                log.warning(f"!stat: get_equity failed: {e}")
+                                equity_str = "\n💰 **Equity:** `(unavailable)`"
+                            try:
                                 positions = broker.get_positions()
                                 positions_str = f"\n📌 **Open positions:** `{len(positions)}`"
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.warning(f"!stat: get_positions failed: {e}")
+                                positions_str = ""
 
                         stats = tracker.get_stats(starting_equity=eq)
                         if not stats:
@@ -453,9 +458,10 @@ class DiscordBot:
                             for p in positions:
                                 side = getattr(p, "side", "long")
                                 qty = float(getattr(p, "qty", 0))
-                                entry = float(getattr(p, "avg_entry_price", 0))
+                                entry = float(getattr(p, "avg_price", getattr(p, "avg_entry_price", 0)))
                                 unreal = float(getattr(p, "unrealized_pl", 0))
-                                unreal_pct = float(getattr(p, "unrealized_plpc", 0)) * 100
+                                qty_abs = abs(qty) or 1
+                                unreal_pct = (unreal / (entry * qty_abs) * 100) if entry else 0.0
                                 total_unreal += unreal
                                 e = "🟢" if unreal >= 0 else "🔴"
                                 msg += (
@@ -587,4 +593,4 @@ class DiscordBot:
                     # Fresh client + handlers created at top of while loop
 
         except Exception as e:
-            log.error(f"Discord bot fatal error: {e}", exc_info=True)
+            log.error(f"Discord bot thread fatal error: {e}", exc_info=True)

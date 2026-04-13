@@ -1,58 +1,86 @@
 """
-Trading Bot — LIVE TRADING with Real-Time Data.
+Trading Bot - LIVE TRADING with Interactive Brokers.
 
-Each stock gets its own watcher thread that:
-  1. Monitors its candles and indicators continuously
-  2. Picks the right strategy for that stock's behavior
-  3. Reports signals to the Coordinator for execution
+All execution and market data runs through IB Gateway / TWS.
+No Alpaca dependency.
 
-LIVE TRADING FEATURES:
-  - Real-time price validation (rejects stale data)
-  - Market hours awareness (stocks vs crypto)
-  - Walk-forward optimized parameters
-  - Profit maximization enhancements
+Broker:  Interactive Brokers (IB Gateway on port 4002)
+Assets:  Stocks, Futures (NQ/ES/CL/GC), Crypto (BTC/USD, ETH/USD via PAXOS)
 
 Usage:
-    1. Set your Alpaca API keys in .env:
-       ALPACA_API_KEY=your_key
-       ALPACA_SECRET_KEY=your_secret
-    2. Set TRADING_MODE=paper in .env (or 'live' for real money)
-    3. Tune parameters in config.yaml
-    4. Run: python main.py
+    1. Start IB Gateway (or TWS) and enable the API:
+         Configure -> API -> Settings -> Enable ActiveX and Socket Clients = ON
+         Socket port = 4002   (Gateway paper default)
+    2. Set TRADING_MODE in .env:
+         TRADING_MODE=paper   (safe default - uses IB paper account)
+         TRADING_MODE=live    (real money - double-check everything first)
+    3. Tune parameters in config.yaml.
+    4. python main.py
 
-Optional: Run walk-forward optimization first:
+Optional - run walk-forward optimisation before live trading:
     python walk_forward_optimizer.py --start 2024-01-01 --end 2025-12-31
 """
 
 import os
 import sys
+import socket
 from datetime import datetime
 
-from coordinator import Coordinator
+from dotenv import load_dotenv
+load_dotenv()
+
+from utils import load_config, setup_logger
 from live_trading import ensure_live_trading_mode
+
+log = setup_logger("main")
+
+
+def _check_ib_gateway(host: str, port: int, timeout: float = 4.0) -> bool:
+    """Return True if IB Gateway / TWS is listening on host:port."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def main():
     print("=" * 60)
-    print("TRADING BOT - LIVE TRADING MODE")
-    print(f"Started at: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print("  TRADING BOT - Interactive Brokers")
+    print(f"  Started: {datetime.now():%Y-%m-%d %H:%M:%S}")
     print("=" * 60)
-    
-    # Verify trading mode
+
+    # 1. Verify trading mode (.env TRADING_MODE=paper|live)
     if not ensure_live_trading_mode():
-        print("ERROR: Invalid trading mode configuration")
+        print("ERROR: Set TRADING_MODE=paper or TRADING_MODE=live in your .env file")
         sys.exit(1)
-    
-    # Check for API keys
-    if not os.getenv("ALPACA_API_KEY") or not os.getenv("ALPACA_SECRET_KEY"):
-        print("\nERROR: Alpaca API keys not set!")
-        print("Please set the following environment variables:")
-        print("  export ALPACA_API_KEY=your_key")
-        print("  export ALPACA_SECRET_KEY=your_secret")
-        print("\nOr add them to your .env file")
+
+    mode = os.getenv("TRADING_MODE", "paper").lower()
+    print(f"  Mode: {mode.upper()}")
+    if mode == "live":
+        print("  *** LIVE TRADING - real money at risk ***")
+
+    # 2. Check IB Gateway / TWS is reachable
+    cfg = load_config()
+    ib_cfg = cfg.get("ib", {})
+    ib_host = ib_cfg.get("host", "127.0.0.1")
+    ib_port = ib_cfg.get("port", 4002)
+
+    if not _check_ib_gateway(ib_host, ib_port):
+        print(f"\nERROR: Cannot reach IB Gateway at {ib_host}:{ib_port}")
+        print("Steps to fix:")
+        print("  1. Open IB Gateway (or TWS)")
+        print("  2. Log in to your account (paper or live)")
+        print(f"  3. Configure -> API -> Settings -> Socket port = {ib_port}")
+        print("  4. Enable 'Enable ActiveX and Socket Clients'")
+        print("  5. Re-run this script")
         sys.exit(1)
-    
-    # Start the bot
+
+    print(f"  IB Gateway: reachable at {ib_host}:{ib_port}")
+    print("")
+
+    # 3. Start the coordinator
+    from coordinator import Coordinator
     bot = Coordinator()
     bot.run()
 

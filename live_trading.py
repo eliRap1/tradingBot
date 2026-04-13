@@ -2,18 +2,23 @@
 LIVE TRADING MODULE - Real-time market data and execution.
 
 This module ensures the bot:
-1. Only trades during LIVE market hours
+1. Only trades during LIVE market hours (per asset class)
 2. Uses REAL-TIME prices (not stale data)
 3. Validates data freshness before trading
 4. Handles market open/close transitions
-5. Supports both US stocks and 24/7 crypto
+5. Supports stocks (NYSE), futures (CME 23h), and crypto (24/7)
+
+Asset market hours:
+  Stocks  : NYSE  09:30 - 16:00 ET Mon-Fri
+  Futures : CME   18:00 ET (Sun/Mon-Thu) to 17:00 ET next day, 1h break daily
+  Crypto  : 24/7 (IB PAXOS near-continuous)
 
 CRITICAL: This prevents trading on old/stale data!
 """
 
 import os
 import time
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -22,9 +27,73 @@ from utils import setup_logger
 
 log = setup_logger("live_trading")
 
-# Timezone for US markets
-ET = ZoneInfo("America/New_York")
+ET  = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
+
+# NYSE observed holidays (2025-2027) — same set used in ib_broker.py
+_NYSE_HOLIDAYS = frozenset({
+    "2025-01-01","2025-01-20","2025-02-17","2025-04-18","2025-05-26",
+    "2025-06-19","2025-07-04","2025-09-01","2025-11-27","2025-12-25",
+    "2026-01-01","2026-01-19","2026-02-16","2026-04-03","2026-05-25",
+    "2026-06-19","2026-07-03","2026-09-07","2026-11-26","2026-12-25",
+    "2027-01-01","2027-01-18","2027-02-15","2027-03-26","2027-05-31",
+    "2027-06-18","2027-07-05","2027-09-06","2027-11-25","2027-12-24",
+})
+
+
+def _is_nyse_trading_day(d: date) -> bool:
+    """Return True if d is a regular NYSE trading day."""
+    return d.weekday() < 5 and d.isoformat() not in _NYSE_HOLIDAYS
+
+
+def _is_cme_futures_open() -> bool:
+    """
+    Return True if CME Globex (ES/NQ/CL/GC) is currently open.
+
+    CME Globex schedule (US Central → ET offset is +1h in standard, +1h in daylight):
+      Opens : Sunday 18:00 ET (i.e. Sunday 17:00 CT)
+      Closes: Friday 17:00 ET
+      Daily maintenance break: 17:00 – 18:00 ET every weekday
+    """
+    now = datetime.now(ET)
+    wd = now.weekday()   # 0=Mon … 6=Sun
+    h, m = now.hour, now.minute
+
+    # Saturday: always closed
+    if wd == 5:
+        return False
+    # Sunday: only open after 18:00 ET
+    if wd == 6:
+        return h >= 18
+    # Friday: closes at 17:00 ET
+    if wd == 4:
+        return not (h >= 17)
+    # Monday–Thursday: open except during 17:00–18:00 ET maintenance break
+    return not (h == 17)
+
+
+def _is_crypto_open() -> bool:
+    """IB PAXOS crypto is essentially 24/7 — always return True."""
+    return True
+
+
+def _classify_symbol(symbol: str) -> str:
+    """
+    Light-weight asset classifier without loading the full config.
+    Returns 'futures', 'crypto', or 'stock'.
+    Uses simple heuristics — for authoritative classification use InstrumentClassifier.
+    """
+    _FUTURES_ROOTS = {"NQ", "ES", "CL", "GC", "RTY", "YM", "NKD"}
+    _CRYPTO_SUFFIXES = {
+        "BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD",
+        "SOL/USD", "AVAX/USD", "LINK/USD", "DOGE/USD",
+        "SOLUSD", "AVAXUSD", "LINKUSD", "DOGEUSD",
+    }
+    if symbol in _FUTURES_ROOTS:
+        return "futures"
+    if symbol in _CRYPTO_SUFFIXES:
+        return "crypto"
+    return "stock"
 
 
 @dataclass
@@ -187,30 +256,28 @@ class LiveTradingManager:
     
     def can_trade_symbol(self, symbol: str) -> Tuple[bool, str]:
         """
-        Check if we can trade a symbol right now.
-        
+        Check if we can trade a symbol right now (per asset class).
+
         Returns:
             (can_trade: bool, reason: str)
         """
-        from broker import CRYPTO_SYMBOLS
-        
-        is_crypto = symbol in CRYPTO_SYMBOLS
+        asset = _classify_symbol(symbol)
+
+        if asset == "crypto":
+            return _is_crypto_open(), "crypto_24_7" if _is_crypto_open() else "crypto_closed"
+
+        if asset == "futures":
+            open_ = _is_cme_futures_open()
+            return open_, "cme_open" if open_ else "cme_maintenance_break"
+
+        # Stocks: need NYSE regular session
         status = self.get_market_status()
-        
-        # Crypto trades 24/7
-        if is_crypto:
-            return True, "crypto_24_7"
-        
-        # Stocks need market to be open
         if status.is_open:
             return True, "market_open"
-        
         if status.session == "pre":
             return False, "premarket_only"
-        
         if status.session == "post":
             return False, "afterhours_only"
-        
         return False, f"market_closed_next_open_{status.next_open}"
     
     def validate_price_freshness(self, symbol: str, price: float, 
@@ -228,13 +295,11 @@ class LiveTradingManager:
         Returns:
             (is_fresh: bool, reason: str)
         """
-        from broker import CRYPTO_SYMBOLS
-        
         if price is None or price <= 0:
             return False, "invalid_price"
-        
-        is_crypto = symbol in CRYPTO_SYMBOLS
-        max_age = (self.MAX_CRYPTO_PRICE_AGE_SECONDS if is_crypto 
+
+        is_crypto = _classify_symbol(symbol) == "crypto"
+        max_age = (self.MAX_CRYPTO_PRICE_AGE_SECONDS if is_crypto
                    else self.MAX_STOCK_PRICE_AGE_SECONDS)
         
         # If we have a timestamp, check age
@@ -255,12 +320,9 @@ class LiveTradingManager:
         Returns:
             (price: float or None, status: str)
         """
-        from broker import CRYPTO_SYMBOLS
-        
-        is_crypto = symbol in CRYPTO_SYMBOLS
-        
+        is_crypto = _classify_symbol(symbol) == "crypto"
+
         try:
-            # Get latest price
             price = data_fetcher.get_latest_price(symbol)
             
             if price is None:
@@ -361,91 +423,49 @@ class LiveTradingManager:
 
 
 class DataFreshnessValidator:
-    """
-    Validates that all data used for trading decisions is fresh.
-
-    This prevents the bot from trading on old/stale market data.
-    """
+    """Validates IB bar data freshness per asset type."""
 
     MAX_BAR_AGE_MINUTES = {
-        "1Min": 2,
-        "5Min": 10,
-        "15Min": 30,
-        "1Hour": 120,
-        "1Day": 1440,  # 24 hours
+        "1Min": 3, "5Min": 10, "15Min": 30, "1Hour": 120, "1Day": 1440,
     }
-
-    # Crypto gets more lenient staleness thresholds because:
-    # 1. REST polling for 170+ symbols means crypto bars can lag
-    # 2. Crypto trades 24/7 but volume drops off-peak, widening bar gaps
     MAX_CRYPTO_BAR_AGE_MINUTES = {
-        "1Min": 5,
-        "5Min": 20,     # Was 10 — too tight, caused repeated SOL/USD skips
-        "15Min": 45,
-        "1Hour": 180,
-        "1Day": 1440,
+        "1Min": 5, "5Min": 25, "15Min": 50, "1Hour": 200, "1Day": 1440,
     }
-    
-    def validate_bars(self, df, timeframe: str = "5Min", symbol: str = None) -> Tuple[bool, str]:
-        """
-        Validate that bar data is fresh enough for trading.
+    MAX_FUTURES_BAR_AGE_MINUTES = {
+        "1Min": 5, "5Min": 20, "15Min": 40, "1Hour": 150, "1Day": 1440,
+    }
 
-        Args:
-            df: DataFrame with timestamp index
-            timeframe: The timeframe of the bars
-            symbol: Optional symbol — crypto gets more lenient thresholds
-
-        Returns:
-            (is_valid: bool, reason: str)
-        """
+    def validate_bars(self, df, timeframe: str = "5Min",
+                      symbol: str = None) -> Tuple[bool, str]:
+        """Return (is_valid, reason). Checks bar age only."""
         if df is None or df.empty:
             return False, "no_data"
-
-        # Crypto gets more lenient thresholds (REST polling lag for 170+ symbols)
-        from broker import CRYPTO_SYMBOLS
-        is_crypto = symbol and (symbol in CRYPTO_SYMBOLS or symbol.replace("/", "") in CRYPTO_SYMBOLS)
-        age_table = self.MAX_CRYPTO_BAR_AGE_MINUTES if is_crypto else self.MAX_BAR_AGE_MINUTES
+        asset = _classify_symbol(symbol) if symbol else "stock"
+        if asset == "crypto":
+            age_table = self.MAX_CRYPTO_BAR_AGE_MINUTES
+        elif asset == "futures":
+            age_table = self.MAX_FUTURES_BAR_AGE_MINUTES
+        else:
+            age_table = self.MAX_BAR_AGE_MINUTES
         max_age = age_table.get(timeframe, 60)
-        
-        # Get latest bar timestamp
         try:
             last_bar_time = df.index[-1]
-            
-            # Convert to UTC if needed
-            if hasattr(last_bar_time, 'tz_localize'):
-                if last_bar_time.tzinfo is None:
-                    last_bar_time = last_bar_time.tz_localize(UTC)
-            
-            now = datetime.now(UTC)
-            age_minutes = (now - last_bar_time).total_seconds() / 60
-            
+            if hasattr(last_bar_time, "tz_localize") and last_bar_time.tzinfo is None:
+                last_bar_time = last_bar_time.tz_localize(UTC)
+            age_minutes = (datetime.now(UTC) - last_bar_time).total_seconds() / 60
             if age_minutes > max_age:
                 return False, f"bars_stale_{int(age_minutes)}min_old"
-            
             return True, f"bars_fresh_{int(age_minutes)}min"
-            
-        except Exception as e:
-            return False, f"validation_error_{str(e)}"
+        except Exception as exc:
+            return False, f"validation_error_{exc}"
 
 
-def ensure_live_trading_mode():
-    """
-    Verify that the bot is configured for live/paper trading (not backtest).
-    
-    Call this at startup to prevent accidental backtesting when live trading intended.
-    """
-    mode = os.getenv("TRADING_MODE", "paper")
-    
+def ensure_live_trading_mode() -> bool:
+    """Return True when TRADING_MODE is paper or live (not backtest)."""
+    mode = os.getenv("TRADING_MODE", "paper").lower()
     if mode == "backtest":
-        log.error("TRADING_MODE is set to 'backtest' - not suitable for live trading!")
-        log.error("Set TRADING_MODE=paper or TRADING_MODE=live")
+        log.error("TRADING_MODE=backtest -- not suitable for live trading\!")
         return False
-    
-    if mode == "live":
-        log.warning("=" * 60)
-        log.warning("*** LIVE TRADING MODE - REAL MONEY AT RISK ***")
-        log.warning("=" * 60)
-    else:
-        log.info("Paper trading mode - no real money at risk")
-    
+    if mode not in ("paper", "live"):
+        log.warning(f"Unrecognised TRADING_MODE='{mode}' -- defaulting to paper")
     return True

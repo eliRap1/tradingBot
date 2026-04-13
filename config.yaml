@@ -1,8 +1,3 @@
-alpaca:
-  paper_url: "https://paper-api.alpaca.markets"
-  live_url: "https://api.alpaca.markets"
-  data_url: "https://data.alpaca.markets"
-
 screener:
   min_price: 10.0
   max_price: 999999.0
@@ -103,7 +98,6 @@ screener:
     - SCHW
     - COF
     - PYPL
-    - SQ
     - AFRM
     # Healthcare
     - UNH
@@ -166,14 +160,11 @@ screener:
     - NEE
     - DUK
     - SO
-  # Crypto (traded 24/7 on Alpaca)
+  # Crypto — IB PAXOS exchange supports BTC and ETH (paper + live)
+  # SOL/AVAX/LINK/DOGE are NOT available on IB; add back only if your account supports them
   crypto:
     - BTC/USD
     - ETH/USD
-    - SOL/USD
-    - AVAX/USD
-    - LINK/USD
-    - DOGE/USD
   # Crypto-specific risk overrides (wider stops for higher volatility)
   crypto_risk:
     stop_loss_atr_mult: 2.5       # wider SL for crypto volatility
@@ -321,11 +312,16 @@ futures:
     - root: GC
       exchange: COMEX
       description: "Gold"
+  symbols:
+    - NQ
+    - ES
+    - CL
+    - GC
   risk:
-    stop_loss_atr_mult: 1.5       # tighter ATR stops for futures (tick-based)
+    stop_loss_atr_mult: 1.5
     take_profit_atr_mult: 3.0
     min_risk_reward: 2.0
-    max_position_pct: 0.05        # 5% per futures position (higher notional)
+    max_position_pct: 0.05
 
 optimization:
   train_days: 180
@@ -335,6 +331,6 @@ optimization:
   max_param_combinations: 200
 
 schedule:
-  market_open_delay_min: 15    # skip first 15 min (volatile)
+  market_open_delay_min: 15    # skip first 15 min (volatile open)
   cycle_interval_sec: 300      # run every 5 minutes
   market_close_buffer_min: 15  # stop new trades 15 min before close
