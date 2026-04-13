@@ -17,6 +17,7 @@ from datetime import datetime
 
 from utils import load_config, setup_logger
 from broker import Broker, CRYPTO_SYMBOLS
+from portfolio import _normalize_symbol
 from data import DataFetcher
 from screener import Screener
 from risk import RiskManager
@@ -114,6 +115,8 @@ class Coordinator:
                 universe = self.config["screener"]["universe"]
             # Add crypto symbols
             universe = list(universe) + self.config["screener"].get("crypto", [])
+            # Deduplicate (preserves order) — fixes duplicate AMZN etc.
+            universe = list(dict.fromkeys(universe))
 
         cycle_interval = self.config["schedule"]["cycle_interval_sec"]
         watcher_interval = max(60, cycle_interval)
@@ -307,9 +310,9 @@ class Coordinator:
 
         # 0c. Check crypto exit fills (manual OCO behavior) — record any that filled
         crypto_fills = self.broker.check_crypto_exit_fills()
-        for sym, reason in crypto_fills.items():
-            meta = self.portfolio.position_meta.get(sym, {})
-            pos = self.portfolio.get_position(sym) if hasattr(self.portfolio, "get_position") else None
+        for raw_sym, reason in crypto_fills.items():
+            norm_sym = _normalize_symbol(raw_sym)
+            meta = self.portfolio.position_meta.get(norm_sym, self.portfolio.position_meta.get(raw_sym, {}))
             entry = meta.get("entry_price", 0.0)
             exit_price = meta.get("take_profit" if reason == "take_profit" else "stop_loss", 0.0)
             qty = meta.get("original_qty", meta.get("qty", 0.0))
@@ -318,11 +321,12 @@ class Coordinator:
             strategies = meta.get("strategies", [])
             if entry > 0 and exit_price > 0:
                 self.portfolio.tracker.record_trade(
-                    symbol=sym, side=side, qty=qty,
+                    symbol=norm_sym, side=side, qty=qty,
                     entry_price=entry, exit_price=exit_price,
                     reason=reason, risk_dollars=risk, strategies=strategies,
                 )
-                self.portfolio.position_meta.pop(sym, None)
+                self.portfolio.position_meta.pop(norm_sym, None)
+                self.portfolio.position_meta.pop(raw_sym, None)
                 self.portfolio._save_meta()
 
         # 0d. Prime bar cache for all watchers (one bulk fetch per timeframe instead of N individual calls)
@@ -474,9 +478,11 @@ class Coordinator:
             return
 
         # 5. Collect confirmed signals from watchers (LONG + SHORT)
+        # Build normalized set of held symbols so BTC/USD matches BTCUSD
+        held_normalized = set(_normalize_symbol(s) for s in held_symbols)
         trade_signals = []
         for sym, watcher in list(self.watchers.items()):
-            if sym in held_symbols:
+            if _normalize_symbol(sym) in held_normalized:
                 continue
             if not watcher.state.confirmed:
                 continue
@@ -490,8 +496,11 @@ class Coordinator:
                 trade_signals.append(watcher)
 
             elif watcher.state.action == Action.SHORT:
+                # Alpaca crypto is long-only — no short selling supported
+                if is_crypto:
+                    continue
                 # Shorts allowed in bear/chop regime, restricted in bull
-                if not is_crypto and regime["regime"] == "bull" and not self.config["signals"].get("allow_shorts_in_bull", False):
+                if regime["regime"] == "bull" and not self.config["signals"].get("allow_shorts_in_bull", False):
                     continue
                 trade_signals.append(watcher)
 
@@ -617,7 +626,7 @@ class Coordinator:
                 continue
             
             # LIVE TRADING: Validate data freshness
-            is_fresh, freshness_reason = self.freshness_validator.validate_bars(bars, "5Min")
+            is_fresh, freshness_reason = self.freshness_validator.validate_bars(bars, "5Min", symbol=sym)
             if not is_fresh:
                 log.warning(f"Skipping {sym}: {freshness_reason}")
                 continue
@@ -718,9 +727,11 @@ class Coordinator:
                         order.stop_loss, order.qty
                     )
                     # Store which strategies fired + full trade context for crypto exit recording
+                    # Use normalized symbol to match broker's position key format
                     contributing = [s for s, v in watcher.state.strategy_scores.items()
                                     if abs(v) > 0.1]
-                    self.portfolio.position_meta.setdefault(order.symbol, {}).update({
+                    norm_sym = _normalize_symbol(order.symbol)
+                    self.portfolio.position_meta.setdefault(norm_sym, {}).update({
                         "strategies": contributing,
                         "entry_price": order.entry_price,
                         "take_profit": order.take_profit,
@@ -728,6 +739,7 @@ class Coordinator:
                         "original_qty": order.qty,
                         "side": order.side,
                     })
+                    self.portfolio._save_meta()
                     log.info(
                         f"ORDER: {order.side} {order.qty} {order.symbol} "
                         f"@ ~${order.entry_price:.2f} | "

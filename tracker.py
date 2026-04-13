@@ -63,7 +63,7 @@ class TradeTracker:
 
     # ── Stats ────────────────────────────────────────────────
 
-    def get_stats(self) -> dict:
+    def get_stats(self, starting_equity: float = 100_000.0) -> dict:
         """Calculate institutional-grade performance statistics."""
         if not self.trades:
             return {}
@@ -155,11 +155,10 @@ class TradeTracker:
             if first_date and last_date:
                 d1 = datetime.fromisoformat(first_date)
                 d2 = datetime.fromisoformat(last_date)
-                days_active = max(1, (d2 - d1).days)
-                # APR = (total_pnl / initial_equity_estimate) * (365 / days)
-                # Use total_pnl relative to peak equity as proxy
-                equity_base = max(abs(total_pnl) * 5, 100000)  # rough estimate
-                apr = (total_pnl / equity_base) * (365 / days_active) * 100
+                days_active = (d2 - d1).days
+                # Need at least 7 days of history for APR to be meaningful
+                if days_active >= 7:
+                    apr = (total_pnl / starting_equity) * (365 / days_active) * 100
         except (ValueError, TypeError, IndexError):
             pass
 

@@ -19,6 +19,16 @@ from broker import CRYPTO_SYMBOLS
 log = setup_logger("portfolio")
 
 
+def _normalize_symbol(sym: str) -> str:
+    """Normalize crypto symbol format: 'BTC/USD' → 'BTCUSD'.
+
+    Alpaca returns positions as 'BTCUSD' but config uses 'BTC/USD'.
+    We standardize to the no-slash format to avoid key mismatches
+    in position_meta, watermarks, and trade recording.
+    """
+    return sym.replace("/", "")
+
+
 class PortfolioManager:
     def __init__(self, config: dict, broker):
         self.config = config
@@ -35,11 +45,18 @@ class PortfolioManager:
         #           "breakeven_armed": bool, "partial_done": bool}}
         self.position_meta = state.get("position_meta", {})
 
+        # Migrate any legacy slash-format keys (e.g. "BTC/USD" → "BTCUSD")
+        migrated_meta = {}
+        for k, v in self.position_meta.items():
+            migrated_meta[_normalize_symbol(k)] = v
+        self.position_meta = migrated_meta
+
     def get_current_positions(self) -> dict:
         """Get current positions as {symbol: position_info}."""
         positions = {}
         for pos in self.broker.get_positions():
-            positions[pos.symbol] = {
+            sym = _normalize_symbol(pos.symbol)
+            positions[sym] = {
                 "qty": float(pos.qty),
                 "entry_price": float(pos.avg_entry_price),
                 "current_price": float(pos.current_price),
@@ -49,16 +66,24 @@ class PortfolioManager:
                 "side": pos.side,
             }
 
-            # Track position open time if new
-            if pos.symbol not in self.position_meta:
-                self.position_meta[pos.symbol] = {
+            # Track position open time if new — but NEVER overwrite existing meta
+            # (initial_risk, strategies, etc. are set by set_position_risk after order)
+            if sym not in self.position_meta:
+                self.position_meta[sym] = {
                     "opened_at": datetime.now().isoformat(),
                     "entry_price": float(pos.avg_entry_price),
-                    "initial_risk": 0.0,  # Will be set when order is placed
+                    "initial_risk": 0.0,  # Will be set by set_position_risk()
                 }
                 self._save_meta()
+                log.info(f"New position detected at broker: {sym} (meta created, awaiting risk data)")
 
         return positions
+
+    def get_position(self, symbol: str):
+        """Get a single position by symbol (normalized)."""
+        sym = _normalize_symbol(symbol)
+        positions = self.get_current_positions()
+        return positions.get(sym)
 
     def check_trailing_stops(self, positions: dict,
                               prices: dict[str, float],
@@ -84,15 +109,17 @@ class PortfolioManager:
         partial_pct = self.config["risk"].get("partial_exit_pct", 0.50)
         bars = bars or {}
 
-        for sym, pos in positions.items():
-            if sym not in prices:
+        for raw_sym, pos in positions.items():
+            sym = _normalize_symbol(raw_sym)
+            price_key = raw_sym if raw_sym in prices else sym
+            if price_key not in prices:
                 continue
 
-            current_price = prices[sym]
+            current_price = prices[price_key]
             entry_price = pos["entry_price"]
             is_long = pos.get("side", "long") == "long"
             meta = self.position_meta.get(sym, {})
-            trail_pct = crypto_trail_pct if sym in CRYPTO_SYMBOLS else default_trail_pct
+            trail_pct = crypto_trail_pct if sym in CRYPTO_SYMBOLS or raw_sym in CRYPTO_SYMBOLS else default_trail_pct
 
             # === CHANDELIER ATR TRAILING STOP ===
             # Use ATR-based trail if bars available, else fall back to % trail
@@ -304,18 +331,22 @@ class PortfolioManager:
 
     def execute_exits(self, symbols_to_close: list[str], positions: dict = None):
         """Close positions for given symbols and record trades."""
-        for sym in symbols_to_close:
+        for raw_sym in symbols_to_close:
+            sym = _normalize_symbol(raw_sym)
             try:
                 # Grab position info and meta BEFORE closing/popping
-                pos = positions.get(sym) if positions else None
+                pos = (positions.get(raw_sym) or positions.get(sym)) if positions else None
                 meta = self.position_meta.get(sym, {})
 
-                self.broker.close_position(sym)
+                # Use the original symbol format for broker API calls
+                self.broker.close_position(raw_sym)
                 log.info(f"Closed position: {sym}")
 
-                # Clean up both watermark dicts
+                # Clean up both watermark dicts (try both formats)
                 self.high_watermarks.pop(sym, None)
+                self.high_watermarks.pop(raw_sym, None)
                 self.low_watermarks.pop(sym, None)
+                self.low_watermarks.pop(raw_sym, None)
 
                 if pos:
                     # Determine exit reason
@@ -379,7 +410,8 @@ class PortfolioManager:
         log.info(f"  {'------':<10} {'----':<6} {'---':>8} {'-----':>10} "
                  f"{'---':>10} {'---':>12} {'--':>8} {'----':>5}")
 
-        for sym, pos in sorted(positions.items(), key=lambda x: x[1]["unrealized_pl"], reverse=True):
+        for raw_sym, pos in sorted(positions.items(), key=lambda x: x[1]["unrealized_pl"], reverse=True):
+            sym = _normalize_symbol(raw_sym)
             days_held = ""
             meta = self.position_meta.get(sym, {})
             if meta.get("opened_at"):
@@ -395,27 +427,32 @@ class PortfolioManager:
             pct_str = f"{pos['unrealized_plpc']:+.1%}"
 
             log.info(
-                f"  {sym:<10} {side:<6} {qty_str:>8} "
+                f"  {raw_sym:<10} {side:<6} {qty_str:>8} "
                 f"${pos['entry_price']:>9,.2f} ${pos['current_price']:>9,.2f} "
                 f"{pl_str:>12} {pct_str:>8} {days_held:>5}"
             )
 
     def set_position_risk(self, symbol: str, entry_price: float,
-                          stop_loss: float, qty: int):
+                          stop_loss: float, qty):
         """Record the initial risk for a position (for R-multiple tracking)."""
+        sym = _normalize_symbol(symbol)
         risk_per_share = abs(entry_price - stop_loss)
         risk_dollars = risk_per_share * qty
-        if symbol not in self.position_meta:
-            self.position_meta[symbol] = {
+        if risk_dollars <= 0:
+            log.warning(f"set_position_risk: {sym} risk_dollars={risk_dollars:.2f} "
+                        f"(entry={entry_price:.2f} SL={stop_loss:.2f}) — check stop placement")
+        if sym not in self.position_meta:
+            self.position_meta[sym] = {
                 "opened_at": datetime.now().isoformat(),
                 "entry_price": entry_price,
                 "initial_risk": risk_dollars,
                 "original_qty": qty,
             }
         else:
-            self.position_meta[symbol]["initial_risk"] = risk_dollars
-            if "original_qty" not in self.position_meta[symbol]:
-                self.position_meta[symbol]["original_qty"] = qty
+            self.position_meta[sym]["initial_risk"] = risk_dollars
+            if "original_qty" not in self.position_meta[sym]:
+                self.position_meta[sym]["original_qty"] = qty
+        log.info(f"Position risk set: {sym} initial_risk=${risk_dollars:.2f} qty={qty}")
         self._save_meta()
 
     def _save_watermarks(self):

@@ -1,7 +1,7 @@
 import pandas as pd
 import ta
 from indicators import stochastic_rsi, crossover, crossunder, rvol
-from candles import detect_patterns, bullish_score, bearish_score
+
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -77,14 +77,10 @@ class StochRSIStrategy:
         rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
         current_rsi = rsi.iloc[-1]
 
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
-
-        vol_ok = rvol(df) > 0.8
+        vol_ok = rvol(df) > 1.0
 
         # ── LONG: Buy pullback in uptrend ────────────────────
-        if above_ema or ctx["direction"] != "down":
+        if above_ema and ctx["direction"] != "down":
             long_score = 0.0
 
             if k_cross_up and was_oversold:
@@ -107,11 +103,6 @@ class StochRSIStrategy:
                 elif current_rsi > 70:
                     long_score -= 0.2
 
-                if candle_bull > 0.2:
-                    long_score += candle_bull * 0.15
-                elif candle_bull == 0:
-                    long_score *= 0.8
-
                 if vol_ok:
                     long_score += 0.05
 
@@ -122,7 +113,7 @@ class StochRSIStrategy:
                     return max(0.0, min(1.0, long_score))
 
         # ── SHORT: Sell rally in downtrend ───────────────────
-        if not above_ema or ctx["direction"] != "up":
+        if not above_ema and ctx["direction"] != "up":
             short_score = 0.0
 
             # StochRSI crosses DOWN from overbought
@@ -147,12 +138,6 @@ class StochRSIStrategy:
                     short_score -= 0.1
                 elif current_rsi < 30:
                     short_score += 0.2  # Already oversold, don't short
-
-                # Bearish candle confirmation
-                if candle_bear > 0.2:
-                    short_score -= candle_bear * 0.15
-                elif candle_bear == 0:
-                    short_score *= 0.8
 
                 if vol_ok:
                     short_score -= 0.05

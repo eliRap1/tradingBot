@@ -1,7 +1,6 @@
 import pandas as pd
 import ta
 from indicators import vwap_bands, rvol
-from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -67,15 +66,12 @@ class VWAPReclaimStrategy:
         above_vwap = current_price > current_vwap
 
         vwap_crosses = self._count_vwap_crosses(close, vwap_line, lookback=20)
-        choppy = vwap_crosses > 3
+        if vwap_crosses > 2:
+            return 0.0  # Choppy market — skip entirely
 
         vol_ratio = rvol(df)
         if vol_ratio < 1.3:
             return 0.0
-
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
 
         pullback_to_support = self._pullback_to_vwap_from_above(close, vwap_line)
         rally_to_resistance = self._rally_to_vwap_from_below(close, vwap_line)
@@ -85,33 +81,23 @@ class VWAPReclaimStrategy:
         rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
         current_rsi = rsi.iloc[-1]
 
-        if pullback_to_support and candle_bull > 0.15:
-            score = self._score_long(
-                pct_from_vwap, vol_ratio, candle_bull, candle_bear, ctx, current_rsi
-            )
-            if choppy:
-                score *= 0.5
+        if pullback_to_support:
+            score = self._score_long(pct_from_vwap, vol_ratio, ctx, current_rsi)
             if score > 0.15:
                 return max(0.0, min(1.0, score))
 
-        if rally_to_resistance and candle_bear > 0.15:
-            score = self._score_short(
-                pct_from_vwap, vol_ratio, candle_bull, candle_bear, ctx, current_rsi
-            )
-            if choppy:
-                score *= 0.5
+        if rally_to_resistance:
+            score = self._score_short(pct_from_vwap, vol_ratio, ctx, current_rsi)
             if score < -0.15:
                 return max(-1.0, min(0.0, score))
 
         if not pd.isna(lower_1.iloc[-1]) and current_price <= lower_1.iloc[-1]:
-            if current_rsi < 40 and candle_bull > 0.2 and vol_ratio > 1.3:
-                s = min(0.25, candle_bull * 0.3 + 0.1)
-                return s * 0.5 if choppy else s
+            if current_rsi < 40 and vol_ratio > 1.3:
+                return 0.20
 
         if not pd.isna(upper_1.iloc[-1]) and current_price >= upper_1.iloc[-1]:
-            if current_rsi > 60 and candle_bear > 0.2 and vol_ratio > 1.3:
-                s = max(-0.25, -(candle_bear * 0.3 + 0.1))
-                return s * 0.5 if choppy else s
+            if current_rsi > 60 and vol_ratio > 1.3:
+                return -0.20
 
         return 0.0
 
@@ -133,7 +119,7 @@ class VWAPReclaimStrategy:
                 was_above = True
                 break
 
-        near_vwap = abs(close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1] < 0.003
+        near_vwap = abs(close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1] < 0.01
         price_above_or_at = close.iloc[-1] >= vwap.iloc[-1] * 0.998
 
         return was_above and near_vwap and price_above_or_at
@@ -146,12 +132,12 @@ class VWAPReclaimStrategy:
                 was_below = True
                 break
 
-        near_vwap = abs(close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1] < 0.003
+        near_vwap = abs(close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1] < 0.01
         price_below_or_at = close.iloc[-1] <= vwap.iloc[-1] * 1.002
 
         return was_below and near_vwap and price_below_or_at
 
-    def _score_long(self, pct_from_vwap, vol_ratio, candle_bull, candle_bear, ctx, rsi):
+    def _score_long(self, pct_from_vwap, vol_ratio, ctx, rsi):
         score = 0.25
 
         if vol_ratio >= 2.0:
@@ -171,14 +157,6 @@ class VWAPReclaimStrategy:
         elif rsi > 75:
             score -= 0.15
 
-        if candle_bull > 0.3:
-            score += candle_bull * 0.15
-        elif candle_bull > 0.15:
-            score += candle_bull * 0.10
-
-        if candle_bear > 0.3:
-            score *= 0.6
-
         if ctx["direction"] == "up":
             score += 0.10
         elif ctx["direction"] == "down" and ctx.get("strong_trend"):
@@ -186,7 +164,7 @@ class VWAPReclaimStrategy:
 
         return score
 
-    def _score_short(self, pct_from_vwap, vol_ratio, candle_bull, candle_bear, ctx, rsi):
+    def _score_short(self, pct_from_vwap, vol_ratio, ctx, rsi):
         score = -0.25
 
         if vol_ratio >= 2.0:
@@ -205,14 +183,6 @@ class VWAPReclaimStrategy:
             score -= 0.10
         elif rsi < 25:
             score += 0.15
-
-        if candle_bear > 0.3:
-            score -= candle_bear * 0.15
-        elif candle_bear > 0.15:
-            score -= candle_bear * 0.10
-
-        if candle_bull > 0.3:
-            score *= 0.6
 
         if ctx["direction"] == "down":
             score -= 0.10

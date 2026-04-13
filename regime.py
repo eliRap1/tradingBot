@@ -44,13 +44,13 @@ class RegimeFilter:
             }
         """
         # Fetch SPY daily data
-        bars = self.data.get_bars(["SPY"], timeframe="1Day", days=250)
+        spy_df = self.data.get_intraday_bars("SPY", timeframe="1Day", days=250)
 
-        if "SPY" not in bars or len(bars["SPY"]) < 50:
+        if spy_df is None or len(spy_df) < 50:
             log.warning("Cannot fetch SPY data — defaulting to cautious mode")
             return self._default_regime()
 
-        df = bars["SPY"]
+        df = spy_df
         close = df["close"]
         current_price = close.iloc[-1]
 
@@ -121,11 +121,10 @@ class RegimeFilter:
                 size_mult = min(size_mult * 1.1, 1.0)
                 desc += f" (HMM confirms @ {hmm['confidence']:.0%})"
 
-            # HMM override: if EMA says bull but HMM strongly says bear, block longs
-            if hmm_state == "bear" and hmm["confidence"] > 0.85 and regime == "bull":
-                allow_longs = False
-                size_mult = 0.4
-                desc += " [HMM OVERRIDE: blocking longs]"
+            # HMM caution: EMA says bull but HMM strongly disagrees — reduce size, don't block
+            if hmm_state == "bear" and hmm["confidence"] > 0.92 and regime == "bull":
+                size_mult = min(size_mult, 0.25)
+                desc += " [HMM CAUTION: size capped at 25%]"
 
         # ── ATR volatility regime ─────────────────────────────
         atr_ind = ta.volatility.AverageTrueRange(

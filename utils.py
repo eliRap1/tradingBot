@@ -122,8 +122,11 @@ def setup_logger(name: str, log_dir: str = "logs") -> logging.Logger:
     logger.setLevel(logging.DEBUG)
 
     if not logger.handlers:
-        # Console handler — colorized
-        ch = logging.StreamHandler()
+        # Console handler — colorized, UTF-8 safe on Windows
+        import sys, io
+        stream = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace") \
+            if hasattr(sys.stdout, "buffer") else sys.stdout
+        ch = logging.StreamHandler(stream)
         ch.setLevel(logging.INFO)
         ch.setFormatter(ColorFormatter())
         logger.addHandler(ch)

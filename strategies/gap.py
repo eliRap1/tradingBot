@@ -13,7 +13,6 @@ import pandas as pd
 import numpy as np
 import ta
 from indicators import rvol
-from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -89,11 +88,11 @@ class GapStrategy:
         if gap_up:
             holding_gap = current_price >= today_open * 0.995
             fading = current_price < today_open * 0.99
-            filled = current_price <= prev_close * 1.002
+            filled = current_price <= prev_close * 1.005
         else:
             holding_gap = current_price <= today_open * 1.005
             fading = current_price > today_open * 1.01
-            filled = current_price >= prev_close * 0.998
+            filled = current_price >= prev_close * 0.995
 
         vol_ratio = rvol(df)
         high_volume = vol_ratio > 1.5
@@ -103,10 +102,6 @@ class GapStrategy:
 
         rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
         current_rsi = rsi.iloc[-1]
-
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
 
         orb_score = self._orb_signal(df, gap_up, gap_down, abs_gap, strong_gap, vol_ratio, ctx)
         if orb_score != 0.0:
@@ -140,8 +135,6 @@ class GapStrategy:
             # Price action confirms
             if current_price > today_open:  # Making new highs after gap
                 score += 0.10
-            if candle_bull > 0.2:
-                score += candle_bull * 0.15
 
             # RSI not extreme
             if current_rsi > 80:
@@ -177,8 +170,6 @@ class GapStrategy:
 
             if current_price < today_open:
                 score -= 0.10
-            if candle_bear > 0.2:
-                score -= candle_bear * 0.15
 
             if current_rsi < 20:
                 score *= 0.7
@@ -210,10 +201,6 @@ class GapStrategy:
             if vol_ratio < 1.0:
                 score -= 0.15
 
-            # Bearish candle confirms fade
-            if candle_bear > 0.2:
-                score -= candle_bear * 0.20
-
             # RSI showing momentum loss
             if current_rsi < 50 and rsi.iloc[-2] > 50:
                 score -= 0.10  # RSI crossed below 50
@@ -236,9 +223,6 @@ class GapStrategy:
 
             if vol_ratio < 1.0:
                 score += 0.15
-
-            if candle_bull > 0.2:
-                score += candle_bull * 0.20
 
             if current_rsi > 50 and rsi.iloc[-2] < 50:
                 score += 0.10

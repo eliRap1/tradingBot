@@ -17,7 +17,6 @@ import pandas as pd
 import numpy as np
 import ta
 from indicators import pivot_high, pivot_low, rvol
-from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -68,7 +67,7 @@ class LiquiditySweepStrategy:
         open_price = df["open"]
         volume = df["volume"]
 
-        pivot_lb = self.cfg.get("pivot_lookback", 5)
+        pivot_lb = self.cfg.get("pivot_lookback", 10)
         sweep_tol = self.cfg.get("sweep_tolerance_pct", 0.005)
         min_wb_ratio = self.cfg.get("min_wick_body_ratio", 2.0)
         min_vol_ratio = self.cfg.get("min_volume_ratio", 1.5)
@@ -116,11 +115,6 @@ class LiquiditySweepStrategy:
         if curr_atr <= 0:
             return 0.0
 
-        # Candle patterns
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
-
         # ══════════════════════════════════════════════════════
         # BEARISH SWEEP (sweep above swing high → SHORT signal)
         # Price wicks above a key high, then closes back below
@@ -130,8 +124,7 @@ class LiquiditySweepStrategy:
             curr_high, curr_low, curr_close, curr_open, curr_body,
             recent_swing_highs, prev_day_high,
             sweep_tol, min_wb_ratio, min_vol_ratio, min_confluence,
-            vol_ratio, curr_rsi, rsi, close, high, ctx, candle_bear,
-            curr_atr
+            vol_ratio, curr_rsi, rsi, close, high, ctx, curr_atr
         )
 
         if short_score < -0.15:
@@ -146,8 +139,7 @@ class LiquiditySweepStrategy:
             curr_high, curr_low, curr_close, curr_open, curr_body,
             recent_swing_lows, prev_day_low,
             sweep_tol, min_wb_ratio, min_vol_ratio, min_confluence,
-            vol_ratio, curr_rsi, rsi, close, low, ctx, candle_bull,
-            curr_atr
+            vol_ratio, curr_rsi, rsi, close, low, ctx, curr_atr
         )
 
         if long_score > 0.15:
@@ -159,7 +151,7 @@ class LiquiditySweepStrategy:
                               curr_body, swing_highs, prev_day_high,
                               sweep_tol, min_wb_ratio, min_vol_ratio,
                               min_confluence, vol_ratio, curr_rsi, rsi,
-                              close, high, ctx, candle_bear, atr):
+                              close, high, ctx, atr):
         """Check for a bearish liquidity sweep (sweep above high → short)."""
 
         # Build list of all resistance levels to check
@@ -240,17 +232,12 @@ class LiquiditySweepStrategy:
                 score -= 0.05
                 confluence += 1
 
-            # Factor 8: Bearish candle confirmation
-            if candle_bear > 0.2:
-                score -= candle_bear * 0.15
-                confluence += 1
-
-            # Factor 9: Displacement — strong reversal candle
+            # Factor 8: Displacement — strong reversal candle
             if curr_body >= 1.5 * atr and curr_close < curr_open:
                 score -= 0.10
                 confluence += 1
 
-            # ── Confluence gate ──
+            # ── Confluence gate (min 3 of 8 factors) ──
             if confluence < min_confluence:
                 continue  # not enough confirmation
 
@@ -272,7 +259,7 @@ class LiquiditySweepStrategy:
                               curr_body, swing_lows, prev_day_low,
                               sweep_tol, min_wb_ratio, min_vol_ratio,
                               min_confluence, vol_ratio, curr_rsi, rsi,
-                              close, low, ctx, candle_bull, atr):
+                              close, low, ctx, atr):
         """Check for a bullish liquidity sweep (sweep below low → long)."""
 
         levels = list(swing_lows)
@@ -351,17 +338,12 @@ class LiquiditySweepStrategy:
                 score += 0.05
                 confluence += 1
 
-            # Factor 8: Bullish candle confirmation
-            if candle_bull > 0.2:
-                score += candle_bull * 0.15
-                confluence += 1
-
-            # Factor 9: Displacement — strong reversal candle
+            # Factor 8: Displacement — strong reversal candle
             if curr_body >= 1.5 * atr and curr_close > curr_open:
                 score += 0.10
                 confluence += 1
 
-            # ── Confluence gate ──
+            # ── Confluence gate (min 3 of 8 factors) ──
             if confluence < min_confluence:
                 continue
 

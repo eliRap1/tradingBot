@@ -1,7 +1,7 @@
 import pandas as pd
 import ta
 from indicators import supertrend, crossover, crossunder, rvol
-from candles import detect_patterns, bullish_score, bearish_score
+
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -72,15 +72,11 @@ class SuperTrendStrategy:
 
         vol_ratio = rvol(df)
 
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
-
         choppy = ctx["adx"] < 25
 
         if is_bullish and momentum_up:
             score = self._score_long(
-                ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars
+                ctx, above_ema200, vol_ratio, stable_bars
             )
             if choppy:
                 score *= 0.6
@@ -88,7 +84,7 @@ class SuperTrendStrategy:
 
         if is_bearish and momentum_down:
             score = self._score_short(
-                ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars
+                ctx, above_ema200, vol_ratio, stable_bars
             )
             if choppy:
                 score *= 0.6
@@ -106,8 +102,8 @@ class SuperTrendStrategy:
                 break
         return count
 
-    def _score_long(self, ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars):
-        if not (ctx["adx"] > 20 and candle_bull > 0.15):
+    def _score_long(self, ctx, above_ema200, vol_ratio, stable_bars):
+        if ctx["adx"] <= 20:
             return 0.0
 
         score = 0.0
@@ -132,21 +128,13 @@ class SuperTrendStrategy:
         elif vol_ratio >= 1.2:
             score += 0.05
 
-        if candle_bull > 0.3:
-            score += candle_bull * 0.15
-        elif candle_bull > 0.15:
-            score += candle_bull * 0.10
-
-        if candle_bear > 0.3:
-            score *= 0.6
-
         if ctx["above_vwap"]:
             score += 0.05
 
         return score
 
-    def _score_short(self, ctx, above_ema200, vol_ratio, candle_bull, candle_bear, stable_bars):
-        if not (ctx["adx"] > 20 and candle_bear > 0.15):
+    def _score_short(self, ctx, above_ema200, vol_ratio, stable_bars):
+        if ctx["adx"] <= 20:
             return 0.0
 
         score = 0.0
@@ -170,14 +158,6 @@ class SuperTrendStrategy:
             score -= 0.15
         elif vol_ratio >= 1.2:
             score -= 0.05
-
-        if candle_bear > 0.3:
-            score -= candle_bear * 0.15
-        elif candle_bear > 0.15:
-            score -= candle_bear * 0.10
-
-        if candle_bull > 0.3:
-            score *= 0.6
 
         if not ctx["above_vwap"]:
             score -= 0.05

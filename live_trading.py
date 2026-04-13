@@ -363,10 +363,10 @@ class LiveTradingManager:
 class DataFreshnessValidator:
     """
     Validates that all data used for trading decisions is fresh.
-    
+
     This prevents the bot from trading on old/stale market data.
     """
-    
+
     MAX_BAR_AGE_MINUTES = {
         "1Min": 2,
         "5Min": 10,
@@ -374,22 +374,38 @@ class DataFreshnessValidator:
         "1Hour": 120,
         "1Day": 1440,  # 24 hours
     }
+
+    # Crypto gets more lenient staleness thresholds because:
+    # 1. REST polling for 170+ symbols means crypto bars can lag
+    # 2. Crypto trades 24/7 but volume drops off-peak, widening bar gaps
+    MAX_CRYPTO_BAR_AGE_MINUTES = {
+        "1Min": 5,
+        "5Min": 20,     # Was 10 — too tight, caused repeated SOL/USD skips
+        "15Min": 45,
+        "1Hour": 180,
+        "1Day": 1440,
+    }
     
-    def validate_bars(self, df, timeframe: str = "5Min") -> Tuple[bool, str]:
+    def validate_bars(self, df, timeframe: str = "5Min", symbol: str = None) -> Tuple[bool, str]:
         """
         Validate that bar data is fresh enough for trading.
-        
+
         Args:
             df: DataFrame with timestamp index
             timeframe: The timeframe of the bars
-            
+            symbol: Optional symbol — crypto gets more lenient thresholds
+
         Returns:
             (is_valid: bool, reason: str)
         """
         if df is None or df.empty:
             return False, "no_data"
-        
-        max_age = self.MAX_BAR_AGE_MINUTES.get(timeframe, 60)
+
+        # Crypto gets more lenient thresholds (REST polling lag for 170+ symbols)
+        from broker import CRYPTO_SYMBOLS
+        is_crypto = symbol and (symbol in CRYPTO_SYMBOLS or symbol.replace("/", "") in CRYPTO_SYMBOLS)
+        age_table = self.MAX_CRYPTO_BAR_AGE_MINUTES if is_crypto else self.MAX_BAR_AGE_MINUTES
+        max_age = age_table.get(timeframe, 60)
         
         # Get latest bar timestamp
         try:

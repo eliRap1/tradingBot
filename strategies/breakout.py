@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import ta
 from indicators import pivot_high, pivot_low, last_pivot_value, bars_since_pivot, supertrend, rvol
-from candles import detect_patterns, bullish_score, bearish_score
+
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -94,10 +94,6 @@ class BreakoutStrategy:
 
         consolidation = range_compressed or bb_squeeze
 
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
-
         if "open" in df.columns:
             candle_body = abs(close.iloc[-1] - df["open"].iloc[-1])
             candle_range = high.iloc[-1] - low.iloc[-1]
@@ -137,8 +133,6 @@ class BreakoutStrategy:
 
             if strong_bull_candle:
                 score += 0.15
-            elif candle_bull > 0.2:
-                score += 0.08
 
             if ctx["adx"] > 20 and ctx["di_plus"] > ctx["di_minus"]:
                 score += 0.1
@@ -153,9 +147,6 @@ class BreakoutStrategy:
             if ctx["above_vwap"]:
                 score += 0.05
 
-            if candle_bear > 0.3:
-                score *= 0.7
-
             return max(0.0, min(1.0, score))
 
         # LONG: Retest setup
@@ -163,8 +154,6 @@ class BreakoutStrategy:
               low.iloc[-1] <= resistance * 1.01 and
               close.iloc[-1] > resistance):
             score = 0.35
-            if candle_bull > 0.2:
-                score += 0.15
             if vol_ratio > 1.0:
                 score += 0.1
             return max(0.0, min(1.0, score))
@@ -197,8 +186,6 @@ class BreakoutStrategy:
             # Strong bearish candle
             if strong_bear_candle:
                 score -= 0.15
-            elif candle_bear > 0.2:
-                score -= 0.08
 
             # ADX: trend accelerating down
             if ctx["adx"] > 20 and ctx["di_minus"] > ctx["di_plus"]:
@@ -216,10 +203,6 @@ class BreakoutStrategy:
             if not ctx["above_vwap"]:
                 score -= 0.05
 
-            # Bullish candle contradicts breakdown
-            if candle_bull > 0.3:
-                score *= 0.7
-
             return max(-1.0, min(0.0, score))
 
         # SHORT: Retest of broken support from below
@@ -227,8 +210,6 @@ class BreakoutStrategy:
               high.iloc[-1] >= support * 0.99 and
               close.iloc[-1] < support):
             score = -0.35
-            if candle_bear > 0.2:
-                score -= 0.15
             if vol_ratio > 1.0:
                 score -= 0.1
             return max(-1.0, min(0.0, score))

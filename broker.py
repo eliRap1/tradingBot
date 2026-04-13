@@ -9,7 +9,10 @@ from utils import setup_logger
 load_dotenv()
 log = setup_logger("broker")
 
-CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
+CRYPTO_SYMBOLS = {
+    "BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "LINK/USD", "DOGE/USD",
+    "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "LINKUSD", "DOGEUSD",
+}
 
 
 class Broker:
@@ -91,15 +94,20 @@ class Broker:
     def submit_crypto_order(self, symbol: str, qty: float, side: str,
                              take_profit: float, stop_loss: float):
         """Submit crypto order with linked TP and SL orders.
-        
+
         Crypto doesn't support bracket orders on Alpaca, so we:
         1. Place entry order and wait for fill confirmation
         2. Place TP limit and SL stop orders with the actual filled qty
         3. Track both exit orders so we can cancel the other when one fills
-        
+
         CRITICAL: The exit orders are tracked in _crypto_exit_orders so that
         when one fills, we can cancel the other (manual OCO behavior).
         """
+        # Hard-reject crypto shorts — Alpaca does not support crypto short selling
+        if side == "sell":
+            log.error(f"CRYPTO SHORT REJECTED: {symbol} — Alpaca does not support crypto short selling")
+            return None
+
         log.info(f"CRYPTO ORDER: {side} {qty} {symbol} | TP={take_profit:.2f} SL={stop_loss:.2f}")
 
         # Round crypto prices (BTC to 2 decimals, ETH to 2)
@@ -135,9 +143,14 @@ class Broker:
             except Exception as e:
                 log.warning(f"Error checking entry status: {e}")
         
+        # Reduce exit qty by 0.1% to account for Alpaca fee/rounding edge cases
+        # This prevents "insufficient balance" errors when placing exit orders
+        exit_qty = round(filled_qty * 0.999, 8)
+        log.info(f"CRYPTO EXIT QTY: {symbol} filled={filled_qty} exit_qty={exit_qty} (0.1% buffer)")
+
         # Exit side (opposite of entry)
         exit_side = "sell" if side == "buy" else "buy"
-        
+
         tp_order_id = None
         sl_order_id = None
 
@@ -145,7 +158,7 @@ class Broker:
         try:
             tp_order = self.api.submit_order(
                 symbol=symbol,
-                qty=filled_qty,
+                qty=exit_qty,
                 side=exit_side,
                 type="limit",
                 limit_price=tp_price,
@@ -153,23 +166,26 @@ class Broker:
                 client_order_id=f"{client_id}_tp"
             )
             tp_order_id = tp_order.id
-            log.info(f"CRYPTO TP order placed: {exit_side} {filled_qty} {symbol} @ ${tp_price}")
+            log.info(f"CRYPTO TP order placed: {exit_side} {exit_qty} {symbol} @ ${tp_price}")
         except Exception as e:
             log.error(f"Failed to place crypto TP order: {e}")
 
-        # Stop-loss order
+        # Stop-loss order — Alpaca crypto requires stop_limit (plain stop not supported)
+        # Limit price is set 0.3% beyond the stop to ensure fill after trigger
         try:
+            sl_limit = round(sl_price * (0.997 if exit_side == "sell" else 1.003), 2)
             sl_order = self.api.submit_order(
                 symbol=symbol,
-                qty=filled_qty,
+                qty=exit_qty,
                 side=exit_side,
-                type="stop",
+                type="stop_limit",
                 stop_price=sl_price,
+                limit_price=sl_limit,
                 time_in_force="gtc",
                 client_order_id=f"{client_id}_sl"
             )
             sl_order_id = sl_order.id
-            log.info(f"CRYPTO SL order placed: {exit_side} {filled_qty} {symbol} @ ${sl_price}")
+            log.info(f"CRYPTO SL order placed: {exit_side} {exit_qty} {symbol} @ ${sl_price}")
         except Exception as e:
             log.error(f"Failed to place crypto SL order: {e}")
 
@@ -179,7 +195,7 @@ class Broker:
                 self._crypto_exit_orders[symbol] = {
                     "tp_order_id": tp_order_id,
                     "sl_order_id": sl_order_id,
-                    "qty": filled_qty,
+                    "qty": exit_qty,
                     "entry_side": side
                 }
 
@@ -191,9 +207,10 @@ class Broker:
         This should be called periodically (e.g., in coordinator cycle) to
         implement manual OCO behavior for crypto positions.
         """
+        filled_exits = {}  # {symbol: reason} — returned to coordinator for trade recording
         with self._crypto_lock:
             symbols_to_remove = []
-            
+
             for symbol, orders in self._crypto_exit_orders.items():
                 tp_id = orders.get("tp_order_id")
                 sl_id = orders.get("sl_order_id")
@@ -232,22 +249,26 @@ class Broker:
                         log.info(f"CRYPTO OCO: Cancelled SL for {symbol} (TP filled)")
                     except Exception as e:
                         log.warning(f"Failed to cancel SL after TP fill: {e}")
+                    filled_exits[symbol] = "take_profit"
                     symbols_to_remove.append(symbol)
-                    
+
                 elif sl_filled and tp_id:
                     try:
                         self.api.cancel_order(tp_id)
                         log.info(f"CRYPTO OCO: Cancelled TP for {symbol} (SL filled)")
                     except Exception as e:
                         log.warning(f"Failed to cancel TP after SL fill: {e}")
+                    filled_exits[symbol] = "stop_loss"
                     symbols_to_remove.append(symbol)
-                
+
                 # Clean up if both orders are gone
                 elif not orders.get("tp_order_id") and not orders.get("sl_order_id"):
                     symbols_to_remove.append(symbol)
-            
+
             for symbol in symbols_to_remove:
                 self._crypto_exit_orders.pop(symbol, None)
+
+        return filled_exits  # {symbol: "take_profit"|"stop_loss"}
     
     def cancel_crypto_exit_orders(self, symbol: str):
         """Cancel any pending TP/SL orders for a crypto position."""

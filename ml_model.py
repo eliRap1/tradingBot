@@ -41,7 +41,7 @@ BIAS_MAP = {"bullish": 2, "neutral": 1, "bearish": 0}
 
 
 class MLMetaModel:
-    def __init__(self, min_trades: int = 50):
+    def __init__(self, min_trades: int = 20):
         self.min_trades = min_trades
         self.model = None
         self._load_model()

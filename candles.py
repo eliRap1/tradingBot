@@ -150,9 +150,12 @@ def _is_hammer(o, h, l, c, i):
     r = _candle_range(h, l, i)
     if r == 0 or body == 0:
         return False
+    # Body must be in top 40% of range (strong close after rejection)
+    body_pos = (min(o[i], c[i]) - l[i]) / r
     return (lower >= body * 2 and
             upper <= body * 0.5 and
-            body / r >= 0.1)
+            body / r >= 0.1 and
+            body_pos >= 0.60)
 
 
 def _is_shooting_star(o, h, l, c, i):
@@ -166,9 +169,12 @@ def _is_shooting_star(o, h, l, c, i):
     r = _candle_range(h, l, i)
     if r == 0 or body == 0:
         return False
+    # Body must be in bottom 40% of range (weak close after rejection)
+    body_pos = (h[i] - max(o[i], c[i])) / r
     return (upper >= body * 2 and
             lower <= body * 0.5 and
-            body / r >= 0.1)
+            body / r >= 0.1 and
+            body_pos >= 0.60)
 
 
 def _is_dragonfly_doji(o, h, l, c, i):
@@ -273,9 +279,11 @@ def _is_morning_star(o, h, l, c):
     if body1 / r1 < 0.4:
         return False
 
-    # Candle 2: small body (star)
+    # Candle 2: small body (star) — must gap down from candle 1
     body2 = _body(o, c, -2)
     if body2 > body1 * 0.5:
+        return False
+    if o[-2] > l[-3]:  # candle 2 must open at/below candle 1 low
         return False
 
     # Candle 3: bullish, closes at least halfway into candle 1
@@ -304,6 +312,8 @@ def _is_evening_star(o, h, l, c):
 
     body2 = _body(o, c, -2)
     if body2 > body1 * 0.5:
+        return False
+    if o[-2] < h[-3]:  # candle 2 must open at/above candle 1 high
         return False
 
     if not _is_bearish(o, c, -1):

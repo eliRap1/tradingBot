@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import ta
 from indicators import rvol
-from candles import detect_patterns, bullish_score, bearish_score
+
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -93,10 +93,6 @@ class MomentumStrategy:
         current_roc = roc.iloc[-1]
         roc_accel = roc.iloc[-1] - roc.iloc[-3] if len(roc) > 3 else 0
 
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
-
         vol_ratio = rvol(df)
         vol_confirmed = vol_ratio > 1.3
         vol_surge = vol_ratio > 2.0
@@ -132,10 +128,6 @@ class MomentumStrategy:
                 long_score += 0.12
             if roc_accel > 1:
                 long_score += 0.10
-
-            if long_score > 0.1:
-                long_score += candle_bull * 0.20
-            long_score -= candle_bear * 0.15
 
             if vol_surge:
                 long_score *= 1.30
@@ -183,10 +175,6 @@ class MomentumStrategy:
                 short_score -= 0.12
             if roc_accel < -1:
                 short_score -= 0.10
-
-            if short_score < -0.1:
-                short_score -= candle_bear * 0.20
-            short_score += candle_bull * 0.15
 
             if vol_surge:
                 short_score *= 1.30

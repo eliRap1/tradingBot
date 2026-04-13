@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import ta
 from indicators import rvol, vwap_bands
-from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context
 from utils import setup_logger
 
@@ -94,10 +93,6 @@ class MeanReversionStrategy:
         rsi_recovering = current_rsi > prev_rsi and prev_rsi < 35
         rsi_declining = current_rsi < prev_rsi and prev_rsi > 65
 
-        patterns = detect_patterns(df)
-        candle_bull = bullish_score(patterns)
-        candle_bear = bearish_score(patterns)
-
         vol_ratio = rvol(df)
         vol_spike = vol_ratio > 1.5
 
@@ -114,12 +109,6 @@ class MeanReversionStrategy:
             long_score += 0.15
         elif rsi_recovering:
             long_score += 0.2
-
-        if long_score > 0.1:
-            if candle_bull > 0.2:
-                long_score += candle_bull * 0.25
-            else:
-                long_score *= 0.6  # No reversal candle = weak
 
         if long_score > 0.1 and vol_spike:
             long_score += 0.1
@@ -151,13 +140,6 @@ class MeanReversionStrategy:
             short_score -= 0.15
         elif rsi_declining:
             short_score -= 0.2  # Falling from overbought
-
-        # Bearish reversal candle confirmation
-        if short_score < -0.1:
-            if candle_bear > 0.2:
-                short_score -= candle_bear * 0.25
-            else:
-                short_score *= 0.6  # No reversal candle = weak
 
         if short_score < -0.1 and vol_spike:
             short_score -= 0.1

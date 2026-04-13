@@ -17,7 +17,17 @@
       "Bash(sort -t/ -k6)",
       "Bash(timeout 120)",
       "Bash(echo \"EXIT_CODE=$?\")",
-      "Bash(pip show:*)"
+      "Bash(pip show:*)",
+      "Bash(awk ':*)",
+      "WebSearch",
+      "Bash(grep -r \"TODO\\\\|BUG\\\\|FIXME\\\\|XXX\\\\|HACK\" /c/Users/eli08/Videos/tradingBot/*.py)",
+      "Bash(python3 -m py_compile C:/Users/eli08/Videos/tradingBot/alerts.py)",
+      "Bash(pandoc \"D:/Users/Downloads/Eval_Int_Async_DB_02052024.docx\" -t plain)",
+      "Bash(pandoc \"D:/Users/Downloads/web-services-asynchronous-programming-and-databases-Project.docx\" -t plain)",
+      "Read(//d/Users/**)",
+      "Read(//c/Users/eli08/**)",
+      "Bash(node gen_sefer.js)",
+      "Bash(npm install:*)"
     ]
   }
 }

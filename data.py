@@ -6,7 +6,10 @@ from utils import setup_logger
 
 log = setup_logger("data")
 
-CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
+CRYPTO_SYMBOLS = {
+    "BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "LINK/USD", "DOGE/USD",
+    "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "LINKUSD", "DOGEUSD",
+}
 
 
 def _normalize_crypto(symbol: str) -> str:
@@ -18,71 +21,65 @@ def _normalize_crypto(symbol: str) -> str:
 
 class DataFetcher:
     """Data fetching with rate limiting and exponential backoff.
-    
-    Alpaca limits: 200 requests/min for free tier, higher for paid.
-    We implement a token bucket rate limiter + exponential backoff on failures.
+
+    Alpaca free tier: ~60 requests/min.
+    Global semaphore limits concurrent requests across all watcher threads.
     """
-    
-    def __init__(self, broker, requests_per_minute: int = 150):
+
+    # Global semaphore — max 2 concurrent API calls
+    _global_semaphore = threading.Semaphore(2)
+    # Minimum gap between any two API calls (seconds)
+    _min_interval = 2.0
+    _last_call_time = 0.0
+    _call_lock = threading.Lock()
+
+    def __init__(self, broker, requests_per_minute: int = 40):
         self.api = broker.api
-        
-        # Rate limiter: token bucket
         self._rate_limit = requests_per_minute
-        self._tokens = requests_per_minute
-        self._last_refill = time.time()
-        self._lock = threading.Lock()
-    
+        # Intraday bar cache: {(symbol, timeframe): (timestamp, DataFrame)}
+        self._intraday_cache: dict[tuple, tuple[float, pd.DataFrame]] = {}
+        self._cache_lock = threading.Lock()
+        self._cache_ttl = 360  # 6 minutes — slightly longer than the 5min cycle
+
     def _wait_for_rate_limit(self):
-        """Block until a request token is available."""
-        with self._lock:
+        """Enforce minimum interval between API calls globally."""
+        with DataFetcher._call_lock:
             now = time.time()
-            elapsed = now - self._last_refill
-            
-            # Refill tokens based on elapsed time
-            refill = elapsed * (self._rate_limit / 60.0)
-            self._tokens = min(self._rate_limit, self._tokens + refill)
-            self._last_refill = now
-            
-            if self._tokens < 1:
-                # Wait until we have a token
-                wait_time = (1 - self._tokens) * (60.0 / self._rate_limit)
-                time.sleep(wait_time)
-                self._tokens = 1
-            
-            self._tokens -= 1
+            gap = now - DataFetcher._last_call_time
+            if gap < DataFetcher._min_interval:
+                time.sleep(DataFetcher._min_interval - gap)
+            DataFetcher._last_call_time = time.time()
     
     def _api_call_with_retry(self, func, *args, max_retries: int = 3, **kwargs):
-        """Execute API call with exponential backoff on failure."""
-        for attempt in range(max_retries):
+        """Execute API call with global semaphore + exponential backoff."""
+        with DataFetcher._global_semaphore:
+            for attempt in range(max_retries):
+                self._wait_for_rate_limit()
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    error_str = str(e).lower()
+
+                    if "rate" in error_str or "429" in error_str or "too many" in error_str:
+                        backoff = min(60, 2 ** attempt * 10)  # 10s, 20s, 40s
+                        log.warning(f"Rate limit hit, backing off {backoff}s: {e}")
+                        time.sleep(backoff)
+                    elif "500" in error_str or "502" in error_str or "503" in error_str:
+                        backoff = 2 ** attempt
+                        log.warning(f"Server error, retry in {backoff}s: {e}")
+                        time.sleep(backoff)
+                    else:
+                        raise e
+
+            # Final attempt
             self._wait_for_rate_limit()
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                error_str = str(e).lower()
-                
-                # Rate limit error - back off significantly
-                if "rate" in error_str or "429" in error_str or "too many" in error_str:
-                    backoff = min(60, 2 ** attempt * 5)  # 5s, 10s, 20s, max 60s
-                    log.warning(f"Rate limit hit, backing off {backoff}s: {e}")
-                    time.sleep(backoff)
-                # Server error - retry with backoff
-                elif "500" in error_str or "502" in error_str or "503" in error_str:
-                    backoff = 2 ** attempt
-                    log.warning(f"Server error, retry in {backoff}s: {e}")
-                    time.sleep(backoff)
-                # Other errors - don't retry
-                else:
-                    raise e
-        
-        # Final attempt without catching
-        self._wait_for_rate_limit()
-        return func(*args, **kwargs)
+            return func(*args, **kwargs)
 
     def get_bars(self, symbols: list[str], timeframe: str = "1Day",
                  days: int = 60) -> dict[str, pd.DataFrame]:
         """Fetch historical bars for multiple symbols with rate limiting."""
         # Normalize crypto symbols to slash format for Alpaca API
-        symbols = [_normalize_crypto(s) for s in symbols]
+        symbols = [_normalize_crypto(s) for s in symbols if isinstance(s, str)]
         end = datetime.now()
         start = end - timedelta(days=days)
 
@@ -93,8 +90,8 @@ class DataFetcher:
         bars = {}
         time_fmt = "%Y-%m-%dT%H:%M:%SZ" if "Min" in timeframe else "%Y-%m-%d"
 
-        # Fetch stock bars with rate limiting
-        batch_size = 20
+        # Fetch stock bars in batches of 30 with delays to avoid rate limits
+        batch_size = 30
         for i in range(0, len(stock_symbols), batch_size):
             batch = stock_symbols[i:i + batch_size]
             try:
@@ -120,8 +117,10 @@ class DataFetcher:
                         "volume": int(bar.v),
                         "vwap": float(bar.vw) if hasattr(bar, "vw") else None,
                     })
+                if i + batch_size < len(stock_symbols):
+                    time.sleep(3)
             except Exception as e:
-                log.error(f"Failed to fetch bars for {batch}: {e}")
+                log.error(f"Failed to fetch bars for batch {batch}: {e}")
 
         # Fetch crypto bars with rate limiting
         for sym in crypto_symbols:
@@ -159,11 +158,48 @@ class DataFetcher:
         log.info(f"Fetched {timeframe} bars for {len(result)}/{len(symbols)} symbols")
         return result
 
+    # Per-timeframe cache TTLs
+    _CACHE_TTLS = {"5Min": 360, "1Hour": 3600, "1Day": 14400}
+
     def get_intraday_bars(self, symbol: str, timeframe: str = "5Min",
                           days: int = 5) -> pd.DataFrame | None:
-        """Fetch intraday bars for a single symbol."""
+        """Fetch bars, returning cached data if fresh. TTL varies by timeframe."""
+        ttl = self._CACHE_TTLS.get(timeframe, self._cache_ttl)
+        key = (symbol, timeframe)
+        with self._cache_lock:
+            if key in self._intraday_cache:
+                cached_time, cached_df = self._intraday_cache[key]
+                if time.time() - cached_time < ttl:
+                    return cached_df
+
         result = self.get_bars([symbol], timeframe=timeframe, days=days)
-        return result.get(symbol)
+        df = result.get(symbol)
+        if df is not None:
+            with self._cache_lock:
+                self._intraday_cache[key] = (time.time(), df)
+        return df
+
+    def prime_intraday_cache(self, symbols: list[str], timeframe: str = "5Min",
+                              days: int = 5):
+        """Bulk-fetch bars for all symbols at once and populate cache.
+        Call this once per coordinator cycle instead of letting each watcher fetch independently."""
+        ttl = self._CACHE_TTLS.get(timeframe, self._cache_ttl)
+        now = time.time()
+        with self._cache_lock:
+            # Skip symbols already cached and fresh
+            stale = [s for s in symbols
+                     if (s, timeframe) not in self._intraday_cache
+                     or now - self._intraday_cache[(s, timeframe)][0] >= ttl]
+
+        if not stale:
+            return  # All symbols already fresh in cache
+
+        result = self.get_bars(stale, timeframe=timeframe, days=days)
+        now = time.time()
+        with self._cache_lock:
+            for sym, df in result.items():
+                self._intraday_cache[(sym, timeframe)] = (now, df)
+        log.info(f"Cache primed ({timeframe}): {len(result)}/{len(stale)} symbols")
 
     def get_latest_price(self, symbol: str) -> float | None:
         try:
