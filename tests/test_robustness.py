@@ -184,7 +184,7 @@ class TestFullPipeline:
         for name, strat in strategies.items():
             all_signals[name] = strat.generate_signals({"TEST": bars})
 
-        weights = {n: config["strategies"][n]["weight"]
+        weights = {n: config["strategies"].get(n, {}).get("weight", 0.20)
                    for n in ALL_STRATEGIES}
 
         opps = aggregate_signals(

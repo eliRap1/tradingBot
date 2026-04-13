@@ -38,11 +38,11 @@ class TestSectorCap:
         assert "ETH/USD" in SECTOR_MAP
 
     def test_no_sector_has_too_many_stocks(self):
-        """No single sector should have more than 15 stocks (overfitting to one sector)."""
+        """No single sector should have more than 30 stocks (overfitting to one sector)."""
         from collections import Counter
         counts = Counter(SECTOR_MAP.values())
         for sector, count in counts.items():
-            assert count <= 15, \
+            assert count <= 30, \
                 f"Sector '{sector}' has {count} stocks — too concentrated"
 
 

@@ -235,6 +235,9 @@ strategies:
     min_confluence: 3            # need 3+ confirming factors to fire
     weight: 0.20                 # higher weight — sweeps are high-probability
 
+  futures_trend:
+    weight: 0.30                 # futures-only: ORB + session VWAP + ADX + ATR gate
+
 signals:
   min_composite_score: 0.25        # Restored — 0.20 lets too many marginal signals through
   max_positions: 10                # Balanced (12 × 10% = 120% exposure was too high)
