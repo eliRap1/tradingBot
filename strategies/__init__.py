@@ -6,6 +6,7 @@ from .stoch_rsi import StochRSIStrategy
 from .vwap_reclaim import VWAPReclaimStrategy
 from .gap import GapStrategy
 from .liquidity_sweep import LiquiditySweepStrategy
+from .futures_trend import FuturesTrendStrategy
 
 ALL_STRATEGIES = {
     "momentum": MomentumStrategy,
@@ -16,4 +17,5 @@ ALL_STRATEGIES = {
     "vwap_reclaim": VWAPReclaimStrategy,
     "gap": GapStrategy,
     "liquidity_sweep": LiquiditySweepStrategy,
+    "futures_trend": FuturesTrendStrategy,
 }
