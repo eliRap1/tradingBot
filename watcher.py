@@ -70,7 +70,8 @@ class StockWatcher:
     """
 
     def __init__(self, symbol: str, config: dict, data_fetcher,
-                 interval: int = 60, sector_regime_getter=None):
+                 interval: int = 60, sector_regime_getter=None,
+                 strategies: dict | None = None):
         self.symbol = symbol
         self.config = config
         self.data = data_fetcher
@@ -79,10 +80,20 @@ class StockWatcher:
         self.log = setup_logger(f"watcher.{symbol}")
         self._sector_regime_getter = sector_regime_getter
 
-        # Initialize strategy instances (one per watcher)
-        self.strategies = {
-            name: cls(config) for name, cls in ALL_STRATEGIES.items()
-        }
+        # Initialize strategy instances (one per watcher).
+        # If strategies dict provided (from StrategyRouter), instantiate only those.
+        # Otherwise fall back to all strategies for backward compat.
+        if strategies is not None:
+            self.strategies = {
+                name: cls(config) for name, cls in ALL_STRATEGIES.items()
+                if name in strategies
+            }
+        else:
+            self.strategies = {
+                name: cls(config) for name, cls in ALL_STRATEGIES.items()
+            }
+        # Weight overrides from StrategyRouter (None = use select_strategies())
+        self._strategy_weights_override = strategies
 
         self._thread = None
         self._stop_event = threading.Event()
@@ -191,7 +202,15 @@ class StockWatcher:
                     _sector_reg = self._sector_regime_getter(_sector_label)
             except Exception:
                 _sector_reg = None
-        selection = select_strategies(daily_df, self.symbol, sector_regime=_sector_reg)
+        if self._strategy_weights_override is not None:
+            # StrategyRouter provided weights — bypass select_strategies
+            selection = {
+                "regime": "router_assigned",
+                "reason": "StrategyRouter per-instrument weights",
+                "strategies": self._strategy_weights_override,
+            }
+        else:
+            selection = select_strategies(daily_df, self.symbol, sector_regime=_sector_reg)
         self.state.regime = selection["regime"]
         self.state.regime_reason = selection["reason"]
         self.state.strategy_weights = selection["strategies"]

@@ -298,6 +298,32 @@ sector_regime:
   enabled: true           # set false to disable sector layer entirely
   cache_ttl_sec: 900      # how long to cache sector ETF results (15 min)
 
+ib:
+  host: "127.0.0.1"
+  port: 4002
+  client_id: 1
+  timeout_sec: 10
+
+futures:
+  contracts:
+    - root: NQ
+      exchange: CME
+      description: "E-mini Nasdaq-100"
+    - root: ES
+      exchange: CME
+      description: "E-mini S&P 500"
+    - root: CL
+      exchange: NYMEX
+      description: "Crude Oil WTI"
+    - root: GC
+      exchange: COMEX
+      description: "Gold"
+  risk:
+    stop_loss_atr_mult: 1.5       # tighter ATR stops for futures (tick-based)
+    take_profit_atr_mult: 3.0
+    min_risk_reward: 2.0
+    max_position_pct: 0.05        # 5% per futures position (higher notional)
+
 optimization:
   train_days: 180
   test_days: 60

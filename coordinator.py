@@ -16,9 +16,15 @@ import threading
 from datetime import datetime
 
 from utils import load_config, setup_logger
-from broker import Broker, CRYPTO_SYMBOLS
+from alpaca_broker import AlpacaBroker, CRYPTO_SYMBOLS
+from alpaca_data import AlpacaDataFetcher
+from ib_broker import IBBroker
+from ib_data import IBDataFetcher
+from routing_broker import RoutingBroker
+from routing_data import RoutingDataFetcher
+from instrument_classifier import InstrumentClassifier
+from strategy_router import StrategyRouter
 from portfolio import _normalize_symbol
-from data import DataFetcher
 from screener import Screener
 from risk import RiskManager
 from portfolio import PortfolioManager
@@ -53,8 +59,23 @@ class Coordinator:
         # Apply optimized parameters if available
         self.config = apply_optimized_params(self.config)
         
-        self.broker = Broker(self.config)
-        self.data = DataFetcher(self.broker)
+        # Build broker abstraction layer
+        self._alpaca_broker = AlpacaBroker(self.config)
+        self._ib_broker = IBBroker(self.config)
+        self._clf = InstrumentClassifier(self.config)
+        self.broker = RoutingBroker(self._ib_broker, self._alpaca_broker, self._clf)
+
+        # Build data abstraction layer
+        self._alpaca_data = AlpacaDataFetcher(self._alpaca_broker)
+        self._ib_data = IBDataFetcher(
+            self._ib_broker._ib,
+            self._ib_broker._contracts,
+            self.config
+        )
+        self.data = RoutingDataFetcher(self._alpaca_data, self._ib_data, self._clf)
+
+        # Strategy router — assigns optimal strategy set per instrument type
+        self._strategy_router = StrategyRouter(self.config)
         self.screener = Screener(self.config, self.data)
         self.risk = RiskManager(self.config)
         self.portfolio = PortfolioManager(self.config, self.broker)
@@ -89,11 +110,12 @@ class Coordinator:
         self._order_timestamps: list[float] = []
 
         # Verify connection and show market status
-        account = self.broker.get_account()
-        equity = float(account.equity)
+        equity = self.broker.get_equity()
+        cash = self.broker.get_cash()
+        buying_power = self.broker.get_buying_power()
         log.info(f"Account: equity=${equity:,.2f} "
-                 f"cash=${float(account.cash):,.2f} "
-                 f"buying_power=${float(account.buying_power):,.2f}")
+                 f"cash=${cash:,.2f} "
+                 f"buying_power=${buying_power:,.2f}")
         self.risk.peak_equity = max(self.risk.peak_equity, equity)
         self.risk.set_starting_equity(equity)
         
@@ -105,7 +127,7 @@ class Coordinator:
             log.info(f"Next market open: {market_status.next_open}")
 
     def start_watchers(self, crypto_only: bool = False):
-        """Spawn a watcher thread for each stock/crypto in the universe."""
+        """Spawn a watcher thread for each stock/crypto/futures in the universe."""
         if crypto_only:
             universe = self.config["screener"].get("crypto", [])
         else:
@@ -115,6 +137,9 @@ class Coordinator:
                 universe = self.config["screener"]["universe"]
             # Add crypto symbols
             universe = list(universe) + self.config["screener"].get("crypto", [])
+            # Add futures roots (NQ, ES, CL, GC)
+            futures_roots = [c["root"] for c in self.config.get("futures", {}).get("contracts", [])]
+            universe = list(universe) + futures_roots
             # Deduplicate (preserves order) — fixes duplicate AMZN etc.
             universe = list(dict.fromkeys(universe))
 
@@ -126,6 +151,8 @@ class Coordinator:
 
         for sym in universe:
             if sym not in self.watchers:
+                instrument_type = self._clf.classify(sym)
+                strat_weights = self._strategy_router.get_strategies(instrument_type)
                 watcher = StockWatcher(
                     symbol=sym,
                     config=self.config,
@@ -135,6 +162,7 @@ class Coordinator:
                         self.sector_regime.get_regime_for_sector
                         if self._sector_regime_enabled and self.sector_regime else None
                     ),
+                    strategies=strat_weights,
                 )
                 self.watchers[sym] = watcher
                 watcher.start()
@@ -143,10 +171,10 @@ class Coordinator:
         log.info(f"All {len(self.watchers)} watchers running")
 
     def stop_watchers(self, stocks_only: bool = False):
-        """Stop watcher threads. If stocks_only, keep crypto running."""
+        """Stop watcher threads. If stocks_only, keep crypto and futures running."""
         if stocks_only:
-            log.info("Stopping stock watchers (crypto continues)...")
-            to_stop = [s for s in self.watchers if s not in CRYPTO_SYMBOLS]
+            log.info("Stopping stock watchers (crypto + futures continue)...")
+            to_stop = [s for s in self.watchers if self._clf.classify(s) == "stock"]
             for sym in to_stop:
                 self.watchers[sym].stop()
                 del self.watchers[sym]
@@ -166,16 +194,16 @@ class Coordinator:
                 clock = self.broker.get_clock()
 
                 if not clock.is_open:
-                    # Stop stock watchers ONCE, keep crypto running
+                    # Stop stock watchers ONCE, keep crypto + futures running
                     has_stock_watchers = any(
-                        s not in CRYPTO_SYMBOLS for s in self.watchers
+                        self._clf.classify(s) == "stock" for s in self.watchers
                     )
                     if has_stock_watchers:
                         self.stop_watchers(stocks_only=True)
 
                     # Start crypto watchers if not already running
                     crypto_running = any(
-                        s in CRYPTO_SYMBOLS for s in self.watchers
+                        self._clf.classify(s) in ("crypto", "futures") for s in self.watchers
                     )
                     if not crypto_running:
                         self.start_watchers(crypto_only=True)
@@ -263,7 +291,7 @@ class Coordinator:
 
                 # Start all watchers if not running
                 has_stock_watchers = any(
-                    s not in CRYPTO_SYMBOLS for s in self.watchers
+                    self._clf.classify(s) == "stock" for s in self.watchers
                 )
                 if not has_stock_watchers:
                     self.start_watchers()
@@ -463,10 +491,10 @@ class Coordinator:
                 positions = self.portfolio.get_current_positions()
                 held_symbols = list(positions.keys())
 
-        # 4. Check position capacity (crypto has separate slots)
+        # 4. Check position capacity (crypto has separate slots; futures share stock pool)
         max_pos = self.config["signals"]["max_positions"]
-        stock_positions = [s for s in held_symbols if s not in CRYPTO_SYMBOLS]
-        crypto_positions = [s for s in held_symbols if s in CRYPTO_SYMBOLS]
+        stock_positions = [s for s in held_symbols if self._clf.classify(s) != "crypto"]
+        crypto_positions = [s for s in held_symbols if self._clf.classify(s) == "crypto"]
         max_crypto = self.config["signals"].get("max_crypto_positions", 2)
         stocks_full = len(stock_positions) >= max_pos
         crypto_full = len(crypto_positions) >= max_crypto
@@ -488,7 +516,8 @@ class Coordinator:
                 continue
 
             # Crypto is NOT gated by SPY regime — it trades independently
-            is_crypto = sym in CRYPTO_SYMBOLS
+            # Futures DO correlate with SPY so they are gated by regime
+            is_crypto = self._clf.classify(sym) == "crypto"
 
             if watcher.state.action == Action.BUY:
                 if not is_crypto and not regime["allow_longs"]:
@@ -604,7 +633,7 @@ class Coordinator:
         # Filter by available slots per type
         executable = []
         for w in filtered:
-            is_crypto = w.symbol in CRYPTO_SYMBOLS
+            is_crypto = self._clf.classify(w.symbol) == "crypto"
             if is_crypto and crypto_slots > 0:
                 executable.append(w)
                 crypto_slots -= 1
@@ -646,7 +675,7 @@ class Coordinator:
             if "stale" in price_status or "closed" in price_status:
                 log.warning(f"Price issue for {sym}: {price_status}")
                 # For crypto, continue anyway (24/7 trading)
-                if sym not in CRYPTO_SYMBOLS:
+                if self._clf.classify(sym) not in ("crypto", "futures"):
                     continue
 
             # Apply correlation-adjusted sizing
@@ -686,7 +715,7 @@ class Coordinator:
                 try:
                     use_smart = self.config.get("execution", {}).get("smart_orders", False)
 
-                    if order.symbol in CRYPTO_SYMBOLS:
+                    if self._clf.classify(order.symbol) == "crypto":
                         self.broker.submit_crypto_order(
                             symbol=order.symbol,
                             qty=order.qty,
