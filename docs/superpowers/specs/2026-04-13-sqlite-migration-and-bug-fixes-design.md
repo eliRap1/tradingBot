@@ -1,19 +1,29 @@
-# Design Spec: SQLite State Migration + Critical Bug Fixes
+# Design Spec: SQLite State Migration + Full Bug Fix Pass
 **Date:** 2026-04-13  
 **Status:** Approved  
-**Scope:** Full SQLite state migration, three missing PortfolioManager methods, IB bracket order fix, CRYPTO_SYMBOLS fix, ML + regime hardening
+**Scope:** Full SQLite state migration, all missing PortfolioManager methods, IB bracket order fix,
+CRYPTO_SYMBOLS fix, ML feature/leakage fix, HMM caching, breadth sampling, bear veto (correct location),
+dead-code removal, regime label fix, live_trading crypto set.
 
 ---
 
-## Background
+## Complete Bug Inventory
 
-The bot has three missing methods in `PortfolioManager` (`set_position_risk`, `_save_meta`, `_save_watermarks`) that are called throughout the coordinator but never defined. This causes:
-- `initial_risk` always 0.0 → partial exits (1.2R / 2.5R) never fire
-- `position_meta` changes never persisted to disk → all position state lost on restart
-- Watermarks reset on restart → chandelier trailing stop restarts from scratch
-- Strategy attribution always `[]` → ML model has no training signal
-
-Additionally, the IB `bracketOrder` call has incorrect parameter usage, and `CRYPTO_SYMBOLS` is imported from the Alpaca-era module (includes SOL/AVAX/LINK/DOGE not available on IB PAXOS).
+| Priority | Bug | File | Impact |
+|----------|-----|------|--------|
+| P0 | `set_position_risk` not defined | `portfolio.py` | `initial_risk=0` → partials never fire |
+| P0 | `_save_meta` not defined | `portfolio.py` | Meta lost on every restart |
+| P0 | `_save_watermarks` not defined | `portfolio.py` | Watermarks reset → trailing stop restarts |
+| P0 | `bracketOrder` missing `takeProfitPrice` | `ib_broker.py` | TP leg malformed / TypeError silently caught |
+| P0 | ML train/predict feature mismatch + leakage | `ml_model.py` | Model produces garbage predictions |
+| P1 | `CRYPTO_SYMBOLS` from Alpaca (SOL/AVAX/LINK/DOGE) | `portfolio.py`, `watcher.py`, `risk.py` | Wrong crypto set for IB |
+| P1 | Bear veto in wrong file (bypassed by StrategyRouter) | `strategy_selector.py` | Veto never fires |
+| P1 | HMM refit every 5-minute cycle | `regime.py` | Slow + non-deterministic results |
+| P1 | Breadth sample always first 20 symbols (all tech) | `regime.py` | Misleading breadth signal |
+| P2 | `SmartFilters.filter_confirmed` dead code | `filters.py` | Wasted disk writes each cycle |
+| P2 | `_classify_symbol` includes non-IB crypto | `live_trading.py` | Wrong tradability classification |
+| P2 | `"breakdown"` regime value undocumented | `strategy_selector.py` | Inconsistent regime string |
+| P3 | Duplicate `"regime"` key in dict | `coordinator.py:891` | Cosmetic — second overwrites first |
 
 ---
 
@@ -21,7 +31,8 @@ Additionally, the IB `bracketOrder` call has incorrect parameter usage, and `CRY
 
 ### New File: `state_db.py`
 
-Single `StateDB` class. One `bot_state.db` SQLite file. All writes go through a `threading.Lock()`. Replaces `state.json`, `trades.json`, `watcher_pending.json`.
+Single `StateDB` class. One `bot_state.db` SQLite file. All writes go through a `threading.Lock()`.
+Replaces `state.json`, `trades.json`, `watcher_pending.json`.
 
 **Tables:**
 
@@ -64,7 +75,7 @@ CREATE TABLE IF NOT EXISTS trades (
 
 CREATE TABLE IF NOT EXISTS bot_state (
     key TEXT PRIMARY KEY,
-    value TEXT             -- JSON-encoded value
+    value TEXT              -- JSON-encoded value
 );
 
 CREATE TABLE IF NOT EXISTS pending_signals (
@@ -103,28 +114,40 @@ On `StateDB.__init__`, if `state.json` or `trades.json` or `watcher_pending.json
 ### `state_db.py` (new)
 Full `StateDB` implementation as described above.
 
-### `portfolio.py`
+---
+
+### `portfolio.py` — P0 fixes (3 missing methods)
+
 - Import `StateDB` from `state_db`; instantiate as `self.db = StateDB()`
 - Add `set_position_risk(symbol, entry_price, stop_loss, qty)`:
   ```python
   initial_risk = abs(entry_price - stop_loss) * qty
-  self.db.upsert_position(symbol, initial_risk=initial_risk, entry_price=entry_price, original_qty=qty)
+  self.db.upsert_position(symbol, initial_risk=initial_risk,
+                          entry_price=entry_price, original_qty=qty)
   self.position_meta.setdefault(symbol, {})["initial_risk"] = initial_risk
   ```
-- Add `_save_meta()`: upserts all `self.position_meta` entries to `positions` table
-- Add `_save_watermarks()`: upserts all `self.high_watermarks` / `self.low_watermarks` to `watermarks` table
-- `__init__`: load `position_meta`, `high_watermarks`, `low_watermarks` from SQLite instead of `state.json`
+- Add `_save_meta()`: iterates `self.position_meta`, calls `self.db.upsert_position` for each entry
+- Add `_save_watermarks()`: iterates `self.high_watermarks` / `self.low_watermarks`, calls `self.db.upsert_watermark`
+- `__init__`: load `position_meta`, `high_watermarks`, `low_watermarks` from SQLite (via `StateDB`) instead of `state.json`
 - `execute_exits` → `record_trade` writes to `trades` table via `self.db.record_trade(...)`
-- Replace `from broker import CRYPTO_SYMBOLS` with IB-specific constant
+- Replace `from broker import CRYPTO_SYMBOLS` → `from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS`
 
-### `ib_broker.py`
-Fix `submit_order` bracket logic. Replace `self._ib.bracketOrder(...)` with manual market + OCO children using correct `parentId` chaining:
+---
+
+### `ib_broker.py` — P0 bracket order fix
+
+Replace `self._ib.bracketOrder(...)` with manual market + OCO children using correct `parentId` chaining.
+The current call passes `limitPrice=req.take_profit` as the parent's entry price (wrong) and omits the
+required `takeProfitPrice` positional argument (raises TypeError caught silently by coordinator's
+`except Exception`).
+
+Correct implementation:
 ```python
 from ib_insync import MarketOrder, LimitOrder, StopOrder
 
 tp_side = "SELL" if ib_side == "BUY" else "BUY"
 
-# 1. Parent market order — do NOT transmit yet
+# 1. Parent market order — transmit=False holds it until children are attached
 parent = MarketOrder(ib_side, req.qty)
 parent.transmit = False
 parent_trade = self._ib.placeOrder(contract, parent)
@@ -136,40 +159,149 @@ tp_order.parentId = parent_id
 tp_order.transmit = False
 self._ib.placeOrder(contract, tp_order)
 
-# 3. Stop-loss leg — transmit=True sends all three atomically
+# 3. Stop-loss leg — transmit=True releases all three atomically
 sl_order = StopOrder(tp_side, req.qty, req.stop_loss)
 sl_order.parentId = parent_id
 sl_order.transmit = True
 self._ib.placeOrder(contract, sl_order)
 ```
 
-### `ib_data.py` + `instrument_classifier.py`
-Add IB-specific `IB_CRYPTO_SYMBOLS` constant:
+---
+
+### `ml_model.py` — P0 feature mismatch + leakage fix
+
+**Current bugs:**
+- `_trade_to_features` uses binary 0/1 strategy flags; `_build_feature_vector` uses float scores — different feature spaces, model is miscalibrated
+- `r_multiple` is used as a training feature but is only known after the trade closes (look-ahead bias / data leakage)
+
+**Fix:** Unify both methods to use identical entry-time features only:
+```
+[strategy_score_0..7 (float), num_agreeing (int), composite_score (float)]
+```
+10 features total, all known at entry time, same type in both training and prediction.
+
+For training: strategy scores are not stored in trade records currently. After the
+`position_meta.strategies` fix lands, store scores too. Until then, use binary
+presence flags for both methods (consistent, no leakage). Remove `r_multiple` from training features entirely.
+
+---
+
+### `ib_data.py` — P1 IB-specific crypto set
+
+Add at module level:
 ```python
 IB_CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
 ```
-Export it from `ib_data.py`. Update `instrument_classifier.py` to use it.
+Export from `ib_data.py`. This is the authoritative set for IB PAXOS paper + live.
 
-### `watcher.py`
-Replace `from data import CRYPTO_SYMBOLS` with `from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS`.
+---
 
-### `portfolio.py`, `risk.py`
-Replace `from broker import CRYPTO_SYMBOLS` with `from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS`.
+### `watcher.py` — P1 CRYPTO_SYMBOLS + bear veto
+
+- Replace `from data import CRYPTO_SYMBOLS` → `from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS`
+- **Bear veto** goes here (not in `strategy_selector.py`), because `StrategyRouter` bypasses
+  `strategy_selector` entirely. After `selection["strategies"]` is determined, apply veto:
+  ```python
+  # Bear veto: in macro bear regime with strong trend, suppress long-only strategies
+  if macro_regime == "bear" and ctx["adx"] > 30:
+      for strat in ("momentum", "gap", "breakout"):
+          selection["strategies"][strat] = 0.0
+      # Re-normalize
+      total = sum(selection["strategies"].values())
+      if total > 0:
+          selection["strategies"] = {k: round(v/total, 4)
+                                     for k, v in selection["strategies"].items()}
+  ```
+  `macro_regime` is passed in from coordinator via a new optional `regime_getter` argument, or read
+  from a shared state. Simplest: pass it as a parameter to `_analyze()`.
+
+---
+
+### `risk.py` — P1 CRYPTO_SYMBOLS
+
+Replace `from broker import CRYPTO_SYMBOLS` → `from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS`
+
+---
+
+### `regime.py` — P1 HMM caching + P1 breadth fix
+
+**HMM caching:** Cache the fitted model and last-predict timestamp. Only refit when:
+- More than 60 minutes have elapsed since last fit, OR
+- A significant regime change is suspected (EMA regime changed)
+
+```python
+self._hmm_last_fit: float = 0.0
+self._hmm_refit_interval: int = 3600  # refit at most once per hour
+
+def _get_hmm_regime(self, df):
+    now = time.time()
+    needs_refit = (
+        self._hmm_model is None or
+        now - self._hmm_last_fit > self._hmm_refit_interval
+    )
+    if needs_refit:
+        # fit model, update self._hmm_model, self._hmm_last_fit = now
+        ...
+    else:
+        # just predict on existing model (fast path)
+        ...
+```
+
+**Breadth fix:** Replace `sample = self._universe[:20]` with a stratified sample:
+```python
+import random
+sample_size = min(30, len(self._universe))
+sample = random.sample(self._universe, sample_size)
+```
+This ensures sectors beyond tech are represented.
+
+---
+
+### `filters.py` — P2 dead code removal
+
+Remove `filter_confirmed()` method and the `CONFIRMATION_FILE = "pending_signals.json"` constant.
+The coordinator never calls this method — signal confirmation is handled by `watcher.state.confirmed`.
+Remove the corresponding `_load_pending` / `_save_pending` methods and the `self._pending_signals` dict.
+
+---
+
+### `live_trading.py` — P2 non-IB crypto fix
+
+Replace `_CRYPTO_SUFFIXES` in `_classify_symbol` with IB-only set:
+```python
+_CRYPTO_SUFFIXES = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
+```
+
+---
+
+### `strategy_selector.py` — P2 regime label fix
+
+Change `"regime": "breakdown"` (line 176) to `"regime": "breakout"` to match the documented
+values: `"trending" | "ranging" | "breakout" | "volatile"`.
+
+---
 
 ### `tracker.py`
-Update `record_trade` and `get_trades` to read/write from `StateDB` instead of `trades.json`.
+- Update `record_trade` and `_save` to write to `StateDB` instead of `trades.json`
+- Update `_load` to read from `StateDB.get_trades()` on init
+- Keep `TRADES_FILE` path for the migration step only
+
+---
 
 ### `state.py`
-Keep `load_state`/`save_state` for backward compat but have them delegate to `StateDB.get_state`/`set_state` for `peak_equity` and similar scalar values.
+Delegate `load_state`/`save_state` to `StateDB.get_state`/`set_state` for scalar values
+(`peak_equity`, `starting_equity`). Remove direct JSON file access.
+
+---
 
 ### `watcher.py` — pending signal persistence
-Replace `_load_pending_state` / `_save_pending_state` JSON file functions with `StateDB.get_pending_signal` / `set_pending_signal`.
+Replace `_load_pending_state` / `_save_pending_state` (currently writing to `watcher_pending.json`)
+with `StateDB.get_pending_signal` / `set_pending_signal`.
 
-### `ml_model.py`
-Reduce `min_trades` threshold from 50 → 20.
+---
 
-### `strategy_selector.py`
-Add bear-regime veto: when regime is `bear` and ADX > 30, zero out `momentum`, `gap`, `breakout` weights for long signals.
+### `coordinator.py` — P3 cosmetic
+Remove duplicate `"regime": s.regime` key at line 891-892 in `get_all_watcher_states`.
 
 ---
 
@@ -177,23 +309,28 @@ Add bear-regime veto: when regime is `bear` and ADX > 30, zero out `momentum`, `
 
 ```
 Coordinator places order
-  → ib_broker.submit_order() — fixed bracket via manual OCO
+  → ib_broker.submit_order() — fixed bracket via manual OCO (parent + TP + SL)
   → portfolio.set_position_risk() — NEW: computes initial_risk, writes to SQLite
-  → position_meta.update() — in-memory + SQLite via _save_meta()
+  → position_meta.setdefault().update() — in-memory, then _save_meta() persists to SQLite
 
 Each coordinator cycle
   → portfolio.get_current_positions() — reads broker, merges with SQLite meta
-  → portfolio.check_trailing_stops() — partial exits use initial_risk from meta
+  → portfolio.check_trailing_stops() — partial exits now work (initial_risk > 0)
   → portfolio._save_meta() / _save_watermarks() — persist to SQLite
 
-Position closed
+Position closed (trailing stop / SL / TP)
   → portfolio.execute_exits() → tracker.record_trade() → StateDB.record_trade()
-  → position deleted from positions table
+  → position row deleted from SQLite positions table
 
 Bot restart
   → StateDB.__init__() — migrates JSON if present, loads SQLite
   → portfolio.__init__() — restores position_meta, watermarks from SQLite
-  → watcher.__init__() — restores prev_signal from SQLite
+  → watcher.__init__() — restores prev_signal from SQLite pending_signals table
+  → ML model loaded from ml_model.bin (if exists)
+
+ML training cycle (every 50 coordinator cycles)
+  → ml_model.train(tracker.trades) — uses unified feature vector (no leakage)
+  → model saved to ml_model.bin
 ```
 
 ---
@@ -201,18 +338,22 @@ Bot restart
 ## Testing
 
 - Unit test `StateDB`: upsert, get, delete, migration from JSON fixtures
-- Unit test `set_position_risk`: verify `initial_risk = |entry - stop| * qty`
-- Unit test partial exit trigger: with `initial_risk > 0`, verify 1.2R fires `partial_done`
-- Integration smoke test: `test_boot.py` must still pass (coordinator boots, IB connects)
-- Verify `bracketOrder` fix: paper account bracket order places correctly with TP and SL legs
+- Unit test `set_position_risk`: verify `initial_risk = |entry - stop| * qty` and SQLite write
+- Unit test partial exit trigger: with `initial_risk > 0`, verify 1.2R fires `partial_done=True`
+- Unit test ML features: `_trade_to_features` and `_build_feature_vector` must return same-shape vectors
+- Unit test HMM: refit only fires after TTL, fast-path returns same regime label on second call
+- Unit test breadth: sample is not always the first N symbols of the universe
+- Integration smoke test: `test_boot.py` must still pass after all changes
+- Manual verify on paper: confirm bracket order places with TP and SL legs visible in IB TWS
 
 ---
 
 ## What Does NOT Change
 
-- Signal generation logic (all strategies unchanged)
-- Regime detection (HMM, breadth, sector layer)
-- IB connection / contract resolution
-- Confluence filtering (3-strategy minimum, 2-cycle confirmation)
-- Order rate limiter, drawdown halt
+- All strategy signal generation logic (momentum, supertrend, breakout, mean_reversion, etc.)
+- IB connection / reconnect / contract resolution
+- Confluence filtering (3-strategy min, 2-cycle confirmation, hourly bias gate)
+- Order rate limiter (20/hour), drawdown halt
 - Dashboard, alerts, Discord bot
+- Sector regime layer (SectorRegimeFilter)
+- Correlation filter logic
