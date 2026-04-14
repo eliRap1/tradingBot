@@ -920,17 +920,43 @@ class Coordinator:
     def _log_watcher_status(self):
         """Log a visual summary of all watcher threads."""
         watchers_snapshot = list(self.watchers.values())
-        statuses = {}
+        if not watchers_snapshot:
+            return
+
+        # ── Monitored universe breakdown ──────────────────────────────
+        stocks   = sorted(w.symbol for w in watchers_snapshot
+                          if self._clf.classify(w.symbol) == "stock")
+        crypto   = sorted(w.symbol for w in watchers_snapshot
+                          if self._clf.classify(w.symbol) == "crypto")
+        futures  = sorted(w.symbol for w in watchers_snapshot
+                          if self._clf.classify(w.symbol) == "futures")
+
+        total = len(watchers_snapshot)
+        log.info(f"  MONITORING {total} symbols — "
+                 f"stocks={len(stocks)} crypto={len(crypto)} futures={len(futures)}")
+
+        # Print stocks in rows of 12 so it's readable in logs
+        _ROW = 12
+        for i in range(0, len(stocks), _ROW):
+            log.info(f"    stocks : {' '.join(stocks[i:i + _ROW])}")
+        if crypto:
+            log.info(f"    crypto : {' '.join(crypto)}")
+        if futures:
+            log.info(f"    futures: {' '.join(futures)}")
+
+        # ── Per-status counts and highlights ─────────────────────────
+        statuses: dict[str, int] = {}
         for w in watchers_snapshot:
             s = w.state.status
             statuses[s] = statuses.get(s, 0) + 1
 
-        signals = [f"{w.symbol}({w.state.score:+.2f})" for w in watchers_snapshot if w.state.score > 0.2]
+        signals = [f"{w.symbol}({w.state.score:+.2f})" for w in watchers_snapshot
+                   if w.state.score > 0.2]
         pending = [w.symbol for w in watchers_snapshot if w.state.status == "pending"]
-        errors = [w.symbol for w in watchers_snapshot if w.state.status == "error"]
+        errors  = [w.symbol for w in watchers_snapshot if w.state.status == "error"]
 
         status_str = " | ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
-        log.info(f"  WATCHERS: {len(watchers_snapshot)} active | {status_str}")
+        log.info(f"  STATUSES: {status_str}")
         if signals:
             log.info(f"  SIGNALS:  {', '.join(signals)}")
         if pending:
