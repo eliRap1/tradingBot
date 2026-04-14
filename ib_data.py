@@ -29,6 +29,10 @@ from base_data import BaseDataFetcher
 
 log = setup_logger("ib_data")
 
+IB_CRYPTO_SYMBOLS: frozenset[str] = frozenset({
+    "BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD",
+})
+
 TIMEFRAME_MAP = {
     "1Min":  "1 min",
     "5Min":  "5 mins",
@@ -81,21 +85,47 @@ class IBDataFetcher(BaseDataFetcher):
 
     # Hard-coded primary exchange for symbols that IB won't qualify via SMART
     _SYMBOL_EXCHANGE: dict[str, str] = {
+        # ── Fintech / growth (NASDAQ) ──────────────────────────────────
         "HOOD": "NASDAQ",
         "RIVN": "NASDAQ",
         "LCID": "NASDAQ",
         "SOFI": "NASDAQ",
-        "UWMC": "NYSE",
         "DKNG": "NASDAQ",
         "OPEN": "NASDAQ",
         "COIN": "NASDAQ",
         "AFRM": "NASDAQ",
-        "BILL": "NYSE",
-        "PATH": "NYSE",
         "GTLB": "NASDAQ",
         "MNST": "NASDAQ",
         "ON":   "NASDAQ",
-        # ETFs used for regime/breadth checks — ARCA not in SMART hints by default
+        # ── Symbols that need explicit NYSE routing ────────────────────
+        "UWMC": "NYSE",
+        "BILL": "NYSE",
+        "PATH": "NYSE",
+        # ── NYSE large-caps that fail SMART qualification ──────────────
+        "OXY":  "NYSE",
+        "MO":   "NYSE",
+        "SNOW": "NYSE",
+        "NKE":  "NYSE",
+        "MPC":  "NYSE",
+        "NET":  "NYSE",
+        "HPQ":  "NYSE",
+        "NOW":  "NYSE",
+        "COF":  "NYSE",
+        "SO":   "NYSE",
+        "LOW":  "NYSE",
+        "CMG":  "NYSE",
+        "PM":   "NYSE",
+        "V":    "NYSE",
+        "ZS":   "NASDAQ",
+        "OKTA": "NASDAQ",
+        # ── NASDAQ large-caps that fail SMART qualification ────────────
+        "MELI": "NASDAQ",
+        "CSX":  "NASDAQ",
+        "PEP":  "NASDAQ",
+        "ZM":   "NASDAQ",
+        "AMAT": "NASDAQ",
+        "IDXX": "NASDAQ",
+        # ── ETFs used for regime/breadth checks ───────────────────────
         "SPY":  "ARCA",
         "QQQ":  "NASDAQ",
         "IWM":  "ARCA",
@@ -103,6 +133,17 @@ class IBDataFetcher(BaseDataFetcher):
         "TLT":  "NASDAQ",
         "GLD":  "ARCA",
         "SLV":  "ARCA",
+        "UUP":  "ARCA",
+        "XLK":  "ARCA",
+        "XLF":  "ARCA",
+        "XLV":  "ARCA",
+        "XLE":  "ARCA",
+        "XLY":  "ARCA",
+        "XLP":  "ARCA",
+        "XLI":  "ARCA",
+        "XLRE": "ARCA",
+        "XLU":  "ARCA",
+        "RSP":  "ARCA",
     }
 
     def __init__(self, ib, contract_manager, config: dict):
