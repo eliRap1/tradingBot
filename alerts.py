@@ -330,6 +330,53 @@ class DiscordBot:
         self._thread.start()
         log.info("Discord bot started — listening for !stat")
 
+    def _submit_test_buy(self, symbol: str = "BTC/USD", notional_usd: float = 1.0) -> str:
+        """Submit a tiny BTC market buy for connectivity checks."""
+        if not self.broker:
+            return "❌ Broker not connected."
+
+        try:
+            price = None
+            if (
+                self.coordinator
+                and getattr(self.coordinator, "live_manager", None)
+                and getattr(self.coordinator, "data", None)
+            ):
+                price, status = self.coordinator.live_manager.get_live_price(
+                    symbol, self.coordinator.data
+                )
+                if price is None:
+                    log.warning(f"Discord !buy live price unavailable for {symbol}: {status}")
+
+            if price is None:
+                quote = self.broker.get_quote(symbol)
+                if quote is not None and quote.mid > 0:
+                    price = quote.mid
+                else:
+                    return f"No live quote available for `{symbol}`."
+
+            qty = round(notional_usd / price, 8)
+            if qty <= 0:
+                return f"❌ Computed quantity is invalid for `{symbol}`."
+
+            order = self.broker.submit_market_order(symbol, qty, "buy")
+            order_id = getattr(order, "id", "submitted")
+            log.info(
+                "Discord !buy submitted tiny test order: %s qty=%.8f notional=$%.2f order_id=%s",
+                symbol,
+                qty,
+                notional_usd,
+                order_id,
+            )
+            return (
+                f"✅ Submitted test buy: `{symbol}` qty=`{qty:.8f}` "
+                f"(~`${notional_usd:.2f}` at `${price:,.2f}`) "
+                f"order=`{order_id}`"
+            )
+        except Exception as e:
+            log.warning(f"Discord !buy failed: {e}")
+            return f"❌ Test buy failed: `{e}`"
+
     def _run(self):
         """Run the Discord bot (blocking, runs in thread)."""
         try:
@@ -441,6 +488,11 @@ class DiscordBot:
                             "`!pause` — pause new trade entries\n"
                             "`!resume` — resume trading"
                         )
+                        msg += "\n`!buy` â€” submit a $1 BTC test market buy"
+                        await message.channel.send(msg)
+
+                    elif message.content.strip().lower() == "!buy":
+                        msg = self._submit_test_buy()
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!positions":
