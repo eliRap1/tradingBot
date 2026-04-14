@@ -31,6 +31,10 @@ from alerts import AlertManager, DiscordBot
 from live_trading import LiveTradingManager, DataFreshnessValidator, ensure_live_trading_mode
 from walk_forward_optimizer import apply_optimized_params
 from ml_model import MLMetaModel
+from edge.cross_asset import CrossAssetEngine
+from edge.news_sentiment import NewsSentimentEngine
+from edge.ml_filter import MLSignalFilter
+from edge.microstructure import MicrostructureGate
 
 log = setup_logger("coordinator")
 
@@ -87,6 +91,11 @@ class Coordinator:
         self.discord_bot.start()
         self.ml_model = MLMetaModel()
         self._ml_train_counter = 0  # retrain every N cycles
+        self.edge_cross_asset = CrossAssetEngine(self.data)
+        self.edge_news = NewsSentimentEngine(self.config)
+        self.edge_ml = MLSignalFilter(min_trades=self.config.get("edge", {}).get("ml_min_trades", 100))
+        self.edge_micro = MicrostructureGate(self.broker, self.data, self.config)
+        self._current_regime_4state = "bull_choppy"
 
         # LIVE TRADING: Real-time data validation
         self.live_manager = LiveTradingManager(self.broker)
@@ -178,7 +187,11 @@ class Coordinator:
         for sym in universe:
             if sym not in self.watchers:
                 instrument_type = self._clf.classify(sym)
-                strat_weights = self._strategy_router.get_strategies(instrument_type)
+                from filters import SECTOR_MAP
+                sector = SECTOR_MAP.get(sym, "other")
+                strat_weights = self._strategy_router.get_strategies(
+                    instrument_type, sector=sector, regime=self._current_regime_4state
+                )
                 watcher = StockWatcher(
                     symbol=sym,
                     config=self.config,
@@ -189,6 +202,8 @@ class Coordinator:
                         if self._sector_regime_enabled and self.sector_regime else None
                     ),
                     strategies=strat_weights,
+                    sector=sector,
+                    current_regime=self._current_regime_4state,
                 )
                 self.watchers[sym] = watcher
                 watcher.start()
@@ -394,7 +409,21 @@ class Coordinator:
 
         # 2. Market regime
         regime = self.regime.get_regime()
+        self._current_regime_4state = self.regime.classify_4state()
+        edge_cross_asset = self.edge_cross_asset.get_signals()
+        blocked_symbols = self.edge_news.get_blocked_symbols(list(self.watchers.keys()))
+        self.edge_ml.maybe_train(self.portfolio.tracker.trades)
         log.info(f"Market: {regime['description']}")
+        for watcher in self.watchers.values():
+            watcher._macro_regime = regime["regime"]
+            watcher._current_regime = self._current_regime_4state
+            if self._clf.classify(watcher.symbol) == "stock":
+                watcher.set_strategy_weights(
+                    self._strategy_router.get_strategies(
+                        "stock", sector=getattr(watcher, "_sector", "other"), regime=self._current_regime_4state
+                    ),
+                    regime=self._current_regime_4state,
+                )
 
         # 2a. Send regime-change and HMM-caution alerts
         new_regime_str = regime["regime"]
@@ -524,6 +553,8 @@ class Coordinator:
         for sym, watcher in list(self.watchers.items()):
             if _normalize_symbol(sym) in held_normalized:
                 continue
+            if sym in blocked_symbols:
+                continue
             if not watcher.state.confirmed:
                 continue
 
@@ -647,7 +678,7 @@ class Coordinator:
         stock_slots = max_pos - len(stock_positions) if not stocks_full else 0
         crypto_slots = max_crypto - len(crypto_positions) if not crypto_full else 0
         cooldown_mult = self.filters.get_loss_cooldown_mult()
-        base_size_mult = regime["size_multiplier"] * cooldown_mult
+        base_size_mult = regime["size_multiplier"] * cooldown_mult * edge_cross_asset.size_multiplier
 
         # Filter by available slots per type
         executable = []
@@ -671,6 +702,10 @@ class Coordinator:
             sym = watcher.symbol
             bars = watcher.get_bars()
             if bars is None:
+                continue
+            micro = self.edge_micro.evaluate(sym, bars)
+            if micro.blocked:
+                log.info(f"Spread gate blocked {sym}: spread={micro.spread_pct:.3%}")
                 continue
             
             # LIVE TRADING: Validate data freshness
@@ -717,7 +752,35 @@ class Coordinator:
                         )
                         continue
 
-            size_mult = base_size_mult * sector_mult * corr_mult
+            now_hour = datetime.now().hour
+            session_bucket = "open" if now_hour == 9 else ("close" if now_hour >= 15 else "mid")
+            days_to_earn = self.edge_news.get_days_to_earnings(sym)
+
+            ml_conf = self.edge_ml.predict_quality({
+                "strategy_scores": watcher.state.strategy_scores,
+                "composite_score": watcher.state.score + micro.ofi_score,
+                "num_agreeing": watcher.state.num_agreeing,
+                "regime": self._current_regime_4state,
+                "size_multiplier": edge_cross_asset.size_multiplier,
+                "spread_pct": micro.spread_pct,
+                "ofi_score": micro.ofi_score,
+                "spy_corr": micro.spy_corr,
+                "hour_of_day": now_hour,
+                "day_of_week": datetime.now().weekday(),
+                "session_bucket": session_bucket,
+                "days_to_earnings": days_to_earn,
+                "nq_overnight_move": edge_cross_asset.nq_overnight_move,
+            })
+            size_mult = base_size_mult * sector_mult * corr_mult * ml_conf
+
+            # News sentiment: suppress longs on bad news, small boost on good news
+            news_score = self.edge_news.score_symbol_news(sym)
+            if news_score < -0.5:
+                size_mult *= 0.70
+                log.info(f"NEWS SENTIMENT: {sym} negative ({news_score:.2f}) — size reduced 30%")
+            elif news_score > 0.5 and watcher.state.action == Action.BUY:
+                size_mult = min(size_mult * 1.10, base_size_mult * sector_mult * corr_mult * 1.25)
+                log.info(f"NEWS SENTIMENT: {sym} positive ({news_score:.2f}) — size boosted 10%")
 
             orders = self.risk.size_orders(
                 opportunities=[_make_opportunity(watcher)],
@@ -785,7 +848,8 @@ class Coordinator:
                         f"@ ~${order.entry_price:.2f} | "
                         f"SL=${order.stop_loss:.2f} TP=${order.take_profit:.2f} | "
                         f"regime={watcher.state.regime} "
-                        f"confluence={watcher.state.num_agreeing}"
+                        f"confluence={watcher.state.num_agreeing} "
+                        f"ml_conf={ml_conf:.2f} spread={micro.spread_pct:.3%}"
                     )
                     self.alerts.send_trade_alert(
                         side=order.side, qty=order.qty,
@@ -887,7 +951,6 @@ class Coordinator:
                 "num_agreeing": s.num_agreeing,
                 "strategy_scores": s.strategy_scores,
                 "strategy_weights": s.strategy_weights,
-                "regime": s.regime,
                 "regime": s.regime,
                 "regime_reason": s.regime_reason,
                 "action": s.action.name if hasattr(s.action, 'name') else str(s.action),
