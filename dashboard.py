@@ -26,7 +26,7 @@ from watcher import StockWatcher
 from strategy_selector import select_strategies
 from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context, get_weekly_trend
-from data import CRYPTO_SYMBOLS
+from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS
 from strategies import ALL_STRATEGIES
 from indicators import keltner_squeeze, daily_pivot_points
 

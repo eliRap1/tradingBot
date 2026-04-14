@@ -84,11 +84,7 @@ def _classify_symbol(symbol: str) -> str:
     Uses simple heuristics — for authoritative classification use InstrumentClassifier.
     """
     _FUTURES_ROOTS = {"NQ", "ES", "CL", "GC", "RTY", "YM", "NKD"}
-    _CRYPTO_SUFFIXES = {
-        "BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD",
-        "SOL/USD", "AVAX/USD", "LINK/USD", "DOGE/USD",
-        "SOLUSD", "AVAXUSD", "LINKUSD", "DOGEUSD",
-    }
+    _CRYPTO_SUFFIXES = {"BTC/USD", "ETH/USD", "BTCUSD", "ETHUSD"}
     if symbol in _FUTURES_ROOTS:
         return "futures"
     if symbol in _CRYPTO_SUFFIXES:

@@ -10,6 +10,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
+from unittest.mock import MagicMock
+
 from watcher import WatcherState, Action
 
 
@@ -84,3 +86,26 @@ class TestWatcherState:
         assert state.score == 0.0
         assert state.confirmed is False
         assert state.error == ""
+
+
+def test_bear_veto_zeroes_momentum_gap_breakout():
+    from watcher import StockWatcher
+
+    config = {
+        "strategies": {
+            "momentum": {"weight": 0.25},
+            "supertrend": {"weight": 0.25},
+            "gap": {"weight": 0.15},
+            "breakout": {"weight": 0.2},
+        },
+        "signals": {"min_composite_score": 0.25, "min_agreeing_strategies": 3},
+    }
+    watcher = StockWatcher("AAPL", config, MagicMock(), strategies={"momentum": 0.4, "supertrend": 0.6})
+    watcher._macro_regime = "bear"
+    selection = {"strategies": {"momentum": 0.4, "supertrend": 0.3, "gap": 0.2, "breakout": 0.1}}
+
+    watcher._apply_bear_veto(selection, {"adx": 35})
+
+    assert selection["strategies"]["momentum"] == 0.0
+    assert selection["strategies"]["gap"] == 0.0
+    assert selection["strategies"]["breakout"] == 0.0

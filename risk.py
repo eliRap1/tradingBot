@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import ta
 from dataclasses import dataclass
+from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS
 from utils import setup_logger
 from state import load_state, save_state
 
@@ -80,7 +81,6 @@ class RiskManager:
             is_short = opp.direction == "sell" or opp.score < 0
 
             # Use crypto-specific risk params if applicable
-            from broker import CRYPTO_SYMBOLS
             crypto_cfg = self.cfg
             if opp.symbol in CRYPTO_SYMBOLS:
                 # Merge crypto overrides from screener.crypto_risk

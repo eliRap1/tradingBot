@@ -23,7 +23,7 @@ from candles import detect_patterns, bullish_score
 from trend import get_trend_context
 from risk import RiskManager
 from signals import Opportunity
-from broker import CRYPTO_SYMBOLS
+from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS
 from utils import setup_logger
 
 log = setup_logger("backtester")

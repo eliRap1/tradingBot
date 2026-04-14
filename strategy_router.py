@@ -1,79 +1,88 @@
-"""Per-instrument strategy assignment with normalized weights.
+"""Per-instrument strategy assignment with optional sector x regime overrides."""
 
-Strategy matrix (weights before normalization):
-  Strategy         Stocks   Crypto   Futures
-  momentum         0.20     0.25     0.20
-  mean_reversion   0.15     ❌       ❌
-  breakout         0.20     0.25     0.20
-  supertrend       0.20     0.25     0.25
-  stoch_rsi        0.15     0.25     0.15
-  vwap_reclaim     0.10     ❌       0.10
-  gap              0.10     ❌       ❌
-  liquidity_sweep  0.20     0.25     0.25
-  futures_trend    ❌       ❌       0.30
+from __future__ import annotations
 
-Weights are normalized to sum to 1.0 per instrument type.
-"""
+import json
+import os
 
-# Raw weights before normalization — edit here to tune per-instrument emphasis
 _STOCK_WEIGHTS = {
-    "momentum":        0.20,
-    "mean_reversion":  0.15,
-    "breakout":        0.20,
-    "supertrend":      0.20,
-    "stoch_rsi":       0.15,
-    "vwap_reclaim":    0.10,
-    "gap":             0.10,
+    "momentum": 0.20,
+    "mean_reversion": 0.15,
+    "breakout": 0.20,
+    "supertrend": 0.20,
+    "stoch_rsi": 0.15,
+    "vwap_reclaim": 0.10,
+    "gap": 0.10,
     "liquidity_sweep": 0.20,
 }
 
 _CRYPTO_WEIGHTS = {
-    "momentum":        0.25,
-    "breakout":        0.25,
-    "supertrend":      0.25,
-    "stoch_rsi":       0.25,
+    "momentum": 0.25,
+    "breakout": 0.25,
+    "supertrend": 0.25,
+    "stoch_rsi": 0.25,
     "liquidity_sweep": 0.25,
 }
 
 _FUTURES_WEIGHTS = {
-    "momentum":        0.20,
-    "breakout":        0.20,
-    "supertrend":      0.25,
-    "stoch_rsi":       0.15,
-    "vwap_reclaim":    0.10,
+    "momentum": 0.20,
+    "breakout": 0.20,
+    "supertrend": 0.25,
+    "stoch_rsi": 0.15,
+    "vwap_reclaim": 0.10,
     "liquidity_sweep": 0.25,
-    "futures_trend":   0.30,
+    "futures_trend": 0.30,
 }
 
 
 def _normalize(weights: dict[str, float]) -> dict[str, float]:
     total = sum(weights.values())
-    if total == 0:
-        return weights
-    return {k: round(v / total, 4) for k, v in weights.items()}
+    if total <= 0:
+        return dict(weights)
+    return {k: round(v / total, 4) for k, v in weights.items() if v > 0}
 
 
 class StrategyRouter:
-    """Returns the normalized strategy weight dict for a given instrument type."""
+    """Returns normalized strategy weights for instrument, sector, and regime."""
 
     def __init__(self, config: dict):
         self._config = config
         self._stock_weights = _normalize(_STOCK_WEIGHTS)
         self._crypto_weights = _normalize(_CRYPTO_WEIGHTS)
         self._futures_weights = _normalize(_FUTURES_WEIGHTS)
+        self._sector_weights = self._load_sector_weights()
 
-    def get_strategies(self, instrument_type: str) -> dict[str, float]:
-        """Return {strategy_name: normalized_weight} for the instrument type.
+    def _load_sector_weights(self) -> dict:
+        path = os.path.join(os.path.dirname(__file__), "research", "sector_weights.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return {
+                sector: {key: _normalize(value) for key, value in mapping.items() if isinstance(value, dict)}
+                for sector, mapping in raw.items()
+                if isinstance(mapping, dict)
+            }
+        except Exception:
+            return {}
 
-        Args:
-            instrument_type: 'stock', 'crypto', or 'futures'
-
-        Returns:
-            Dict of strategy name → normalized weight (sums to 1.0)
-        """
+    def get_strategies(
+        self,
+        instrument_type: str,
+        sector: str | None = None,
+        regime: str | None = None,
+    ) -> dict[str, float]:
         if instrument_type == "crypto":
             return dict(self._crypto_weights)
-        elif instrument_type == "futures":
+        if instrument_type == "futures":
             return dict(self._futures_weights)
-        else:  # stock (default for unknown types too)
-            return dict(self._stock_weights)
+
+        if sector and sector in self._sector_weights:
+            sector_map = self._sector_weights[sector]
+            if regime and regime in sector_map:
+                return dict(sector_map[regime])
+            if "_fallback" in sector_map:
+                return dict(sector_map["_fallback"])
+
+        return dict(self._stock_weights)

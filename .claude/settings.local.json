@@ -27,7 +27,20 @@
       "Read(//d/Users/**)",
       "Read(//c/Users/eli08/**)",
       "Bash(node gen_sefer.js)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(ls -la *.log)",
+      "Bash(ls *.txt)",
+      "Bash(tasklist)",
+      "Bash(grep:*)",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(xargs rm:*)",
+      "Bash(echo \"Bot started PID $!\")",
+      "Bash(ls /c/Users/eli08/Videos/tradingBot/__pycache__/portfolio*.pyc)",
+      "Bash(echo \"Started PID $!\")",
+      "Bash(taskkill /F /PID 58772)",
+      "Bash(taskkill //F //PID 58772)",
+      "Bash(taskkill:*)",
+      "Bash(ls:*)"
     ]
   }
 }

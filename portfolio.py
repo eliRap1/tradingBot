@@ -11,10 +11,10 @@ Improvements:
 """
 
 from datetime import datetime
+from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS
 from utils import setup_logger
 from state import load_state, save_state
 from tracker import TradeTracker
-from broker import CRYPTO_SYMBOLS
 
 log = setup_logger("portfolio")
 
@@ -50,6 +50,31 @@ class PortfolioManager:
         for k, v in self.position_meta.items():
             migrated_meta[_normalize_symbol(k)] = v
         self.position_meta = migrated_meta
+
+    def set_position_risk(self, symbol: str, entry_price: float, stop_loss: float, qty: float):
+        """Persist entry metadata needed for later R-multiple and exit logic."""
+        sym = _normalize_symbol(symbol)
+        meta = self.position_meta.get(sym, {})
+        meta.update({
+            "opened_at": meta.get("opened_at", datetime.now().isoformat()),
+            "entry_price": entry_price,
+            "initial_risk": abs(entry_price - stop_loss) * qty,
+            "stop_loss": stop_loss,
+            "original_qty": qty,
+        })
+        self.position_meta[sym] = meta
+        self._save_meta()
+
+    def _save_meta(self):
+        state = load_state()
+        state["position_meta"] = self.position_meta
+        save_state(state)
+
+    def _save_watermarks(self):
+        state = load_state()
+        state["high_watermarks"] = self.high_watermarks
+        state["low_watermarks"] = self.low_watermarks
+        save_state(state)
 
     def get_current_positions(self) -> dict:
         """Get current positions as {symbol: position_info}."""

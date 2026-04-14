@@ -168,10 +168,10 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
             "reason": f"Near 20-day high with volume expansion",
         }
 
-    # NEAR LOWS + VOLUME — breakdown mode (short)
+    # NEAR LOWS + VOLUME — breakout mode (short)
     if near_low and vol_expanding:
         return {
-            "regime": "breakdown",
+            "regime": "breakout",
             "strategies": {
                 "breakout": 0.25,
                 "momentum": 0.15,

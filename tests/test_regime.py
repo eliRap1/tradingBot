@@ -10,6 +10,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
+from unittest.mock import MagicMock
+
+import numpy as np
+import pandas as pd
+
+from regime import RegimeFilter
 from tests.helpers import make_uptrend_bars, make_downtrend_bars, make_ranging_bars
 from strategy_selector import select_strategies
 
@@ -71,3 +77,55 @@ class TestStrategySelection:
 
         assert selection["regime"] in ("mixed", "trending", "ranging", "breakout", "volatile")
         assert len(selection["strategies"]) > 0
+
+
+def _make_spy_df(n=250):
+    dates = pd.date_range("2025-01-01", periods=n, freq="B")
+    close = 450 + np.cumsum(np.random.randn(n))
+    return pd.DataFrame({
+        "open": close - 0.5,
+        "high": close + 1,
+        "low": close - 1,
+        "close": close,
+        "volume": 1e6,
+    }, index=dates)
+
+
+def test_hmm_not_refit_within_ttl():
+    data = MagicMock()
+    data.get_intraday_bars.return_value = _make_spy_df()
+    data.get_bars.return_value = {}
+
+    rf = RegimeFilter(data)
+    rf._hmm_refit_interval = 3600
+    rf._fit_hmm = MagicMock(side_effect=rf._fit_hmm)
+
+    rf.get_regime()
+    rf.get_regime()
+
+    assert rf._fit_hmm.call_count <= 1
+
+
+def test_breadth_sample_not_always_first_20():
+    universe = [f"SYM{i:03d}" for i in range(100)]
+    data = MagicMock()
+    data.get_intraday_bars.return_value = _make_spy_df()
+    data.get_bars.return_value = {}
+
+    rf = RegimeFilter(data, universe=universe)
+    samples_seen = set()
+    for _ in range(5):
+        rf._get_market_breadth()
+        call_args = data.get_bars.call_args[0][0]
+        samples_seen.update(call_args)
+
+    assert any(int(sym[3:]) >= 20 for sym in samples_seen)
+
+
+def test_classify_4state_returns_valid_bucket():
+    data = MagicMock()
+    data.get_intraday_bars.return_value = _make_spy_df()
+    rf = RegimeFilter(data)
+    assert rf.classify_4state() in {
+        "bull_trending", "bull_choppy", "bear_trending", "bear_choppy"
+    }

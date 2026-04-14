@@ -1,0 +1,15 @@
+{
+  "tech": {
+    "bull_trending": {"momentum": 0.4, "breakout": 0.3, "supertrend": 0.3},
+    "bull_choppy": {"mean_reversion": 0.4, "stoch_rsi": 0.3, "supertrend": 0.3},
+    "bear_trending": {"liquidity_sweep": 0.5, "supertrend": 0.3, "stoch_rsi": 0.2},
+    "bear_choppy": {"mean_reversion": 0.5, "stoch_rsi": 0.3, "vwap_reclaim": 0.2},
+    "_fallback": {"momentum": 0.25, "breakout": 0.25, "supertrend": 0.25, "stoch_rsi": 0.25}
+  },
+  "semi": {
+    "_fallback": {"momentum": 0.35, "breakout": 0.3, "supertrend": 0.2, "liquidity_sweep": 0.15}
+  },
+  "finance": {
+    "_fallback": {"mean_reversion": 0.35, "stoch_rsi": 0.25, "supertrend": 0.2, "breakout": 0.2}
+  }
+}

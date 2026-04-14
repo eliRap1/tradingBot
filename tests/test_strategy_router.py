@@ -1,4 +1,5 @@
 import pytest
+import json
 
 CONFIG = {
     "futures": {"contracts": [{"root": "NQ"}, {"root": "ES"}, {"root": "CL"}, {"root": "GC"}]},
@@ -90,3 +91,23 @@ def test_all_weights_positive(router):
 def test_unknown_type_defaults_to_stock(router):
     strats = router.get_strategies("unknown")
     assert "mean_reversion" in strats  # stock has mean_reversion
+
+
+def test_sector_regime_override(tmp_path, monkeypatch):
+    research_dir = tmp_path / "research"
+    research_dir.mkdir()
+    (research_dir / "sector_weights.json").write_text(json.dumps({
+        "tech": {
+            "bull_trending": {"momentum": 0.6, "breakout": 0.4},
+            "_fallback": {"supertrend": 1.0}
+        }
+    }))
+    import strategy_router
+    monkeypatch.setattr(strategy_router.os.path, "dirname", lambda _: str(tmp_path))
+    router = strategy_router.StrategyRouter(CONFIG)
+    assert router.get_strategies("stock", sector="tech", regime="bull_trending") == {
+        "momentum": 0.6, "breakout": 0.4
+    }
+    assert router.get_strategies("stock", sector="tech", regime="bear_choppy") == {
+        "supertrend": 1.0
+    }

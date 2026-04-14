@@ -156,21 +156,22 @@ class MLMetaModel:
             return None
 
     def _trade_to_features(self, trade: dict) -> list | None:
-        """Convert a closed trade record to a feature vector."""
+        """Convert a closed trade record to the live prediction feature space."""
+        scores = trade.get("strategy_scores", {})
         strats = set(trade.get("strategies", []))
-        if not strats:
+        if not strats and not scores:
             return None
 
         features = []
-        # Per-strategy binary: was this strategy active?
         for s in STRATEGY_NAMES:
-            features.append(1.0 if s in strats else 0.0)
-
-        # Number of agreeing strategies
-        features.append(float(len(strats)))
-
-        # R-multiple if available (proxy for signal quality)
-        features.append(float(trade.get("r_multiple", 0) or 0))
+            if s in scores:
+                features.append(float(scores[s]))
+            elif s in strats:
+                features.append(1.0)
+            else:
+                features.append(0.0)
+        features.append(float(trade.get("num_agreeing", len(strats))))
+        features.append(float(trade.get("composite_score", 0.0)))
 
         return features
 

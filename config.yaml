@@ -288,6 +288,17 @@ alerts:
   notify_drawdown: true          # drawdown warnings
   notify_daily_summary: true     # end-of-day performance
 
+edge:
+  enabled: true
+  earnings_avoidance: true
+  news_sentiment: false
+  news_lookback_hours: 4
+  news_sentiment_threshold: 0.5
+  max_spread_pct: 0.0015
+  ofi_weight: 0.05
+  ml_filter_threshold: 0.55
+  ml_min_trades: 100
+
 sector_regime:
   enabled: true           # set false to disable sector layer entirely
   cache_ttl_sec: 900      # how long to cache sector ETF results (15 min)
