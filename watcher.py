@@ -12,8 +12,6 @@ This mimics how a real trader watches a chart — focused on one instrument
 at a time, reading price action, and applying the right setup.
 """
 
-import json
-import os
 import threading
 import time
 import pandas as pd
@@ -27,9 +25,9 @@ from candles import detect_patterns, bullish_score, bearish_score
 from trend import get_trend_context, get_weekly_trend, get_hourly_bias
 from indicators import supertrend, pivot_high, pivot_low, stochastic_rsi, last_pivot_value, order_flow_imbalance
 from crypto_sentiment import crypto_sentiment
+from ib_data import IB_CRYPTO_SYMBOLS
+from state_db import StateDB
 from utils import setup_logger
-
-PENDING_STATE_FILE = os.path.join(os.path.dirname(__file__), "watcher_pending.json")
 
 
 class Action(Enum):
@@ -62,6 +60,8 @@ class WatcherState:
     error: str = ""
     confirmed: bool = False         # signal persisted across 2 checks
     prev_signal: bool = False       # had signal last check
+    macro_regime: str = ""
+    sector: str = ""
 
 
 class StockWatcher:
@@ -71,7 +71,8 @@ class StockWatcher:
 
     def __init__(self, symbol: str, config: dict, data_fetcher,
                  interval: int = 60, sector_regime_getter=None,
-                 strategies: dict | None = None):
+                 strategies: dict | None = None, sector: str = "other",
+                 current_regime: str = "bull_choppy"):
         self.symbol = symbol
         self.config = config
         self.data = data_fetcher
@@ -79,6 +80,9 @@ class StockWatcher:
         self.state = WatcherState(symbol=symbol)
         self.log = setup_logger(f"watcher.{symbol}")
         self._sector_regime_getter = sector_regime_getter
+        self._sector = sector
+        self._current_regime = current_regime
+        self.state.sector = sector
 
         # Initialize strategy instances (one per watcher).
         # If strategies dict provided (from StrategyRouter), instantiate only those.
@@ -101,9 +105,18 @@ class StockWatcher:
         self._bars_cache_time = None  # track cache age
         self._max_cache_age_seconds = 300  # refresh bars every 5 min max
         self._alpha_decay = {}  # {strategy_name: float} set by coordinator
+        self._macro_regime: str = "bull"
 
         # Restore pending signal state from disk (survives restarts)
         self.state.prev_signal = _load_pending_state(symbol)
+
+    def set_strategy_weights(self, weights: dict[str, float], regime: str | None = None):
+        self._strategy_weights_override = weights
+        if regime:
+            self._current_regime = regime
+        for name in weights:
+            if name not in self.strategies and name in ALL_STRATEGIES:
+                self.strategies[name] = ALL_STRATEGIES[name](self.config)
 
     def start(self):
         """Start watching in a background thread."""
@@ -211,9 +224,11 @@ class StockWatcher:
             }
         else:
             selection = select_strategies(daily_df, self.symbol, sector_regime=_sector_reg)
+        self._apply_bear_veto(selection, ctx)
         self.state.regime = selection["regime"]
         self.state.regime_reason = selection["reason"]
         self.state.strategy_weights = selection["strategies"]
+        self.state.macro_regime = self._current_regime
 
         # 5. Run selected strategies on 5-MIN bars (entry timeframe)
         strategy_scores = {}
@@ -254,8 +269,7 @@ class StockWatcher:
         flow = order_flow_imbalance(intraday_df, lookback=20)
 
         # 6. Decision: LONG, SHORT, or NONE
-        from data import CRYPTO_SYMBOLS
-        is_crypto = self.symbol in CRYPTO_SYMBOLS
+        is_crypto = self.symbol in IB_CRYPTO_SYMBOLS
         # Crypto needs only 2/5 strategies (fewer patterns in 24/7 markets)
         min_agreeing = self.config["signals"].get("min_crypto_agreeing", 2) if is_crypto \
             else self.config["signals"].get("min_agreeing_strategies", 3)
@@ -340,34 +354,57 @@ class StockWatcher:
         """Return cached bars for order sizing."""
         return self._bars
 
+    def _apply_bear_veto(self, selection: dict, ctx: dict):
+        macro = getattr(self, "_macro_regime", "bull")
+        if macro != "bear" or ctx.get("adx", 0) <= 30:
+            return
+
+        for strat in ("momentum", "gap", "breakout"):
+            if strat in selection["strategies"]:
+                selection["strategies"][strat] = 0.0
+
+        total = sum(selection["strategies"].values())
+        if total > 0:
+            selection["strategies"] = {
+                name: round(weight / total, 4)
+                for name, weight in selection["strategies"].items()
+            }
+        self.log.debug(
+            f"Bear veto applied (ADX={ctx.get('adx', 0):.0f}): momentum/gap/breakout weights zeroed"
+        )
+
 
 # ── Pending signal persistence (survives restarts) ────────
 
 _pending_lock = threading.Lock()
+_pending_db: StateDB | None = None
+_pending_db_init_lock = threading.Lock()
+
+
+def _get_pending_db() -> StateDB:
+    """Return module-level StateDB singleton (lazy init, thread-safe)."""
+    global _pending_db
+    if _pending_db is None:
+        with _pending_db_init_lock:
+            if _pending_db is None:
+                db = StateDB()
+                db.migrate_from_json()
+                _pending_db = db
+    return _pending_db
 
 
 def _load_pending_state(symbol: str) -> bool:
-    """Load whether a symbol had a pending signal from disk."""
+    """Load whether a symbol had a pending signal from SQLite."""
     try:
-        if not os.path.exists(PENDING_STATE_FILE):
-            return False
-        with open(PENDING_STATE_FILE, "r") as f:
-            data = json.load(f)
-        return data.get(symbol, False)
+        return _get_pending_db().get_pending_signal(symbol)
     except Exception:
         return False
 
 
 def _save_pending_state(symbol: str, has_signal: bool):
-    """Save pending signal state to disk (thread-safe)."""
+    """Save pending signal state to SQLite (thread-safe)."""
     with _pending_lock:
         try:
-            data = {}
-            if os.path.exists(PENDING_STATE_FILE):
-                with open(PENDING_STATE_FILE, "r") as f:
-                    data = json.load(f)
-            data[symbol] = has_signal
-            with open(PENDING_STATE_FILE, "w") as f:
-                json.dump(data, f)
+            _get_pending_db().set_pending_signal(symbol, has_signal)
         except Exception:
             pass

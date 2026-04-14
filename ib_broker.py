@@ -173,21 +173,23 @@ class IBBroker(BaseBroker):
         ib_side = "BUY" if req.side == "buy" else "SELL"
 
         if req.take_profit and req.stop_loss:
-            # Use ib.bracketOrder() so IB assigns real orderIds before we set parentId.
-            # Manual construction (parent.orderId before placeOrder) gives orderId=0,
-            # which orphans the TP/SL legs — this is the correct approach.
             tp_side = "SELL" if ib_side == "BUY" else "BUY"
-            bracket = self._ib.bracketOrder(
-                ib_side,
-                req.qty,
-                limitPrice=req.take_profit,   # TP limit leg
-                stopLossPrice=req.stop_loss,  # SL stop leg
-            )
-            # bracketOrder returns (parent, takeProfit, stopLoss) tuple
-            parent_order, tp_order, sl_order = bracket
 
+            # Place parent first (transmit=False); IB assigns orderId via nextOrderId
+            parent_order = MarketOrder(ib_side, req.qty)
+            parent_order.transmit = False
             parent_trade = self._ib.placeOrder(contract, parent_order)
+            parent_id = parent_trade.order.orderId
+
+            # Children reference parent by its IB-assigned orderId
+            tp_order = LimitOrder(tp_side, req.qty, req.take_profit)
+            tp_order.parentId = parent_id
+            tp_order.transmit = False
             self._ib.placeOrder(contract, tp_order)
+
+            sl_order = StopOrder(tp_side, req.qty, req.stop_loss)
+            sl_order.parentId = parent_id
+            sl_order.transmit = True  # releases all three atomically
             self._ib.placeOrder(contract, sl_order)
 
             log.info(
