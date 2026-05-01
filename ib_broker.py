@@ -93,6 +93,8 @@ class IBBroker(BaseBroker):
         self._timeout = ib_cfg.get("timeout_sec", 10)
         self._config = config
         self._lock = threading.Lock()
+        self._last_position_refresh = 0.0
+        self._positions_subscribed = False
         # Symbols that failed all contract qualification attempts.
         # TTL dict: symbol → retry-after timestamp (30-min cooldown for transient failures).
         self._bad_contracts: dict[str, float] = {}
@@ -116,8 +118,10 @@ class IBBroker(BaseBroker):
                         self._host, self._port,
                         clientId=self._client_id,
                         timeout=self._timeout
-                    )
+                )
                 log.info(f"Connected to IB Gateway at {self._host}:{self._port}")
+                self._ib.reqMarketDataType(3)  # delayed-frozen fallback
+                self._positions_subscribed = False
                 return
             except Exception as e:
                 log.error(f"IB connection failed (attempt {attempt + 1}): {e}")
@@ -131,6 +135,96 @@ class IBBroker(BaseBroker):
         if not self._ib.isConnected():
             log.warning("IB disconnected — attempting reconnect")
             self._connect()
+
+    @staticmethod
+    def _format_order_qty(asset: str, qty: float):
+        """IB rejects scientific notation for tiny crypto quantities."""
+        if asset == "crypto":
+            return format(float(qty), ".8f")
+        return qty
+
+    @staticmethod
+    def _contract_symbol(contract) -> str:
+        sec_type = str(getattr(contract, "secType", "") or "").upper()
+        symbol = str(getattr(contract, "symbol", "") or "")
+        currency = str(getattr(contract, "currency", "") or "")
+        if sec_type == "CRYPTO" and symbol and currency:
+            return f"{symbol}/{currency}"
+        return (
+            getattr(contract, "localSymbol", None)
+            or symbol
+            or ""
+        )
+
+    @staticmethod
+    def _position_key(symbol: str) -> str:
+        return str(symbol or "").replace("/", "").replace(".", "").replace(" ", "").upper()
+
+    def _refresh_position_cache(self, wait_sec: float = 0.25):
+        """Ask IB for a fresh position snapshot without depending on ib.sleep()."""
+        now = time.time()
+        if now - getattr(self, "_last_position_refresh", 0.0) < 2.0:
+            return
+        self._last_position_refresh = now
+
+        requested = False
+        try:
+            client = getattr(self._ib, "client", None)
+            req_positions = getattr(client, "reqPositions", None)
+            if callable(req_positions):
+                req_positions()
+                requested = True
+                self._positions_subscribed = True
+        except Exception as e:
+            log.debug(f"IB client.reqPositions() refresh failed: {e}")
+
+        if not requested:
+            try:
+                req_positions = getattr(self._ib, "reqPositions", None)
+                if callable(req_positions):
+                    req_positions()
+                    requested = True
+                    self._positions_subscribed = True
+            except Exception as e:
+                log.debug(f"IB reqPositions() refresh failed: {e}")
+
+        if not requested or wait_sec <= 0:
+            return
+
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            try:
+                if list(self._ib.portfolio()) or list(self._ib.positions()):
+                    break
+            except Exception:
+                break
+            time.sleep(0.1)
+
+    def _invalidate_position_cache(self):
+        self._last_position_refresh = 0.0
+
+    def _portfolio_item_to_position(self, item) -> Position:
+        qty = float(item.position)
+        return Position(
+            symbol=self._contract_symbol(item.contract),
+            qty=qty,
+            avg_price=float(getattr(item, "averageCost", 0) or 0),
+            market_value=float(getattr(item, "marketValue", 0) or 0),
+            unrealized_pl=float(getattr(item, "unrealizedPNL", 0) or 0),
+            side="long" if qty > 0 else "short",
+        )
+
+    def _account_position_to_position(self, item) -> Position:
+        qty = float(item.position)
+        avg_price = float(getattr(item, "avgCost", 0) or 0)
+        return Position(
+            symbol=self._contract_symbol(item.contract),
+            qty=qty,
+            avg_price=avg_price,
+            market_value=avg_price * qty,
+            unrealized_pl=0.0,
+            side="long" if qty > 0 else "short",
+        )
 
     # ── BaseBroker interface ──────────────────────────────────────
 
@@ -156,24 +250,35 @@ class IBBroker(BaseBroker):
 
     def get_positions(self) -> list[Position]:
         self._ensure_connected()
-        result = []
+        self._refresh_position_cache()
+        by_symbol: dict[str, Position] = {}
+
         for item in self._ib.portfolio():
             qty = float(item.position)
             if qty == 0:
                 continue
-            result.append(Position(
-                symbol=item.contract.localSymbol or item.contract.symbol,
-                qty=qty,
-                avg_price=float(item.averageCost),
-                market_value=float(item.marketValue),
-                unrealized_pl=float(item.unrealizedPNL),
-                side="long" if qty > 0 else "short",
-            ))
-        return result
+            pos = self._portfolio_item_to_position(item)
+            by_symbol[self._position_key(pos.symbol)] = pos
+
+        try:
+            account_positions = self._ib.positions()
+        except Exception as e:
+            log.debug(f"IB positions() fallback failed: {e}")
+            account_positions = []
+
+        for item in account_positions:
+            qty = float(item.position)
+            if qty == 0:
+                continue
+            pos = self._account_position_to_position(item)
+            by_symbol.setdefault(self._position_key(pos.symbol), pos)
+
+        return list(by_symbol.values())
 
     def get_position(self, symbol: str) -> Optional[Position]:
+        target = self._position_key(symbol)
         for pos in self.get_positions():
-            if pos.symbol == symbol:
+            if self._position_key(pos.symbol) == target:
                 return pos
         return None
 
@@ -206,27 +311,45 @@ class IBBroker(BaseBroker):
         contract = self._resolve_contract(req.symbol, asset)
         if contract is None:
             raise ValueError(f"Cannot resolve IB contract for {req.symbol}")
+        order_qty = self._format_order_qty(asset, req.qty)
 
         ib_side = "BUY" if req.side == "buy" else "SELL"
+
+        def _apply_tif(order) -> None:
+            if asset != "crypto":
+                order.tif = (req.time_in_force or "day").upper()
+
+        # IB PAXOS crypto: BUY requires cashQty + GTC; SELL uses totalQuantity + GTC
+        def _make_market(side: str, qty) -> "MarketOrder":
+            o = MarketOrder(side, 0 if (asset == "crypto" and side == "BUY") else qty)
+            if asset == "crypto":
+                o.tif = "IOC"
+                if side == "BUY":
+                    o.cashQty = float(req.notional or (float(qty) * (self.get_quote(req.symbol).mid or 1)))
+            else:
+                _apply_tif(o)
+            return o
 
         if req.take_profit and req.stop_loss:
             tp_side = "SELL" if ib_side == "BUY" else "BUY"
 
             # Place parent first (transmit=False); IB assigns orderId via nextOrderId
-            parent_order = MarketOrder(ib_side, req.qty)
+            parent_order = _make_market(ib_side, order_qty)
             parent_order.transmit = False
             parent_trade = self._ib.placeOrder(contract, parent_order)
             parent_id = parent_trade.order.orderId
 
             # Children reference parent by its IB-assigned orderId
-            tp_order = LimitOrder(tp_side, req.qty, req.take_profit)
+            tp_order = LimitOrder(tp_side, order_qty, req.take_profit)
             tp_order.parentId = parent_id
             tp_order.transmit = False
+            _apply_tif(tp_order)
             self._ib.placeOrder(contract, tp_order)
 
-            sl_order = StopOrder(tp_side, req.qty, req.stop_loss)
+            sl_order = StopOrder(tp_side, order_qty, req.stop_loss)
             sl_order.parentId = parent_id
             sl_order.transmit = True  # releases all three atomically
+            _apply_tif(sl_order)
             self._ib.placeOrder(contract, sl_order)
 
             log.info(
@@ -234,6 +357,7 @@ class IBBroker(BaseBroker):
                 f"TP={req.take_profit} SL={req.stop_loss} "
                 f"parentId={parent_order.orderId}"
             )
+            self._invalidate_position_cache()
             return Order(
                 id=str(parent_trade.order.orderId),
                 symbol=req.symbol,
@@ -243,9 +367,10 @@ class IBBroker(BaseBroker):
                 status="submitted",
             )
         else:
-            order = MarketOrder(ib_side, req.qty)
+            order = _make_market(ib_side, order_qty)
             trade = self._ib.placeOrder(contract, order)
             log.info(f"IB MARKET: {ib_side} {req.qty} {req.symbol}")
+            self._invalidate_position_cache()
             return Order(
                 id=str(trade.order.orderId),
                 symbol=req.symbol,
@@ -287,10 +412,17 @@ class IBBroker(BaseBroker):
             return None
         try:
             ticker = self._ib.reqMktData(contract, "", True, False)
-            self._ib.sleep(1)
+            # Poll instead of self._ib.sleep() — ib.sleep() calls
+            # loop.run_until_complete() which raises "event loop already running"
+            # when invoked from Discord's async context or any other running loop.
+            # ib_insync's background thread keeps updating the ticker regardless.
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if (ticker.bid and ticker.bid > 0) or (ticker.last and ticker.last > 0):
+                    break
+                time.sleep(0.1)
             bid = float(ticker.bid) if ticker.bid and ticker.bid > 0 else 0.0
             ask = float(ticker.ask) if ticker.ask and ticker.ask > 0 else 0.0
-            self._ib.cancelMktData(contract)
             if bid > 0 and ask > 0:
                 return Quote(symbol=symbol, bid=bid, ask=ask)
             # Fallback: use last price with estimated spread
@@ -391,8 +523,8 @@ class IBBroker(BaseBroker):
         )
         return self.submit_order(req)
 
-    def submit_market_order(self, symbol: str, qty: int, side: str):
-        req = OrderRequest(symbol=symbol, qty=qty, side=side)
+    def submit_market_order(self, symbol: str, qty: int, side: str, notional: float = None):
+        req = OrderRequest(symbol=symbol, qty=qty, side=side, notional=notional)
         return self.submit_order(req)
 
     def submit_smart_order(self, symbol: str, qty: int, side: str,
@@ -443,14 +575,16 @@ class IBBroker(BaseBroker):
         if asset == "stock":
             from ib_insync import Stock
 
-            # 0th attempt: hard-coded override (bypasses SMART entirely)
+            # 0th attempt: hard-coded override with SMART routing + primary exchange hint.
+            # This avoids direct-routing rejections from IB precautionary settings.
             if symbol in self._SYMBOL_EXCHANGE:
                 exch = self._SYMBOL_EXCHANGE[symbol]
                 try:
-                    c = Stock(symbol, exch, "USD")
+                    c = Stock(symbol, "SMART", "USD")
+                    c.primaryExch = exch
                     qualified = self._ib.qualifyContracts(c)
                     if qualified:
-                        log.info(f"Resolved {symbol} via override exchange={exch}")
+                        log.info(f"Resolved {symbol} via override primaryExch={exch}")
                         return qualified[0]
                 except Exception:
                     pass
@@ -498,14 +632,7 @@ class IBBroker(BaseBroker):
             from ib_insync import Crypto
             # IB paper only supports BTC and ETH
             base = symbol.split("/")[0] if "/" in symbol else symbol[:-3]
-            contract = Crypto(base, "PAXOS", "USD")
-            try:
-                qualified = self._ib.qualifyContracts(contract)
-                if qualified:
-                    return qualified[0]
-            except Exception:
-                pass
-            return contract
+            return Crypto(base, "PAXOS", "USD")
 
         return None
 

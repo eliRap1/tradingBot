@@ -36,6 +36,7 @@ class OrderRequest:
     stop_loss: Optional[float] = None
     time_in_force: str = "day"
     limit_price: Optional[float] = None
+    notional: Optional[float] = None  # USD notional — required for IB crypto BUY orders
 
 
 @dataclass

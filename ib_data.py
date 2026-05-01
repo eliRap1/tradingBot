@@ -150,6 +150,8 @@ class IBDataFetcher(BaseDataFetcher):
         self._ib = ib
         self._cm = contract_manager
         self._config = config
+        # Allow delayed data when live market data subscription is missing
+        self._ib.reqMarketDataType(3)  # 3 = delayed-frozen (live if available, else delayed)
         self._cache: dict[tuple, tuple[float, pd.DataFrame]] = {}
         self._cache_lock = threading.Lock()
         self._pacing_lock = threading.Lock()
@@ -177,13 +179,17 @@ class IBDataFetcher(BaseDataFetcher):
         return result
 
     def get_intraday_bars(self, symbol: str, timeframe: str = "5Min",
-                          days: int = 5) -> Optional[pd.DataFrame]:
+                          days: int = 5, cache_only: bool = False) -> Optional[pd.DataFrame]:
         key = (symbol, timeframe)
         ttl = CACHE_TTLS.get(timeframe, 360)
         with self._cache_lock:
             cached = self._cache.get(key)
             if cached and time.time() - cached[0] < ttl:
                 return cached[1]
+            # Even if stale, return cached data in cache-only mode (better than None).
+            stale_cached = cached[1] if cached else None
+        if cache_only:
+            return stale_cached
         df = self._fetch_with_retry(symbol, timeframe, days)
         if df is not None:
             with self._cache_lock:
@@ -216,8 +222,11 @@ class IBDataFetcher(BaseDataFetcher):
             if not contract:
                 return None
             ticker = self._ib.reqMktData(contract, "", True, False)
-            self._ib.sleep(1)
-            self._ib.cancelMktData(contract)
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if (ticker.last and ticker.last > 0) or (ticker.bid and ticker.bid > 0):
+                    break
+                time.sleep(0.1)
             for attr in ("last", "close", "bid"):
                 val = getattr(ticker, attr, None)
                 if val and float(val) > 0:
@@ -242,8 +251,11 @@ class IBDataFetcher(BaseDataFetcher):
             if not contract:
                 return None
             ticker = self._ib.reqMktData(contract, "", True, False)
-            self._ib.sleep(1)
-            self._ib.cancelMktData(contract)
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if (ticker.bid and ticker.bid > 0) or (ticker.last and ticker.last > 0):
+                    break
+                time.sleep(0.1)
             return {
                 "bid":   float(ticker.bid)   if ticker.bid   and ticker.bid   > 0 else None,
                 "ask":   float(ticker.ask)   if ticker.ask   and ticker.ask   > 0 else None,
@@ -388,17 +400,20 @@ class IBDataFetcher(BaseDataFetcher):
             from ib_insync import Stock
             _ensure_event_loop()
 
-            # 0th attempt: hard-coded override
+            # 0th attempt: hard-coded override with SMART routing + primary exchange hint.
+            # This keeps qualification stable without forcing direct exchange routing.
             if symbol in self._SYMBOL_EXCHANGE:
                 exch = self._SYMBOL_EXCHANGE[symbol]
                 try:
-                    c = Stock(symbol, exch, "USD")
+                    c = Stock(symbol, "SMART", "USD")
+                    c.primaryExch = exch
                     qualified = self._ib.qualifyContracts(c)
                     if qualified:
-                        log.info(f"Resolved {symbol} via override exchange={exch}")
+                        log.info(f"Resolved {symbol} via override primaryExch={exch}")
                         return qualified[0]
-                except Exception:
-                    pass
+                    log.warning(f"qualify {symbol} override {exch} returned empty")
+                except Exception as e:
+                    log.warning(f"qualify {symbol} override {exch} exception: {e}")
 
             # 1st attempt: plain SMART routing (works for most liquid US equities)
             contract = Stock(symbol, "SMART", "USD")
@@ -406,8 +421,9 @@ class IBDataFetcher(BaseDataFetcher):
                 qualified = self._ib.qualifyContracts(contract)
                 if qualified:
                     return qualified[0]
-            except Exception:
-                pass
+                log.warning(f"qualify {symbol} SMART returned empty")
+            except Exception as e:
+                log.warning(f"qualify {symbol} SMART exception: {e}")
 
             # 2nd attempt: primaryExch hints (SMART + hint)
             for exch in self._STOCK_EXCHANGE_HINTS:

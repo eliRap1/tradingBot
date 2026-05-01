@@ -26,6 +26,7 @@ from trend import get_trend_context, get_weekly_trend, get_hourly_bias
 from indicators import supertrend, pivot_high, pivot_low, stochastic_rsi, last_pivot_value, order_flow_imbalance
 from crypto_sentiment import crypto_sentiment
 from ib_data import IB_CRYPTO_SYMBOLS
+from instrument_classifier import InstrumentClassifier
 from state_db import StateDB
 from utils import setup_logger
 
@@ -106,6 +107,8 @@ class StockWatcher:
         self._max_cache_age_seconds = 300  # refresh bars every 5 min max
         self._alpha_decay = {}  # {strategy_name: float} set by coordinator
         self._macro_regime: str = "bull"
+        self._threshold_overrides: dict | None = None
+        self._clf = InstrumentClassifier(config)
 
         # Restore pending signal state from disk (survives restarts)
         self.state.prev_signal = _load_pending_state(symbol)
@@ -118,38 +121,130 @@ class StockWatcher:
             if name not in self.strategies and name in ALL_STRATEGIES:
                 self.strategies[name] = ALL_STRATEGIES[name](self.config)
 
-    def start(self):
-        """Start watching in a background thread."""
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name=f"watcher-{self.symbol}",
-            daemon=True
+    def set_threshold_overrides(
+        self,
+        min_score: float | None = None,
+        min_agreeing: int | None = None,
+        mode: str = "normal",
+        reason: str = "",
+    ):
+        if min_score is None and min_agreeing is None:
+            self._threshold_overrides = None
+            return
+        self._threshold_overrides = {
+            "min_score": min_score,
+            "min_agreeing": min_agreeing,
+            "mode": mode,
+            "reason": reason,
+        }
+
+    def clear_threshold_overrides(self):
+        self._threshold_overrides = None
+
+    def _entry_thresholds(
+        self,
+        asset_type: str | None = None,
+        is_crypto: bool | None = None,
+    ) -> tuple[int, float]:
+        if asset_type is None:
+            asset_type = "crypto" if is_crypto else "stock"
+        asset_cfg = self.config.get("risk", {}).get("asset_overrides", {}).get(asset_type, {})
+        if asset_type == "crypto":
+            min_agreeing = self.config["signals"].get("min_crypto_agreeing", 2)
+            min_score = self.config["signals"].get("min_crypto_score", 0.15)
+        else:
+            min_agreeing = self.config["signals"].get("min_agreeing_strategies", 3)
+            min_score = self.config["signals"]["min_composite_score"]
+        min_agreeing = int(asset_cfg.get("min_agreeing", min_agreeing))
+        min_score = float(asset_cfg.get("min_score", min_score))
+        if asset_type == "stock" and self._threshold_overrides:
+            override_score = self._threshold_overrides.get("min_score")
+            override_agreeing = self._threshold_overrides.get("min_agreeing")
+            if override_score is not None:
+                min_score = max(min_score, float(override_score))
+            if override_agreeing is not None:
+                min_agreeing = max(min_agreeing, int(override_agreeing))
+        return min_agreeing, min_score
+
+    def _crypto_regime_allows_long(self, daily_df: pd.DataFrame) -> bool:
+        cfg = (
+            self.config.get("risk", {})
+            .get("asset_overrides", {})
+            .get("crypto", {})
+            .get("regime_filter", {})
         )
-        self._thread.start()
+        if not cfg.get("enabled", False):
+            return True
+
+        ema_period = int(cfg.get("ema_period", 20))
+        lookback = int(cfg.get("return_lookback_bars", 20))
+        min_len = max(ema_period, lookback) + 1
+        if daily_df is None or len(daily_df) < min_len:
+            return False
+
+        def above_ema(df: pd.DataFrame) -> bool:
+            close = df["close"]
+            ema = close.ewm(span=ema_period, min_periods=max(2, ema_period // 2)).mean().iloc[-1]
+            return float(close.iloc[-1]) > float(ema)
+
+        def ret_ok(df: pd.DataFrame) -> bool:
+            if len(df) <= lookback:
+                return False
+            close = df["close"]
+            base = float(close.iloc[-lookback - 1])
+            if base <= 0:
+                return False
+            ret = float(close.iloc[-1]) / base - 1.0
+            return ret >= float(cfg.get("min_benchmark_return", 0.0))
+
+        if cfg.get("require_symbol_above_ema", True) and not above_ema(daily_df):
+            return False
+
+        benchmark = str(cfg.get("benchmark_symbol", "BTC/USD"))
+        if benchmark == self.symbol:
+            benchmark_df = daily_df
+        else:
+            benchmark_df = self.data.get_intraday_bars(
+                benchmark, timeframe="1Day", days=250, cache_only=True
+            )
+        if benchmark_df is None or len(benchmark_df) < min_len:
+            return False
+        if cfg.get("require_benchmark_above_ema", True) and not above_ema(benchmark_df):
+            return False
+        return ret_ok(benchmark_df)
+
+    def start(self):
+        """No-op — watchers no longer spawn threads. Coordinator calls
+        analyze_once() directly on its main loop after priming the bar cache.
+        Kept as a shim so existing call sites stay valid.
+        """
+        self.state.status = "watching"
         self.log.info(f"Started watching {self.symbol}")
 
     def stop(self):
-        """Stop the watcher thread."""
+        """No-op — no thread to stop."""
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=5)
         self.state.status = "stopped"
         self.log.info(f"Stopped watching {self.symbol}")
 
-    def _run_loop(self):
-        """Main loop — fetch data, analyze, decide."""
-        while not self._stop_event.is_set():
-            try:
-                self.state.status = "watching"
-                self._analyze()
-                self.state.last_update = datetime.now().strftime("%H:%M:%S")
-            except Exception as e:
-                self.state.error = str(e)
-                self.state.status = "error"
-                self.log.error(f"Error: {e}")
-
-            self._stop_event.wait(timeout=self.interval)
+    def analyze_once(self):
+        """Run a single analyze cycle on the caller's thread.
+        Must be called after ib_data._cache is primed — never blocks on IB.
+        """
+        t0 = time.time()
+        try:
+            self.state.status = "watching"
+            self._analyze()
+            self.state.last_update = datetime.now().strftime("%H:%M:%S")
+        except Exception as e:
+            self.state.error = str(e)
+            self.state.status = "error"
+            self.log.error(f"Error: {e}")
+        dur = time.time() - t0
+        self.log.debug(
+            f"analyze status={self.state.status} score={self.state.score:+.3f} "
+            f"action={self.state.action.name} dur={dur:.2f}s"
+        )
 
     def _analyze(self):
         """Full analysis cycle for this stock.
@@ -168,20 +263,20 @@ class StockWatcher:
             if now - self._bars_cache_time > self._max_cache_age_seconds:
                 self._bars = None  # Force refresh
 
-        # 1a. Fetch DAILY bars for trend context (served from cache primed by coordinator)
-        daily_df = self.data.get_intraday_bars(self.symbol, timeframe="1Day", days=250)
+        # 1a. Fetch DAILY bars for trend context (cache-only — coordinator primes)
+        daily_df = self.data.get_intraday_bars(self.symbol, timeframe="1Day", days=250, cache_only=True)
         if daily_df is None or len(daily_df) < 30:
             self.state.status = "no_data"
             return
 
-        # 1b. Fetch 5-MINUTE bars for entry signals (served from cache primed by coordinator)
-        intraday_df = self.data.get_intraday_bars(self.symbol, timeframe="5Min", days=5)
+        # 1b. Fetch 5-MINUTE bars for entry signals (cache-only)
+        intraday_df = self.data.get_intraday_bars(self.symbol, timeframe="5Min", days=5, cache_only=True)
         if intraday_df is None or len(intraday_df) < 30:
             # Fall back to daily if intraday not available (market closed, etc.)
             intraday_df = daily_df
 
-        # 1c. Fetch 1-HOUR bars for intermediate confirmation (served from cache primed by coordinator)
-        hourly_df = self.data.get_intraday_bars(self.symbol, timeframe="1Hour", days=10)
+        # 1c. Fetch 1-HOUR bars for intermediate confirmation (cache-only)
+        hourly_df = self.data.get_intraday_bars(self.symbol, timeframe="1Hour", days=10, cache_only=True)
         if hourly_df is not None and len(hourly_df) >= 25:
             self._hourly_bias = get_hourly_bias(hourly_df)
         else:
@@ -269,12 +364,10 @@ class StockWatcher:
         flow = order_flow_imbalance(intraday_df, lookback=20)
 
         # 6. Decision: LONG, SHORT, or NONE
-        is_crypto = self.symbol in IB_CRYPTO_SYMBOLS
+        asset_type = self._clf.classify(self.symbol)
+        is_crypto = asset_type == "crypto" or self.symbol in IB_CRYPTO_SYMBOLS
         # Crypto needs only 2/5 strategies (fewer patterns in 24/7 markets)
-        min_agreeing = self.config["signals"].get("min_crypto_agreeing", 2) if is_crypto \
-            else self.config["signals"].get("min_agreeing_strategies", 3)
-        min_score = self.config["signals"].get("min_crypto_score", 0.15) if is_crypto \
-            else self.config["signals"]["min_composite_score"]
+        min_agreeing, min_score = self._entry_thresholds(asset_type)
 
         # Crypto sentiment filter (funding rate proxy)
         crypto_penalize_long = False
@@ -288,13 +381,18 @@ class StockWatcher:
                               f"({'EXTREME GREED' if sent['extreme_greed'] else 'EXTREME FEAR'})")
 
         # Check for LONG signal (blocked if strong bearish order flow or crypto extreme greed)
+        crypto_regime_allows_long = True if not is_crypto else self._crypto_regime_allows_long(daily_df)
         has_long = (num_bullish >= min_agreeing and composite >= min_score
                     and not flow["is_bearish_flow"]
-                    and not crypto_penalize_long)
+                    and not crypto_penalize_long
+                    and crypto_regime_allows_long)
+        asset_cfg = self.config.get("risk", {}).get("asset_overrides", {}).get(asset_type, {})
+        allow_shorts = bool(asset_cfg.get("allow_shorts", asset_type != "stock"))
         # Check for SHORT signal — only block if shorts are already overcrowded
         # (extreme bearish flow = squeeze risk). Bullish flow on a bearish signal
         # means trapped longs — that IS the short setup, do NOT block it.
-        has_short = (num_bearish >= min_agreeing and composite <= -min_score
+        has_short = (allow_shorts
+                     and num_bearish >= min_agreeing and composite <= -min_score
                      and not (flow["is_bearish_flow"] and flow.get("flow_strength", 0) > 0.40)
                      and not crypto_penalize_short)
 

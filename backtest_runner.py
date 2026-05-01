@@ -99,6 +99,8 @@ def main():
                         help="Use real Alpaca data (requires API keys)")
     parser.add_argument("--output", type=str, default="",
                         help="Save equity curve to CSV file")
+    parser.add_argument("--oos-pct", type=float, default=0.0,
+                        help="If >0, split bars into IS (first 1-pct) / OOS (last pct) and report both")
     args = parser.parse_args()
 
     config = load_config()
@@ -124,9 +126,57 @@ def main():
         print("Using synthetic data (add --live-data for real Alpaca data)")
         bars = generate_test_data(symbols, args.days)
 
-    # Run backtest
-    bt = Backtester(config, initial_equity=args.equity)
-    result = bt.run(bars)
+    # Run backtest (full, or IS/OOS split)
+    if args.oos_pct > 0.0:
+        pct = max(0.05, min(args.oos_pct, 0.5))
+        is_bars = {}
+        oos_bars = {}
+        for sym, df in bars.items():
+            if df is None or len(df) < 30:
+                continue
+            cut = int(len(df) * (1.0 - pct))
+            is_bars[sym] = df.iloc[:cut]
+            oos_bars[sym] = df.iloc[cut:]
+        print(f"\n[OOS] Splitting bars: IS={1-pct:.0%} / OOS={pct:.0%}")
+
+        print("\n[IS] In-sample backtest:")
+        bt_is = Backtester(config, initial_equity=args.equity)
+        is_res = bt_is.run(is_bars)
+
+        print("\n[OOS] Out-of-sample backtest:")
+        bt_oos = Backtester(config, initial_equity=args.equity)
+        oos_res = bt_oos.run(oos_bars)
+
+        print()
+        print("=" * 60)
+        print("OOS vs IS COMPARISON")
+        print("=" * 60)
+
+        def _fmt(lbl, r):
+            return (f"{lbl:6s}  trades={r.total_trades:3d}  "
+                    f"win%={r.win_rate:5.1f}  ret%={r.total_return_pct:+6.2f}  "
+                    f"APR%={r.apr_pct:+6.2f}  "
+                    f"PF={r.profit_factor:4.2f}  Sharpe={r.sharpe_ratio:5.2f}  "
+                    f"MDD%={r.max_drawdown_pct:5.2f}")
+
+        print(_fmt("IS", is_res))
+        print(_fmt("OOS", oos_res))
+
+        # Acceptance: OOS metrics within 20% of IS
+        def _within(a, b, tol=0.20):
+            if abs(a) < 1e-6:
+                return True
+            return abs(b - a) / abs(a) <= tol
+
+        ok_ret = _within(is_res.total_return_pct, oos_res.total_return_pct)
+        ok_pf = _within(is_res.profit_factor, oos_res.profit_factor)
+        ok_wr = _within(is_res.win_rate, oos_res.win_rate)
+        verdict = "PASS" if (ok_ret and ok_pf and ok_wr) else "FAIL"
+        print(f"\nOOS within 20% of IS: return={ok_ret} pf={ok_pf} wr={ok_wr} → {verdict}")
+        result = oos_res
+    else:
+        bt = Backtester(config, initial_equity=args.equity)
+        result = bt.run(bars)
 
     # Print summary
     print()
@@ -136,6 +186,8 @@ def main():
     print(f"Total Trades:   {result.total_trades}")
     print(f"Win Rate:       {result.win_rate}%")
     print(f"Total Return:   {result.total_return_pct}%")
+    print(f"Profit:         ${result.profit_usd:+,.2f}")
+    print(f"APR:            {result.apr_pct}%")
     print(f"Sharpe Ratio:   {result.sharpe_ratio}")
     print(f"Max Drawdown:   {result.max_drawdown_pct}%")
     print(f"Profit Factor:  {result.profit_factor}")

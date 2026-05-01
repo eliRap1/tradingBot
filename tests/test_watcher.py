@@ -13,6 +13,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from watcher import WatcherState, Action
+from tests.helpers import make_config
 
 
 class TestConfirmationFilter:
@@ -109,3 +110,18 @@ def test_bear_veto_zeroes_momentum_gap_breakout():
     assert selection["strategies"]["momentum"] == 0.0
     assert selection["strategies"]["gap"] == 0.0
     assert selection["strategies"]["breakout"] == 0.0
+
+
+def test_threshold_overrides_apply_to_stocks_not_crypto():
+    from watcher import StockWatcher
+
+    watcher = StockWatcher("AAPL", make_config(), MagicMock(), strategies={})
+    watcher.set_threshold_overrides(min_score=0.31, min_agreeing=5, mode="defensive")
+
+    stock_agreeing, stock_score = watcher._entry_thresholds(is_crypto=False)
+    crypto_agreeing, crypto_score = watcher._entry_thresholds(is_crypto=True)
+
+    assert stock_agreeing == 5
+    assert stock_score == 0.31
+    assert crypto_agreeing == 2
+    assert crypto_score == 0.20

@@ -3,6 +3,7 @@ import numpy as np
 import ta
 from dataclasses import dataclass
 from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS
+from instrument_classifier import InstrumentClassifier
 from utils import setup_logger
 from state import load_state, save_state
 
@@ -30,6 +31,26 @@ class RiskManager:
         self.peak_equity = state.get("peak_equity", 0.0)
         self.daily_pnl = 0.0
         self.starting_equity = 0.0
+        self._clf = InstrumentClassifier(config)
+
+    def _asset_cfg(self, asset_type: str) -> dict:
+        overrides = self.cfg.get("asset_overrides", {}).get(asset_type, {})
+        return {**self.cfg, **overrides}
+
+    def _futures_root(self, symbol: str) -> str:
+        sym = symbol.upper()
+        for contract in self._config.get("futures", {}).get("contracts", []):
+            root = str(contract.get("root", "")).upper()
+            if root and sym.startswith(root):
+                return root
+        return sym
+
+    def _contract_multiplier(self, symbol: str, asset_type: str) -> float:
+        if asset_type != "futures":
+            return float(self._asset_cfg(asset_type).get("contract_multiplier", 1.0))
+        futures_cfg = self._asset_cfg("futures")
+        multipliers = futures_cfg.get("contract_multipliers", {})
+        return float(multipliers.get(self._futures_root(symbol), futures_cfg.get("contract_multiplier", 1.0)))
 
     def set_starting_equity(self, equity: float):
         """Call at start of day to track daily loss limit."""
@@ -71,6 +92,8 @@ class RiskManager:
 
             entry_price = prices[opp.symbol]
             df = bars[opp.symbol]
+            asset_type = self._clf.classify(opp.symbol)
+            asset_cfg = self._asset_cfg(asset_type)
 
             # Calculate ATR for stop/target placement
             atr = self._get_atr(df)
@@ -80,13 +103,12 @@ class RiskManager:
             # Direction: positive score = long, negative = short
             is_short = opp.direction == "sell" or opp.score < 0
 
-            # Use crypto-specific risk params if applicable
-            crypto_cfg = self.cfg
+            # Use asset-specific risk params if applicable.
             if opp.symbol in CRYPTO_SYMBOLS:
                 # Merge crypto overrides from screener.crypto_risk
                 crypto_overrides = self._config.get("screener", {}).get("crypto_risk", {})
                 if crypto_overrides:
-                    crypto_cfg = {**self.cfg, **crypto_overrides}
+                    asset_cfg = {**asset_cfg, **crypto_overrides}
 
             # Get profit enhancement for this symbol
             enhancement = profit_enhancements.get(opp.symbol, {})
@@ -96,22 +118,21 @@ class RiskManager:
 
             if is_short:
                 # SHORT: stop above entry, target below entry
-                stop_loss = entry_price + (atr * crypto_cfg["stop_loss_atr_mult"] * stop_mult)
-                take_profit = entry_price - (atr * crypto_cfg["take_profit_atr_mult"] * target_mult)
+                stop_loss = entry_price + (atr * asset_cfg["stop_loss_atr_mult"] * stop_mult)
+                take_profit = entry_price - (atr * asset_cfg["take_profit_atr_mult"] * target_mult)
                 risk = stop_loss - entry_price
                 reward = entry_price - take_profit
                 side = "sell"
             else:
                 # LONG: stop below entry, target above entry
-                stop_loss = entry_price - (atr * crypto_cfg["stop_loss_atr_mult"] * stop_mult)
-                take_profit = entry_price + (atr * crypto_cfg["take_profit_atr_mult"] * target_mult)
+                stop_loss = entry_price - (atr * asset_cfg["stop_loss_atr_mult"] * stop_mult)
+                take_profit = entry_price + (atr * asset_cfg["take_profit_atr_mult"] * target_mult)
                 risk = entry_price - stop_loss
                 reward = take_profit - entry_price
                 side = "buy"
 
             # ── Risk:Reward filter ───────────────────────────
-            # Use crypto-specific min R:R if available
-            min_rr = crypto_cfg.get("min_risk_reward", self.cfg.get("min_risk_reward", 2.5))
+            min_rr = asset_cfg.get("min_risk_reward", self.cfg.get("min_risk_reward", 2.5))
             if risk <= 0:
                 continue
             rr_ratio = reward / risk
@@ -120,13 +141,14 @@ class RiskManager:
                 continue
 
             # ── Position sizing ───────────────────────────────
-            risk_per_share = risk
-            sizing_method = self.cfg.get("sizing_method", "volatility_adjusted")
+            multiplier = self._contract_multiplier(opp.symbol, asset_type)
+            risk_per_unit = risk * multiplier
+            sizing_method = asset_cfg.get("sizing_method", self.cfg.get("sizing_method", "volatility_adjusted"))
 
             if sizing_method == "volatility_adjusted":
                 # Volatility-adjusted sizing: smaller positions for volatile stocks
                 vol_factor = self._get_volatility_factor(df, entry_price)
-                base_risk_pct = self.cfg["max_portfolio_risk_pct"]
+                base_risk_pct = asset_cfg["max_portfolio_risk_pct"]
                 # Adjust risk based on volatility (inverse relationship)
                 adjusted_risk_pct = base_risk_pct * vol_factor
                 max_risk_dollars = equity * adjusted_risk_pct
@@ -145,7 +167,7 @@ class RiskManager:
 
                 if strat_kelly is not None and strat_kelly > 0:
                     # Per-strategy Kelly available — use it
-                    kelly_f = min(strat_kelly, self.cfg["max_portfolio_risk_pct"])
+                    kelly_f = min(strat_kelly, asset_cfg["max_portfolio_risk_pct"])
                     max_risk_dollars = equity * kelly_f
                     log.info(f"Strategy Kelly: f={kelly_f:.4f} for {contributing}")
                 elif total_trades >= kelly_min_trades:
@@ -164,30 +186,50 @@ class RiskManager:
                         log.warning(f"Kelly fraction negative ({kelly_f:.4f}) — system is losing, skipping trade")
                         continue
 
-                    kelly_f = min(kelly_f, self.cfg["max_portfolio_risk_pct"])
+                    kelly_f = min(kelly_f, asset_cfg["max_portfolio_risk_pct"])
 
                     max_risk_dollars = equity * kelly_f
                     log.info(f"Kelly sizing: f={kelly_f:.4f} (p={p:.2f} b={b:.2f})")
                 else:
-                    max_risk_dollars = equity * self.cfg["max_portfolio_risk_pct"]
+                    max_risk_dollars = equity * asset_cfg["max_portfolio_risk_pct"]
             else:
-                max_risk_dollars = equity * self.cfg["max_portfolio_risk_pct"]
+                max_risk_dollars = equity * asset_cfg["max_portfolio_risk_pct"]
 
-            is_crypto = opp.symbol in CRYPTO_SYMBOLS
-            qty_by_risk = max_risk_dollars / risk_per_share
-            max_position_dollars = equity * self.cfg["max_position_pct"]
-            qty_by_size = max_position_dollars / entry_price
+            is_crypto = asset_type == "crypto" or opp.symbol in CRYPTO_SYMBOLS
+            # Leverage: scales notional cap (equity × leverage × max_position_pct)
+            # but NOT risk budget (that stays on cash equity so stops still bite).
+            # Crypto never leveraged (no margin on IB PAXOS).
+            leverage = 1.0 if is_crypto else float(asset_cfg.get("leverage", self.cfg.get("leverage", 1.0)))
+            qty_by_risk = max_risk_dollars / risk_per_unit
+            max_position_dollars = equity * leverage * asset_cfg["max_position_pct"]
+            qty_by_size = max_position_dollars / max(entry_price * multiplier, 1e-9)
 
             qty = min(qty_by_risk, qty_by_size)
 
             # Apply regime size multiplier and profit boost
             qty = qty * regime_size_mult * size_boost
 
-            # Round: crypto keeps fractional, stocks round to int
+            # ── ADV liquidity cap (stocks only) ──────────────
+            # Prevent orders from being too large a slice of avg daily
+            # dollar volume — slippage protection on thin names.
+            if asset_type == "stock":
+                adv_cap_pct = asset_cfg.get("max_pct_of_adv", self.cfg.get("max_pct_of_adv", 0.01))
+                if adv_cap_pct > 0:
+                    adv_cap_qty = self._adv_cap_qty(df, entry_price, adv_cap_pct)
+                    if adv_cap_qty is not None and adv_cap_qty < qty:
+                        log.info(
+                            f"{opp.symbol}: ADV cap applied "
+                            f"qty {qty:.0f} → {adv_cap_qty:.0f} "
+                            f"(cap={adv_cap_pct*100:.1f}% of 20d ADV)"
+                        )
+                        qty = adv_cap_qty
+
+            # Round: crypto keeps fractional, stocks/futures round to whole units.
             if not is_crypto:
                 qty = int(qty)
 
-            if qty <= 0:
+            min_qty = float(asset_cfg.get("min_qty", 0.000001 if is_crypto else 1.0))
+            if qty < min_qty:
                 continue
 
             orders.append(SizedOrder(
@@ -204,7 +246,7 @@ class RiskManager:
             log.info(
                 f"Sized: {side.upper()} {opp.symbol} qty={qty} entry={entry_price:.2f} "
                 f"SL={stop_loss:.2f} TP={take_profit:.2f} "
-                f"R:R={rr_ratio:.1f} risk=${risk_per_share * qty:.2f}"
+                f"R:R={rr_ratio:.1f} risk=${risk_per_unit * qty:.2f}"
                 + (f" boost={size_boost:.2f}" if size_boost != 1.0 else "")
             )
 
@@ -263,6 +305,21 @@ class RiskManager:
             log.warning(f"Drawdown warning: {drawdown:.1%}")
 
         return False
+
+    def _adv_cap_qty(self, df: pd.DataFrame, price: float, cap_pct: float) -> float | None:
+        """Return max qty that keeps order notional <= cap_pct of 20d ADV.
+
+        ADV = avg of (close * volume) over last 20 sessions.
+        """
+        if len(df) < 20 or "volume" not in df.columns:
+            return None
+        try:
+            dollar_vol = (df["close"].tail(20) * df["volume"].tail(20)).mean()
+        except Exception:
+            return None
+        if not dollar_vol or dollar_vol <= 0 or price <= 0:
+            return None
+        return float(dollar_vol * cap_pct / price)
 
     def _get_atr(self, df: pd.DataFrame, period: int = 14) -> float | None:
         if len(df) < period + 1:

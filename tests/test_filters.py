@@ -10,7 +10,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from filters import SECTOR_MAP, MAX_PER_SECTOR
+from filters import SECTOR_MAP, MAX_PER_SECTOR, compute_regime_guard_decision
+from tests.helpers import make_config
 
 
 class TestSectorCap:
@@ -55,3 +56,74 @@ class TestGapFilter:
         gap_threshold = 0.02
         assert 0.01 <= gap_threshold <= 0.05, \
             f"Gap threshold {gap_threshold} outside reasonable range"
+
+
+class TestRegimeGuard:
+    def _config(self):
+        cfg = make_config()
+        cfg["filters"] = {
+            "regime_guard": {
+                "enabled": True,
+                "lookback_trades": 20,
+                "min_trades": 8,
+                "recent_wr_trades": 5,
+                "caution_pf": 1.3,
+                "defensive_pf": 1.0,
+                "defensive_recent_wr": 0.30,
+            }
+        }
+        return cfg
+
+    def test_guard_normal_with_too_few_trades(self):
+        decision = compute_regime_guard_decision(
+            [{"pnl": -100.0}, {"pnl": -50.0}],
+            self._config(),
+        )
+
+        assert decision.mode == "normal"
+        assert decision.size_mult == 1.0
+
+    def test_guard_caution_on_low_profit_factor(self):
+        trades = [{"pnl": p} for p in [150, 100, -100, 100, -100, 100, -100, -100]]
+
+        decision = compute_regime_guard_decision(trades, self._config())
+
+        assert decision.mode == "caution"
+        assert decision.size_mult < 1.0
+        assert decision.max_positions < make_config()["signals"]["max_positions"]
+        assert decision.min_agreeing > make_config()["signals"]["min_agreeing_strategies"]
+
+    def test_guard_defensive_on_bad_recent_win_rate(self):
+        trades = [{"pnl": p} for p in [200, 200, 200, 200, 200, -50, -50, -50, -50, -50]]
+
+        decision = compute_regime_guard_decision(trades, self._config())
+
+        assert decision.mode == "defensive"
+        assert decision.min_agreeing >= 5
+        assert decision.max_positions <= 4
+
+    def test_guard_preserves_zero_stock_slots(self):
+        trades = [{"pnl": -100.0} for _ in range(8)]
+
+        decision = compute_regime_guard_decision(
+            trades,
+            self._config(),
+            base_max_positions=0,
+        )
+
+        assert decision.mode == "defensive"
+        assert decision.max_positions == 0
+
+    def test_guard_paper_only_disables_live_mode(self):
+        cfg = self._config()
+        cfg["filters"]["regime_guard"]["paper_only"] = True
+        trades = [{"pnl": -100.0} for _ in range(8)]
+
+        decision = compute_regime_guard_decision(
+            trades,
+            cfg,
+            trading_mode="live",
+        )
+
+        assert decision.mode == "normal"
+        assert decision.reason == "regime_guard paper_only in live mode"

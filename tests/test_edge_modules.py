@@ -268,12 +268,12 @@ class TestMLSignalFilter:
             "days_to_earnings": 20,
             "nq_overnight_move": 0.002,
         })
-        # 8 strategies + 13 scalar features
-        assert len(vec) == 8 + 13
+        # 9 strategies (incl. DOL) + 13 scalar features
+        assert len(vec) == 9 + 13
 
     def test_regime_encoding_stable(self):
         filt = MLSignalFilter(min_trades=1000)
         a = filt._build_feature_vector({"strategy_scores": {}, "regime": "bull_trending"})
         b = filt._build_feature_vector({"strategy_scores": {}, "regime": "bear_choppy"})
-        regime_idx = 8 + 2  # strategies block + (composite, num_agreeing) then regime
+        regime_idx = 9 + 2  # strategies block (incl. DOL) + (composite, num_agreeing) then regime
         assert a[regime_idx] != b[regime_idx]

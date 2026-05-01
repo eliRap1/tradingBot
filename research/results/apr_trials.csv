@@ -1,0 +1,7 @@
+name,acceptance,full_apr_pct,full_profit_usd,full_return_pct,full_pf,full_max_dd,full_trades,median_fold_apr,worst_fold_apr,folds_pf_ge_1_3
+baseline,no_ship,-1.54,-497.91,-0.5,0.0,0.85,1,0.0,0.0,0
+trend_rotation,no_ship,-1.54,-497.91,-0.5,0.0,1.34,1,0.0,0.0,0
+trend_conservative,no_ship,-2.06,-665.2,-0.67,0.0,1.34,1,0.0,0.0,0
+stocks_futures_no_crypto,no_ship,0.0,0.0,0.0,0.0,0.0,0,0.0,0.0,0
+micro_futures_trend_no_crypto,no_ship,16.93,5156.95,5.16,1.38,7.96,19,0.0,0.0,0
+apr_push_paper,no_ship,-2.72,-882.57,-0.88,0.0,1.67,1,0.0,0.0,0

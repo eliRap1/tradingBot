@@ -35,6 +35,12 @@ from edge.cross_asset import CrossAssetEngine
 from edge.news_sentiment import NewsSentimentEngine
 from edge.ml_filter import MLSignalFilter
 from edge.microstructure import MicrostructureGate
+from edge.econ_calendar import EconCalendar
+from edge.gap_filter import GapFilter
+from edge.insider_flow import InsiderFlow
+from edge.relative_strength import RelativeStrength
+from edge.market_calendar import MarketCalendar
+from edge.volume_gate import VolumeGate
 
 log = setup_logger("coordinator")
 
@@ -85,6 +91,7 @@ class Coordinator:
         self.alerts = AlertManager(self.config)
         self._trading_paused = False  # can be set via !pause Discord command
         self._last_regime_str = ""    # track regime changes for alerts
+        self._last_regime_guard_mode = ""
         self.discord_bot = DiscordBot(
             tracker=self.portfolio.tracker, broker=self.broker, coordinator=self
         )
@@ -95,6 +102,12 @@ class Coordinator:
         self.edge_news = NewsSentimentEngine(self.config)
         self.edge_ml = MLSignalFilter(min_trades=self.config.get("edge", {}).get("ml_min_trades", 100))
         self.edge_micro = MicrostructureGate(self.broker, self.data, self.config)
+        self.edge_econ = EconCalendar(self.config)
+        self.edge_gap = GapFilter(self.config)
+        self.edge_insider = InsiderFlow(self.config)
+        self.edge_rs = RelativeStrength(self.data, self.config)
+        self.edge_calendar = MarketCalendar(self.config)
+        self.edge_volume = VolumeGate(self.config)
         self._current_regime_4state = "bull_choppy"
 
         # LIVE TRADING: Real-time data validation
@@ -104,9 +117,12 @@ class Coordinator:
         # Watcher threads: {symbol: StockWatcher}
         self.watchers: dict[str, StockWatcher] = {}
         self._lock = threading.Lock()
+        self._shutdown_event = threading.Event()
 
         # Order rate limiter: track timestamps of recent orders
         self._order_timestamps: list[float] = []
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
 
         # Verify connection and show market status
         equity = self.broker.get_equity()
@@ -161,9 +177,11 @@ class Coordinator:
             universe = list(self.config["screener"].get("crypto", []))
             if non_stock_only:
                 # Also include futures so they trade during their CME session
-                futures_roots = [
-                    c["root"] for c in self.config.get("futures", {}).get("contracts", [])
-                ]
+                futures_roots = self.config.get("futures", {}).get("symbols")
+                if not futures_roots:
+                    futures_roots = [
+                        c["root"] for c in self.config.get("futures", {}).get("contracts", [])
+                    ]
                 universe = list(dict.fromkeys(universe + futures_roots))
         else:
             universe = self.screener.get_universe()
@@ -172,8 +190,11 @@ class Coordinator:
                 universe = self.config["screener"]["universe"]
             # Add crypto symbols
             universe = list(universe) + self.config["screener"].get("crypto", [])
-            # Add futures roots (NQ, ES, CL, GC)
-            futures_roots = [c["root"] for c in self.config.get("futures", {}).get("contracts", [])]
+            # Add configured futures symbols. Keep specs separate so micros can be traded
+            # while full-size roots remain available for multiplier validation.
+            futures_roots = self.config.get("futures", {}).get("symbols")
+            if not futures_roots:
+                futures_roots = [c["root"] for c in self.config.get("futures", {}).get("contracts", [])]
             universe = list(universe) + futures_roots
             # Deduplicate (preserves order) — fixes duplicate AMZN etc.
             universe = list(dict.fromkeys(universe))
@@ -185,6 +206,8 @@ class Coordinator:
                  f"(interval={watcher_interval}s each)")
 
         for sym in universe:
+            if self._shutdown_event.is_set():
+                break
             if sym not in self.watchers:
                 instrument_type = self._clf.classify(sym)
                 from filters import SECTOR_MAP
@@ -207,7 +230,8 @@ class Coordinator:
                 )
                 self.watchers[sym] = watcher
                 watcher.start()
-                time.sleep(2)  # stagger to avoid API rate limits
+                if self._wait_or_stop(2):  # stagger to avoid API rate limits
+                    break
 
         log.info(f"All {len(self.watchers)} watchers running")
 
@@ -225,6 +249,37 @@ class Coordinator:
                 watcher.stop()
             self.watchers.clear()
         log.info(f"Watchers remaining: {len(self.watchers)}")
+
+    def shutdown(self):
+        """Idempotent process teardown for Ctrl+C and fatal exits."""
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutdown_complete = True
+
+        log.info("Shutting down gracefully...")
+        self._shutdown_event.set()
+
+        try:
+            self.stop_watchers()
+        except Exception as exc:
+            log.warning(f"Failed stopping watchers during shutdown: {exc}")
+
+        try:
+            self.discord_bot.stop()
+        except Exception as exc:
+            log.warning(f"Failed stopping Discord bot during shutdown: {exc}")
+
+        try:
+            self.broker.disconnect()
+        except Exception as exc:
+            log.warning(f"Failed disconnecting broker during shutdown: {exc}")
+
+    def _wait_or_stop(self, seconds: float) -> bool:
+        """Wait up to seconds, but exit early if shutdown has been requested."""
+        if seconds <= 0:
+            return self._shutdown_event.is_set()
+        return self._shutdown_event.wait(timeout=seconds)
 
     def run(self):
         """Main coordinator loop."""
@@ -276,7 +331,8 @@ class Coordinator:
                     interval = self.config["schedule"]["cycle_interval_sec"]
                     cycle_count = 0
                     while True:
-                        time.sleep(interval)
+                        if self._wait_or_stop(interval):
+                            raise KeyboardInterrupt
                         cycle_count += 1
 
                         # Check if market opened
@@ -286,7 +342,8 @@ class Coordinator:
                             self.risk.set_starting_equity(equity)
                             delay = self.config["schedule"]["market_open_delay_min"]
                             log.info(f"Market opened. Waiting {delay}min...")
-                            time.sleep(delay * 60)
+                            if self._wait_or_stop(delay * 60):
+                                raise KeyboardInterrupt
                             break
 
                         # Run crypto cycle
@@ -327,7 +384,8 @@ class Coordinator:
                     self.stop_watchers(stocks_only=True)
                     # Don't wait — keep looping for crypto
                     self._coordinator_cycle()
-                    time.sleep(self.config["schedule"]["cycle_interval_sec"])
+                    if self._wait_or_stop(self.config["schedule"]["cycle_interval_sec"]):
+                        raise KeyboardInterrupt
                     continue
 
                 # Start all watchers if not running
@@ -343,26 +401,45 @@ class Coordinator:
                 # Sleep between coordinator checks
                 interval = self.config["schedule"]["cycle_interval_sec"]
                 log.info(f"Coordinator cycle done. Next check in {interval}s")
-                time.sleep(interval)
+                if self._wait_or_stop(interval):
+                    raise KeyboardInterrupt
 
             except KeyboardInterrupt:
-                log.info("Shutting down gracefully...")
-                self.stop_watchers()
+                self.shutdown()
                 break
             except Exception as e:
                 log.error(f"Coordinator error: {e}", exc_info=True)
-                time.sleep(60)
+                if self._wait_or_stop(60):
+                    break
 
     def _coordinator_cycle(self):
         """
         Collect signals from all watchers, apply global filters, execute trades.
-        
+
         LIVE TRADING: Validates market hours and data freshness before trading.
         """
         log.info("")
         log.info("=" * 50)
         log.info(f"  CYCLE @ {datetime.now():%H:%M:%S}")
         log.info("=" * 50)
+
+        # Per-cycle edge counters (summarized at end of cycle)
+        self._edge_counts = {
+            "econ_block": 0,
+            "halfday_block": 0,
+            "holiday_block": 0,
+            "gap_block": 0,
+            "gap_penalty": 0,
+            "rs_block": 0,
+            "rs_boost": 0,
+            "insider_boost": 0,
+            "insider_block_short": 0,
+            "news_pos": 0,
+            "news_neg": 0,
+            "vol_block": 0,
+            "vol_surge_boost": 0,
+            "vol_below_penalty": 0,
+        }
 
         # 0a. Check if we should skip this cycle entirely.
         # We only skip during the last 15 min of NYSE close (widening spreads).
@@ -371,6 +448,21 @@ class Coordinator:
         if should_skip:
             log.info(f"Skipping cycle: {skip_reason}")
             return
+
+        # Market calendar: holidays / half-day early-close blocks
+        cal_sig = self.edge_calendar.evaluate()
+        if cal_sig.is_holiday:
+            log.info(f"HOLIDAY: {cal_sig.session_name} — no trading cycle")
+            self._edge_counts["holiday_block"] += 1
+            self._log_edge_summary()
+            return
+        if cal_sig.early_close:
+            log.warning(
+                f"HALF-DAY EARLY CLOSE: past {self.edge_calendar.half_day_cutoff_hour}:00 ET "
+                f"on half-day — no new entries"
+            )
+            self._edge_counts["halfday_block"] += 1
+            # Fall through to run exits/management; skip entries later
 
         # 0b. Log market status
         market_status = self.live_manager.get_market_status()
@@ -481,6 +573,52 @@ class Coordinator:
             for w in self.watchers.values():
                 w._alpha_decay = decay_factors
 
+        # 2d. Portfolio-level regime guard: tighten only stock entries in weak/choppy tape.
+        regime_guard = self.filters.get_regime_guard_decision()
+        if self._last_regime_guard_mode and self._last_regime_guard_mode != regime_guard.mode:
+            self.alerts.send_regime_guard_change(
+                self._last_regime_guard_mode, regime_guard.mode, regime_guard.reason
+            )
+        if regime_guard.mode != self._last_regime_guard_mode:
+            log.info(
+                f"REGIME GUARD: {self._last_regime_guard_mode or 'initial'} -> "
+                f"{regime_guard.mode} ({regime_guard.reason})"
+            )
+        elif regime_guard.mode != "normal":
+            log.warning(
+                f"REGIME GUARD ACTIVE: {regime_guard.mode} "
+                f"size={regime_guard.size_mult:.2f} max_stocks={regime_guard.max_positions} "
+                f"score>={regime_guard.min_score:.2f} agree>={regime_guard.min_agreeing} "
+                f"({regime_guard.reason})"
+            )
+        self._last_regime_guard_mode = regime_guard.mode
+        for watcher in self.watchers.values():
+            if self._clf.classify(watcher.symbol) == "stock":
+                watcher.set_threshold_overrides(
+                    min_score=regime_guard.min_score,
+                    min_agreeing=regime_guard.min_agreeing,
+                    mode=regime_guard.mode,
+                    reason=regime_guard.reason,
+                )
+            else:
+                watcher.clear_threshold_overrides()
+
+        # 2e. Run each watcher's analyze on the main thread (bars now cached).
+        # This replaces the prior threaded watcher model, which deadlocked on
+        # the shared ib_insync connection.
+        analyze_start = time.time()
+        status_counts: dict[str, int] = {}
+        for sym, watcher in list(self.watchers.items()):
+            try:
+                watcher.analyze_once()
+                status_counts[watcher.state.status] = status_counts.get(watcher.state.status, 0) + 1
+            except Exception as e:
+                log.error(f"watcher {sym} analyze failed: {e}")
+        log.info(
+            f"Watcher pass: {len(self.watchers)} in {time.time() - analyze_start:.1f}s — "
+            + " ".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+        )
+
         # 3. Manage existing positions + reconcile with broker
         positions = self.portfolio.get_current_positions()
         held_symbols = list(positions.keys())
@@ -532,15 +670,30 @@ class Coordinator:
                 positions = self.portfolio.get_current_positions()
                 held_symbols = list(positions.keys())
 
-        # 4. Check position capacity (crypto has separate slots; futures share stock pool)
+        # 4. Check position capacity (crypto has separate slots; futures share the base pool)
         max_pos = self.config["signals"]["max_positions"]
-        stock_positions = [s for s in held_symbols if self._clf.classify(s) != "crypto"]
+        non_crypto_positions = [s for s in held_symbols if self._clf.classify(s) != "crypto"]
+        stock_positions = [s for s in held_symbols if self._clf.classify(s) == "stock"]
+        futures_positions = [s for s in held_symbols if self._clf.classify(s) == "futures"]
         crypto_positions = [s for s in held_symbols if self._clf.classify(s) == "crypto"]
-        max_crypto = self.config["signals"].get("max_crypto_positions", 2)
-        stocks_full = len(stock_positions) >= max_pos
+        asset_overrides = self.config.get("risk", {}).get("asset_overrides", {})
+        max_stock = min(
+            regime_guard.max_positions,
+            int(asset_overrides.get("stock", {}).get("max_positions", max_pos)),
+        )
+        max_futures = int(asset_overrides.get("futures", {}).get("max_positions", max_pos))
+        max_crypto = int(
+            asset_overrides.get("crypto", {}).get(
+                "max_positions", self.config["signals"].get("max_crypto_positions", 2)
+            )
+        )
+        non_crypto_full = (
+            len(stock_positions) >= max_stock
+            and len(futures_positions) >= max_futures
+        ) or len(non_crypto_positions) >= max_pos
         crypto_full = len(crypto_positions) >= max_crypto
-        if stocks_full and crypto_full:
-            log.info(f"At max positions (stocks={len(stock_positions)}/{max_pos}, "
+        if non_crypto_full and crypto_full:
+            log.info(f"At max positions (non_crypto={len(non_crypto_positions)}/{max_pos}, "
                      f"crypto={len(crypto_positions)}/{max_crypto}). Skipping new entries.")
             self.portfolio.tracker.log_stats()
             self._log_watcher_status()
@@ -561,6 +714,7 @@ class Coordinator:
             asset_type = self._clf.classify(sym)
             is_crypto  = asset_type == "crypto"
             is_futures = asset_type == "futures"
+            asset_cfg = self.config.get("risk", {}).get("asset_overrides", {}).get(asset_type, {})
 
             # Long signals ─────────────────────────────────────────────────
             # Crypto:  always allowed (24/7, independent of equity regime)
@@ -578,6 +732,8 @@ class Coordinator:
             elif watcher.state.action == Action.SHORT:
                 if is_crypto:
                     continue   # IB PAXOS does not support crypto shorts
+                if not bool(asset_cfg.get("allow_shorts", asset_type != "stock")):
+                    continue
                 if not is_futures:
                     if regime["regime"] == "bull" and not self.config["signals"].get("allow_shorts_in_bull", False):
                         continue
@@ -593,6 +749,7 @@ class Coordinator:
 
         # 5b. ML meta-model filter: skip signals with low predicted win probability
         if self.ml_model.is_ready:
+            ml_threshold = self.config.get("edge", {}).get("ml_filter_threshold", 0.55)
             ml_filtered = []
             for w in trade_signals:
                 features = {
@@ -601,8 +758,8 @@ class Coordinator:
                     "composite_score": w.state.score,
                 }
                 prob = self.ml_model.predict(features)
-                if prob is not None and prob < 0.4:
-                    log.info(f"ML FILTER: {w.symbol} blocked (win_prob={prob:.1%})")
+                if prob is not None and prob < ml_threshold:
+                    log.info(f"ML FILTER: {w.symbol} blocked (win_prob={prob:.1%} < {ml_threshold:.0%})")
                     continue
                 ml_filtered.append(w)
             trade_signals = ml_filtered
@@ -622,8 +779,10 @@ class Coordinator:
                  f"Shorts: {[w.symbol for w in shorts]}")
 
         # 7. Apply global filters
-        # Sector cap
-        from filters import SECTOR_MAP, MAX_PER_SECTOR
+        # Sector cap (dynamic: scales with universe size)
+        from filters import SECTOR_MAP, sector_cap_for
+        universe_size = len(self.config.get("screener", {}).get("universe", []))
+        sector_cap = sector_cap_for(universe_size)
         sector_count = {}
         for sym in held_symbols:
             sector = SECTOR_MAP.get(sym, "other")
@@ -636,8 +795,8 @@ class Coordinator:
 
             # Sector cap
             sector = SECTOR_MAP.get(sym, "other")
-            if sector_count.get(sector, 0) >= MAX_PER_SECTOR:
-                log.info(f"SECTOR CAP: Skipping {sym} (sector '{sector}' full)")
+            if sector_count.get(sector, 0) >= sector_cap:
+                log.info(f"SECTOR CAP: Skipping {sym} (sector '{sector}' full, cap={sector_cap})")
                 continue
 
             filtered.append(watcher)
@@ -675,27 +834,63 @@ class Coordinator:
                 return
 
         # 8. Size and execute orders (separate slots for stocks vs crypto)
-        stock_slots = max_pos - len(stock_positions) if not stocks_full else 0
-        crypto_slots = max_crypto - len(crypto_positions) if not crypto_full else 0
+        non_crypto_slots = max(0, max_pos - len(non_crypto_positions))
+        stock_slots = max(
+            0,
+            min(max_stock - len(stock_positions), non_crypto_slots),
+        )
+        futures_slots = max(
+            0,
+            min(max_futures - len(futures_positions), non_crypto_slots),
+        )
+        crypto_slots = max(0, max_crypto - len(crypto_positions)) if not crypto_full else 0
         cooldown_mult = self.filters.get_loss_cooldown_mult()
-        base_size_mult = regime["size_multiplier"] * cooldown_mult * edge_cross_asset.size_multiplier
+        base_size_mult = (
+            regime["size_multiplier"] * cooldown_mult
+            * edge_cross_asset.size_multiplier
+        )
 
         # Filter by available slots per type
         executable = []
         for w in filtered:
-            is_crypto = self._clf.classify(w.symbol) == "crypto"
-            if is_crypto and crypto_slots > 0:
+            asset_type = self._clf.classify(w.symbol)
+            if asset_type == "crypto" and crypto_slots > 0:
                 executable.append(w)
                 crypto_slots -= 1
-            elif not is_crypto and stock_slots > 0:
+            elif asset_type == "stock" and stock_slots > 0 and non_crypto_slots > 0:
                 executable.append(w)
                 stock_slots -= 1
+                non_crypto_slots -= 1
+            elif asset_type == "futures" and futures_slots > 0 and non_crypto_slots > 0:
+                executable.append(w)
+                futures_slots -= 1
+                non_crypto_slots -= 1
 
         # Rate limit check
         if not self._check_order_rate_limit():
             log.critical("ORDER RATE LIMIT HIT — halting new orders this cycle")
             self.portfolio.tracker.log_stats()
             self._log_watcher_status()
+            return
+
+        # Economic calendar blackout — block new entries around CPI/NFP/FOMC
+        econ_event = self.edge_econ.is_blackout()
+        if econ_event:
+            log.warning(
+                f"ECON BLACKOUT: {econ_event.name} at "
+                f"t{econ_event.minutes_to:+.0f}min — no new entries this cycle"
+            )
+            self._edge_counts["econ_block"] += 1
+            self.portfolio.tracker.log_stats()
+            self._log_watcher_status()
+            self._log_edge_summary()
+            return
+
+        # Half-day early close: skip entry loop, let exits/management run
+        if cal_sig.early_close:
+            self.portfolio.tracker.log_stats()
+            self._log_watcher_status()
+            self._log_edge_summary()
             return
 
         for watcher in executable:
@@ -734,6 +929,8 @@ class Coordinator:
 
             # Apply correlation-adjusted sizing
             corr_mult = self.filters.get_corr_size_mult(sym)
+            asset_type = self._clf.classify(sym)
+            guard_size_mult = regime_guard.size_mult if asset_type == "stock" else 1.0
 
             # Layer 2: sector regime multiplier
             sector_mult = 1.0
@@ -756,6 +953,18 @@ class Coordinator:
             session_bucket = "open" if now_hour == 9 else ("close" if now_hour >= 15 else "mid")
             days_to_earn = self.edge_news.get_days_to_earnings(sym)
 
+            # Earnings hard-block: skip entries within 1 day of scheduled earnings
+            edge_cfg = self.config.get("edge", {})
+            if edge_cfg.get("earnings_avoidance", True):
+                earnings_block_days = edge_cfg.get("earnings_block_days", 1)
+                if days_to_earn is not None and 0 <= days_to_earn <= earnings_block_days:
+                    self._edge_counts["earnings_block"] = self._edge_counts.get("earnings_block", 0) + 1
+                    log.info(
+                        f"EARNINGS BLOCK: {sym} earnings in {days_to_earn}d "
+                        f"(threshold {earnings_block_days}d) - entry skipped"
+                    )
+                    continue
+
             ml_conf = self.edge_ml.predict_quality({
                 "strategy_scores": watcher.state.strategy_scores,
                 "composite_score": watcher.state.score + micro.ofi_score,
@@ -771,16 +980,104 @@ class Coordinator:
                 "days_to_earnings": days_to_earn,
                 "nq_overnight_move": edge_cross_asset.nq_overnight_move,
             })
-            size_mult = base_size_mult * sector_mult * corr_mult * ml_conf
+            guarded_base_size_mult = base_size_mult * guard_size_mult
+            size_mult = guarded_base_size_mult * sector_mult * corr_mult * ml_conf
 
             # News sentiment: suppress longs on bad news, small boost on good news
             news_score = self.edge_news.score_symbol_news(sym)
             if news_score < -0.5:
                 size_mult *= 0.70
-                log.info(f"NEWS SENTIMENT: {sym} negative ({news_score:.2f}) — size reduced 30%")
+                self._edge_counts["news_neg"] += 1
+                log.info(f"NEWS SENTIMENT: {sym} negative ({news_score:+.2f}) — size reduced 30%")
             elif news_score > 0.5 and watcher.state.action == Action.BUY:
-                size_mult = min(size_mult * 1.10, base_size_mult * sector_mult * corr_mult * 1.25)
-                log.info(f"NEWS SENTIMENT: {sym} positive ({news_score:.2f}) — size boosted 10%")
+                size_mult = min(size_mult * 1.10, guarded_base_size_mult * sector_mult * corr_mult * 1.25)
+                self._edge_counts["news_pos"] += 1
+                log.info(f"NEWS SENTIMENT: {sym} positive ({news_score:+.2f}) — size boosted 10%")
+
+            # Pre-market gap filter: block extreme gaps, size-penalize large chases
+            gap_side = "buy" if watcher.state.action == Action.BUY else "sell"
+            daily_bars = self.data.get_intraday_bars(sym, timeframe="1Day", days=5)
+            gap_sig = self.edge_gap.evaluate(daily_bars, side=gap_side)
+            if gap_sig.block:
+                self._edge_counts["gap_block"] += 1
+                log.info(
+                    f"GAP BLOCK: {sym} {gap_sig.category} gap "
+                    f"{gap_sig.gap_pct:+.2%} — skipped (exhaustion risk)"
+                )
+                continue
+            if gap_sig.size_mult != 1.0:
+                size_mult *= gap_sig.size_mult
+                self._edge_counts["gap_penalty"] += 1
+                log.info(
+                    f"GAP: {sym} {gap_sig.category} {gap_sig.gap_pct:+.2%} "
+                    f"{gap_side} — size x{gap_sig.size_mult:.2f}"
+                )
+
+            # Relative strength rank: boost strong names, block/short weak ones
+            universe_for_rs = self.config.get("screener", {}).get("universe", [])
+            rs_sig = self.edge_rs.evaluate(sym, universe_for_rs)
+            if watcher.state.action == Action.BUY and rs_sig.block_long:
+                self._edge_counts["rs_block"] += 1
+                log.info(
+                    f"RS BLOCK: {sym} rank={rs_sig.rank_pct:.2f} "
+                    f"({rs_sig.bucket}) — long blocked (weak momentum)"
+                )
+                continue
+            if watcher.state.action == Action.SHORT and not rs_sig.allow_short:
+                self._edge_counts["rs_block"] += 1
+                log.info(
+                    f"RS BLOCK: {sym} rank={rs_sig.rank_pct:.2f} "
+                    f"({rs_sig.bucket}) — short blocked (not weak enough)"
+                )
+                continue
+            if watcher.state.action == Action.BUY and rs_sig.long_size_mult != 1.0:
+                size_mult *= rs_sig.long_size_mult
+                self._edge_counts["rs_boost"] += 1
+                log.info(
+                    f"RS: {sym} rank={rs_sig.rank_pct:.2f} "
+                    f"({rs_sig.bucket}) — size x{rs_sig.long_size_mult:.2f}"
+                )
+
+            # Volume surge confirmation: require conviction on signal bar
+            vol_sig = self.edge_volume.evaluate(bars)
+            if vol_sig.block:
+                self._edge_counts["vol_block"] += 1
+                log.info(
+                    f"VOLUME BLOCK: {sym} weak vol ratio={vol_sig.ratio:.2f} — "
+                    f"skipped (no conviction)"
+                )
+                continue
+            if vol_sig.bucket == "surge":
+                size_mult *= vol_sig.size_mult
+                self._edge_counts["vol_surge_boost"] += 1
+                log.info(
+                    f"VOLUME: {sym} surge ratio={vol_sig.ratio:.2f} — "
+                    f"size x{vol_sig.size_mult:.2f}"
+                )
+            elif vol_sig.bucket == "below":
+                size_mult *= vol_sig.size_mult
+                self._edge_counts["vol_below_penalty"] += 1
+                log.info(
+                    f"VOLUME: {sym} below-avg ratio={vol_sig.ratio:.2f} — "
+                    f"size x{vol_sig.size_mult:.2f}"
+                )
+
+            # Insider Form 4 cluster: boost long size on cluster buys
+            insider_sig = self.edge_insider.evaluate(sym)
+            if insider_sig.cluster and watcher.state.action == Action.BUY:
+                size_mult *= insider_sig.size_mult
+                self._edge_counts["insider_boost"] += 1
+                log.info(
+                    f"INSIDER: {sym} cluster buy "
+                    f"({insider_sig.buys} buys / {insider_sig.sells} sells) "
+                    f"— size x{insider_sig.size_mult:.2f}"
+                )
+            if insider_sig.block_short and watcher.state.action == Action.SHORT:
+                self._edge_counts["insider_block_short"] += 1
+                log.info(
+                    f"INSIDER BLOCK: {sym} short blocked — insider cluster buying"
+                )
+                continue
 
             orders = self.risk.size_orders(
                 opportunities=[_make_opportunity(watcher)],
@@ -870,9 +1167,10 @@ class Coordinator:
                     log.error(f"Order failed for {sym}: {e}")
                     self.alerts.send_error(f"Order failed for {sym}: {e}")
 
-        # 9. Log stats
+        # 9. Log stats + per-cycle edge activation summary
         self.portfolio.tracker.log_stats()
         self._log_watcher_status()
+        self._log_edge_summary()
 
     def _check_order_rate_limit(self) -> bool:
         """Returns False if order rate limit exceeded. Safety valve."""
@@ -916,6 +1214,21 @@ class Coordinator:
         if cleaned:
             self.portfolio._save_watermarks()
             self.portfolio._save_meta()
+
+    def _log_edge_summary(self):
+        """One-line per-cycle summary of edge activations and blocks.
+
+        Only logs non-zero counters for readability. Keys with zero hits
+        this cycle are elided.
+        """
+        counts = getattr(self, "_edge_counts", None)
+        if not counts:
+            return
+        hits = [f"{k}={v}" for k, v in counts.items() if v]
+        if hits:
+            log.info(f"  EDGES: {' | '.join(hits)}")
+        else:
+            log.info("  EDGES: none fired")
 
     def _log_watcher_status(self):
         """Log a visual summary of all watcher threads."""

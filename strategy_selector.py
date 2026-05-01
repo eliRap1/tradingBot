@@ -114,6 +114,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.00,
                 "gap": 0.10,
                 "liquidity_sweep": 0.10,
+                "dol": 0.12,
             },
             "reason": f"Strong uptrend (ADX={adx:.0f}), using trend strategies",
         }
@@ -130,6 +131,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.00,
                 "gap": 0.10,
                 "liquidity_sweep": 0.10,
+                "dol": 0.12,
             },
             "reason": f"Strong downtrend (ADX={adx:.0f}), short bias active",
         }
@@ -147,6 +149,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.10,
                 "gap": 0.10,
                 "liquidity_sweep": 0.10,
+                "dol": 0.10,
             },
             "reason": f"Range squeeze detected, watching for breakout",
         }
@@ -164,6 +167,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.00,
                 "gap": 0.10,
                 "liquidity_sweep": 0.10,
+                "dol": 0.10,
             },
             "reason": f"Near 20-day high with volume expansion",
         }
@@ -181,6 +185,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.00,
                 "gap": 0.10,
                 "liquidity_sweep": 0.10,
+                "dol": 0.10,
             },
             "reason": f"Near 20-day low with volume expansion, breakdown setup",
         }
@@ -198,6 +203,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "breakout": 0.10,
                 "gap": 0.05,
                 "liquidity_sweep": 0.10,
+                "dol": 0.15,
             },
             "reason": f"Ranging market (ADX={adx:.0f}), mean reversion favored",
         }
@@ -215,6 +221,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.05,
                 "gap": 0.10,
                 "liquidity_sweep": 0.10,
+                "dol": 0.12,
             },
             "reason": f"Moderate uptrend (ADX={adx:.0f}), balanced approach",
         }
@@ -232,6 +239,7 @@ def _select_strategies_inner(df: pd.DataFrame, symbol: str) -> dict:
                 "mean_reversion": 0.10,
                 "gap": 0.10,
                 "liquidity_sweep": 0.10,
+                "dol": 0.12,
             },
             "reason": f"Moderate downtrend (ADX={adx:.0f}), short bias",
         }
@@ -252,6 +260,7 @@ def _default():
             "mean_reversion": 0.10,
             "gap": 0.10,
             "liquidity_sweep": 0.10,
+            "dol": 0.10,
         },
         "reason": "No clear regime, using balanced weights",
     }

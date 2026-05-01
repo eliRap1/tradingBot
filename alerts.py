@@ -14,10 +14,13 @@ Setup:
   8. Invite bot to server with: OAuth2 -> URL Generator -> bot -> Send Messages + Read Messages
 """
 
+import asyncio
 import os
 import time
 import threading
 import requests
+import nest_asyncio
+nest_asyncio.apply()
 from datetime import datetime, timezone, timedelta
 from utils import setup_logger
 
@@ -238,6 +241,17 @@ class AlertManager:
         )
         self._send(msg)
 
+    def send_regime_guard_change(self, old_mode: str, new_mode: str, reason: str):
+        """Notify when the portfolio-level regime guard changes mode."""
+        if not self.enabled:
+            return
+        msg = (
+            f"*REGIME GUARD*\n"
+            f"`{old_mode.upper()} -> {new_mode.upper()}`\n"
+            f"{reason}"
+        )
+        self._send(msg)
+
     _ETF_NAMES = {
         "XLK": "Tech/Semi/Cloud", "XLE": "Energy",       "XLF": "Financials",
         "XLV": "Healthcare",      "XLY": "Consumer Disc", "XLP": "Consumer Staples",
@@ -314,6 +328,9 @@ class DiscordBot:
         self.broker = broker
         self.coordinator = coordinator
         self._thread = None
+        self._loop = None
+        self._client = None
+        self._stop_event = threading.Event()
         self.token = os.getenv("DISCORD_BOT_TOKEN", "")
 
         if not self.token:
@@ -324,11 +341,164 @@ class DiscordBot:
         if not self.token:
             return
 
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run, name="discord-bot", daemon=True
         )
         self._thread.start()
         log.info("Discord bot started — listening for !stat")
+
+    def stop(self):
+        """Request the Discord bot thread to stop and close its client."""
+        self._stop_event.set()
+
+        loop = self._loop
+        client = self._client
+        if loop and client and not loop.is_closed():
+            try:
+                future = asyncio.run_coroutine_threadsafe(client.close(), loop)
+                future.result(timeout=5)
+            except Exception:
+                pass
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def _ib_check(self, symbol: str = "SPY") -> str:
+        """Full IB connectivity diagnostic — no order placed."""
+        lines = [f"**IB Check: `{symbol}`**"]
+        if not self.broker:
+            return "IB Check: broker not connected."
+        try:
+            # 1. Connection
+            connected = getattr(self.broker, "_ib", None)
+            is_conn = connected.isConnected() if connected else False
+            lines.append(f"Connection: {'OK' if is_conn else 'DISCONNECTED'}")
+
+            # 2. Account equity
+            try:
+                equity = self.broker.get_equity()
+                lines.append(f"Account equity: ${equity:,.2f}")
+            except Exception as e:
+                lines.append(f"Account equity: ERROR ({e})")
+
+            # 3. Contract resolution
+            try:
+                asset = self.broker.asset_type(symbol)
+                contract = self.broker._resolve_contract(symbol, asset)
+                if contract:
+                    lines.append(f"Contract: OK ({contract.exchange})")
+                else:
+                    lines.append("Contract: FAILED to resolve")
+            except Exception as e:
+                lines.append(f"Contract: ERROR ({e})")
+
+            # 4. Price (live then bar cache)
+            price = None
+            source = None
+            try:
+                quote = self.broker.get_quote(symbol)
+                if quote and quote.mid > 0:
+                    price = quote.mid
+                    source = "live"
+            except Exception:
+                pass
+            if price is None and self.coordinator and getattr(self.coordinator, "data", None):
+                try:
+                    bars = self.coordinator.data.get_intraday_bars(
+                        symbol, timeframe="1Day", days=5
+                    )
+                    if bars is not None and not bars.empty:
+                        price = float(bars["close"].iloc[-1])
+                        source = "bar cache"
+                except Exception:
+                    pass
+            if price:
+                lines.append(f"Price: ${price:,.2f} ({source})")
+            else:
+                lines.append("Price: unavailable (no subscription or bar cache)")
+
+            # 5. Open orders count
+            try:
+                open_orders = self.broker._ib.openOrders()
+                lines.append(f"Open orders: {len(open_orders)}")
+            except Exception:
+                pass
+
+        except Exception as e:
+            lines.append(f"Check failed: {e}")
+        return "\n".join(lines)
+
+    def _format_open_orders(self, orders) -> str:
+        if not orders:
+            return ""
+        lines = [f"**Open Orders** ({len(orders)})"]
+        for order in orders[:10]:
+            qty = float(getattr(order, "qty", 0) or 0)
+            side = str(getattr(order, "side", "") or "").upper()
+            symbol = getattr(order, "symbol", "")
+            status = getattr(order, "status", "unknown")
+            filled_qty = getattr(order, "filled_qty", None)
+            line = f"- `{symbol}` {side} qty=`{qty:.4g}` status=`{status}`"
+            if filled_qty not in (None, 0):
+                line += f" filled=`{float(filled_qty):.4g}`"
+            lines.append(line)
+        if len(orders) > 10:
+            lines.append(f"... and {len(orders) - 10} more")
+        return "\n".join(lines)
+
+    def _positions_message(self) -> str:
+        if not self.broker:
+            return "Broker not connected."
+
+        try:
+            positions = list(self.broker.get_positions())
+        except Exception as e:
+            return f"Error fetching positions: `{e}`"
+
+        equity_line = ""
+        try:
+            eq = self.broker.get_equity()
+            equity_line = f"\n**Equity:** `${eq:,.2f}`"
+        except Exception as e:
+            log.warning(f"!positions: get_equity failed: {e}")
+            equity_line = "\n**Equity:** `(unavailable)`"
+
+        if not positions:
+            try:
+                open_orders = list(self.broker.get_open_orders())
+            except Exception as e:
+                log.warning(f"!positions: get_open_orders failed: {e}")
+                open_orders = []
+            if open_orders:
+                return (
+                    "No filled positions are visible yet.\n"
+                    "IB may still be filling the order or updating the position cache.\n\n"
+                    f"{self._format_open_orders(open_orders)}"
+                    f"{equity_line}"
+                )
+            return f"No open positions are visible right now.{equity_line}"
+
+        msg = f"**Open Positions** ({len(positions)})\n"
+        total_unreal = 0.0
+        for p in positions:
+            side = getattr(p, "side", "long")
+            qty = float(getattr(p, "qty", 0) or 0)
+            entry = float(getattr(p, "avg_price", getattr(p, "avg_entry_price", 0)) or 0)
+            unreal = float(getattr(p, "unrealized_pl", 0) or 0)
+            qty_abs = abs(qty) or 1
+            unreal_pct = (unreal / (entry * qty_abs) * 100) if entry else 0.0
+            total_unreal += unreal
+            sign = "+" if unreal >= 0 else ""
+            msg += (
+                f"`{p.symbol}` {str(side).upper()} {qty:.4g} "
+                f"@ ${entry:.2f} | "
+                f"P&L: `${sign}{unreal:,.2f}` (`{unreal_pct:+.1f}%`)\n"
+            )
+        sign = "+" if total_unreal >= 0 else ""
+        msg += f"\n**Total unrealized:** `${sign}{total_unreal:,.2f}`"
+        msg += equity_line
+        return msg
 
     def _submit_test_buy(self, symbol: str = "BTC/USD", notional_usd: float = 1.0) -> str:
         """Submit a tiny BTC market buy for connectivity checks."""
@@ -336,13 +506,20 @@ class DiscordBot:
             return "❌ Broker not connected."
 
         try:
+            asset = self.broker.asset_type(symbol) if hasattr(self.broker, "asset_type") else "stock"
+            live_manager = getattr(self.coordinator, "live_manager", None) if self.coordinator else None
+            if live_manager and asset != "crypto":
+                can_trade, reason = live_manager.can_trade_symbol(symbol)
+                if not can_trade:
+                    return f"Cannot submit test buy for `{symbol}` right now: `{reason}`."
+
             price = None
             if (
                 self.coordinator
-                and getattr(self.coordinator, "live_manager", None)
+                and live_manager
                 and getattr(self.coordinator, "data", None)
             ):
-                price, status = self.coordinator.live_manager.get_live_price(
+                price, status = live_manager.get_live_price(
                     symbol, self.coordinator.data
                 )
                 if price is None:
@@ -352,14 +529,32 @@ class DiscordBot:
                 quote = self.broker.get_quote(symbol)
                 if quote is not None and quote.mid > 0:
                     price = quote.mid
-                else:
-                    return f"No live quote available for `{symbol}`."
 
-            qty = round(notional_usd / price, 8)
+            # Fall back to bar cache (last known close) — works without market data subscription
+            if price is None and self.coordinator and getattr(self.coordinator, "data", None):
+                try:
+                    bars = self.coordinator.data.get_intraday_bars(
+                        symbol, timeframe="1Day", days=5
+                    )
+                    if bars is not None and not bars.empty:
+                        price = float(bars["close"].iloc[-1])
+                        log.info(f"Discord !buy using bar-cache price for {symbol}: {price}")
+                except Exception:
+                    pass
+
+            if price is None:
+                return f"No price available for `{symbol}` (no live quote or bar cache)."
+
+            # IB API doesn't support fractional shares — round to whole shares for stocks/ETFs
+            if asset == "crypto":
+                qty = round(notional_usd / price, 8)
+            else:
+                qty = max(1, int(notional_usd / price))
+                notional_usd = qty * price  # adjust notional to match whole shares
             if qty <= 0:
                 return f"❌ Computed quantity is invalid for `{symbol}`."
 
-            order = self.broker.submit_market_order(symbol, qty, "buy")
+            order = self.broker.submit_market_order(symbol, qty, "buy", notional=notional_usd)
             order_id = getattr(order, "id", "submitted")
             log.info(
                 "Discord !buy submitted tiny test order: %s qty=%.8f notional=$%.2f order_id=%s",
@@ -371,7 +566,8 @@ class DiscordBot:
             return (
                 f"✅ Submitted test buy: `{symbol}` qty=`{qty:.8f}` "
                 f"(~`${notional_usd:.2f}` at `${price:,.2f}`) "
-                f"order=`{order_id}`"
+                f"order=`{order_id}`\n"
+                "Use `!positions` after a few seconds to confirm the fill."
             )
         except Exception as e:
             log.warning(f"Discord !buy failed: {e}")
@@ -381,7 +577,6 @@ class DiscordBot:
         """Run the Discord bot (blocking, runs in thread)."""
         try:
             import discord
-            import asyncio
 
             tracker = self.tracker
             broker = self.broker
@@ -389,12 +584,14 @@ class DiscordBot:
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            self._loop = loop
             backoff = 5
 
-            while True:
+            while not self._stop_event.is_set():
                 intents = discord.Intents.default()
                 intents.message_content = True
                 client = discord.Client(intents=intents)
+                self._client = client
 
                 @client.event
                 async def on_ready():
@@ -429,7 +626,9 @@ class DiscordBot:
 
                         stats = tracker.get_stats(starting_equity=eq)
                         if not stats:
-                            await message.channel.send("📊 No trades recorded yet.")
+                            await message.channel.send(
+                                f"Stats: no closed trades recorded yet.{equity_str}{positions_str}"
+                            )
                             return
 
                         # Today's trades
@@ -488,44 +687,48 @@ class DiscordBot:
                             "`!pause` — pause new trade entries\n"
                             "`!resume` — resume trading"
                         )
-                        msg += "\n`!buy` â€” submit a $1 BTC test market buy"
+                        msg += "\n`!buy [SYMBOL] [USD]` - test market buy, e.g. `!buy GLD 10` or `!buy BTC/USD 5`"
+                        msg += "\n`!ibcheck [SYMBOL]` - full IB connectivity check (no order placed)"
+                        msg += "\n`!clearcontract SYMBOL` - clear bad-contract cache for a symbol"
                         await message.channel.send(msg)
 
-                    elif message.content.strip().lower() == "!buy":
-                        msg = self._submit_test_buy()
+                    elif message.content.strip().lower().startswith("!ibcheck"):
+                        parts = message.content.strip().split()
+                        symbol = parts[1].upper() if len(parts) > 1 else "SPY"
+                        msg = self._ib_check(symbol)
+                        await message.channel.send(msg)
+
+                    elif message.content.strip().lower().startswith("!clearcontract"):
+                        parts = message.content.strip().split()
+                        if len(parts) < 2:
+                            await message.channel.send("Usage: `!clearcontract SYMBOL`")
+                        else:
+                            sym = parts[1].upper()
+                            cleared = []
+                            data = getattr(self.coordinator, "data", None)
+                            if data and hasattr(data, "_bad_contracts"):
+                                data._bad_contracts.pop(sym, None)
+                                cleared.append("ib_data")
+                            if self.broker and hasattr(self.broker, "_bad_contracts"):
+                                self.broker._bad_contracts.pop(sym, None)
+                                cleared.append("ib_broker")
+                            if cleared:
+                                await message.channel.send(f"Cleared `{sym}` from bad-contract cache in: {', '.join(cleared)}. Retry `!buy {sym}` now.")
+                            else:
+                                await message.channel.send(f"No bad-contract cache found for `{sym}`.")
+
+                    elif message.content.strip().lower().startswith("!buy"):
+                        parts = message.content.strip().split()
+                        symbol = parts[1].upper() if len(parts) > 1 else "BTC/USD"
+                        try:
+                            notional = float(parts[2]) if len(parts) > 2 else 1.0
+                        except ValueError:
+                            notional = 1.0
+                        msg = self._submit_test_buy(symbol=symbol, notional_usd=notional)
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!positions":
-                        if not broker:
-                            await message.channel.send("❌ Broker not connected.")
-                            return
-                        try:
-                            positions = broker.get_positions()
-                            if not positions:
-                                await message.channel.send("📭 No open positions.")
-                                return
-                            eq = broker.get_equity()
-                            msg = f"📌 **Open Positions** ({len(positions)})\n"
-                            total_unreal = 0.0
-                            for p in positions:
-                                side = getattr(p, "side", "long")
-                                qty = float(getattr(p, "qty", 0))
-                                entry = float(getattr(p, "avg_price", getattr(p, "avg_entry_price", 0)))
-                                unreal = float(getattr(p, "unrealized_pl", 0))
-                                qty_abs = abs(qty) or 1
-                                unreal_pct = (unreal / (entry * qty_abs) * 100) if entry else 0.0
-                                total_unreal += unreal
-                                e = "🟢" if unreal >= 0 else "🔴"
-                                msg += (
-                                    f"{e} `{p.symbol}` {side.upper()} {qty:.4g} "
-                                    f"@ ${entry:.2f} | "
-                                    f"P&L: `${unreal:+,.2f}` (`{unreal_pct:+.1f}%`)\n"
-                                )
-                            sign = "+" if total_unreal >= 0 else ""
-                            msg += f"\n**Total unrealized:** `${sign}{total_unreal:,.2f}`"
-                            msg += f"\n**Equity:** `${eq:,.2f}`"
-                        except Exception as e:
-                            msg = f"❌ Error fetching positions: `{e}`"
+                        msg = self._positions_message()
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!regime":
@@ -637,12 +840,29 @@ class DiscordBot:
 
                 try:
                     loop.run_until_complete(client.start(self.token))
-                    break  # clean shutdown (e.g. client.close() called)
+                    if self._stop_event.is_set():
+                        break
+                    log.warning("Discord bot client stopped unexpectedly — restarting")
                 except Exception as e:
+                    if self._stop_event.is_set():
+                        break
                     log.warning(f"Discord bot disconnected: {e} — retrying in {backoff}s")
-                    time.sleep(backoff)
+                    self._stop_event.wait(timeout=backoff)
                     backoff = min(backoff * 2, 120)
                     # Fresh client + handlers created at top of while loop
+                finally:
+                    self._client = None
+
+            try:
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                if not loop.is_closed():
+                    loop.close()
+            finally:
+                self._loop = None
 
         except Exception as e:
             log.error(f"Discord bot thread fatal error: {e}", exc_info=True)

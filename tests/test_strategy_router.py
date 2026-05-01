@@ -13,6 +13,7 @@ CONFIG = {
         "vwap_reclaim": {"weight": 0.15},
         "gap": {"weight": 0.15},
         "liquidity_sweep": {"weight": 0.20},
+        "dol": {"weight": 0.15},
     }
 }
 

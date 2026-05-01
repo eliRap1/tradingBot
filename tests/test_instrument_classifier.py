@@ -21,6 +21,11 @@ def test_futures_roots(clf):
     assert clf.classify("GC") == "futures"
 
 
+def test_futures_month_symbols(clf):
+    assert clf.classify("CLK6") == "futures"
+    assert clf.classify("ESM26") == "futures"
+
+
 def test_crypto_symbols(clf):
     assert clf.classify("BTC/USD") == "crypto"
     assert clf.classify("ETH/USD") == "crypto"
@@ -40,6 +45,7 @@ def test_stock_fallback(clf):
 
 def test_unknown_is_stock(clf):
     assert clf.classify("ZZZZ") == "stock"
+    assert clf.classify("CLF") == "stock"
 
 
 def test_helpers(clf):

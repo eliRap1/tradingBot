@@ -175,6 +175,42 @@ class TestBacktester:
         if result.equity_curve:
             assert result.equity_curve[0][1] == 50000
 
+    def test_backtester_regime_guard_reduces_stock_exposure(self, config):
+        from backtester import Backtester, BacktestTrade
+
+        config["filters"] = {
+            "regime_guard": {
+                "enabled": True,
+                "lookback_trades": 20,
+                "min_trades": 8,
+                "recent_wr_trades": 5,
+                "defensive_recent_wr": 0.30,
+            }
+        }
+        bt = Backtester(config, initial_equity=100000)
+        trades = [
+            BacktestTrade(
+                symbol=f"T{i}",
+                side="buy",
+                qty=1,
+                entry_price=100.0,
+                exit_price=99.0,
+                entry_date="2026-01-01",
+                exit_date="2026-01-02",
+                pnl=-100.0,
+                pnl_pct=-0.01,
+                bars_held=1,
+                exit_reason="stop_loss",
+            )
+            for i in range(8)
+        ]
+
+        decision = bt._regime_guard(trades)
+
+        assert decision.mode == "defensive"
+        assert decision.size_mult < 1.0
+        assert decision.max_positions < config["signals"]["max_positions"]
+
 
 # ═══════════════════════════════════════════════════════════
 # Feature 4: Kelly Criterion

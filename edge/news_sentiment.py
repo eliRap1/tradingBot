@@ -8,7 +8,14 @@ import requests
 
 
 class NewsSentimentEngine:
-    """Earnings blocker plus optional headline sentiment."""
+    """Earnings blocker plus optional headline sentiment.
+
+    Uses Alpaca news API (unlimited for paper accounts). Per-symbol TTL cache
+    (default 30 min) to avoid redundant calls. Falls back to NEWSAPI_KEY if
+    Alpaca creds absent.
+    """
+
+    _ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
 
     def __init__(self, config: dict):
         self.config = config.get("edge", {})
@@ -16,9 +23,13 @@ class NewsSentimentEngine:
         self._blocked_at = 0.0
         # symbol → nearest earnings date (absolute date, not relative)
         self._earnings_dates: dict[str, datetime] = {}
+        # symbol → (ts, score) — per-symbol sentiment cache
+        self._sentiment_cache: dict[str, tuple[float, float]] = {}
+        self._sentiment_ttl_sec = int(self.config.get("news_cache_ttl_sec", 1800))
         self._news_key = os.getenv("NEWSAPI_KEY", "")
         self._alpaca_key = os.getenv("ALPACA_API_KEY", "")
         self._alpaca_secret = os.getenv("ALPACA_SECRET_KEY", "")
+        self._analyzer = None  # lazy-init vader
 
     def get_blocked_symbols(self, symbols: list[str] | None = None) -> set[str]:
         if time.time() - self._blocked_at < 3600:
@@ -47,36 +58,98 @@ class NewsSentimentEngine:
         return abs(delta)
 
     def score_symbol_news(self, symbol: str) -> float:
-        if not self.config.get("news_sentiment", False) or not self._news_key:
-            return 0.0
-        try:
-            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+        """Composite sentiment score for recent headlines on `symbol`.
 
-            analyzer = SentimentIntensityAnalyzer()
-            hours = int(self.config.get("news_lookback_hours", 4))
-            since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-            resp = requests.get(
-                "https://newsapi.org/v2/everything",
-                params={
-                    "q": symbol,
-                    "from": since,
-                    "sortBy": "publishedAt",
-                    "language": "en",
-                    "apiKey": self._news_key,
-                    "pageSize": 10,
-                },
-                timeout=10,
-            )
-            articles = resp.json().get("articles", [])
-            if not articles:
-                return 0.0
-            scores = []
-            for article in articles:
-                text = f"{article.get('title', '')}. {article.get('description', '')}"
-                scores.append(analyzer.polarity_scores(text)["compound"])
-            return sum(scores) / len(scores)
-        except Exception:
+        Returns value in [-1.0, +1.0] (vader compound average). Zero means
+        neutral or no data. Cached per symbol for `news_cache_ttl_sec`.
+        """
+        if not self.config.get("news_sentiment", False):
             return 0.0
+        if not (self._alpaca_key or self._news_key):
+            return 0.0
+
+        now = time.time()
+        cached = self._sentiment_cache.get(symbol)
+        if cached and now - cached[0] < self._sentiment_ttl_sec:
+            return cached[1]
+
+        articles = self._fetch_articles(symbol)
+        if not articles:
+            score = 0.0
+        else:
+            analyzer = self._get_analyzer()
+            if analyzer is None:
+                return 0.0
+            scores = [analyzer.polarity_scores(text)["compound"] for text in articles]
+            score = sum(scores) / len(scores)
+
+        self._sentiment_cache[symbol] = (now, score)
+        return score
+
+    def _get_analyzer(self):
+        if self._analyzer is None:
+            try:
+                from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+                self._analyzer = SentimentIntensityAnalyzer()
+            except Exception:
+                self._analyzer = None
+        return self._analyzer
+
+    def _fetch_articles(self, symbol: str) -> list[str]:
+        """Fetch recent headline+summary text for `symbol`. Alpaca preferred."""
+        hours = int(self.config.get("news_lookback_hours", 4))
+        since = (datetime.utcnow() - timedelta(hours=hours)).isoformat() + "Z"
+
+        if self._alpaca_key and self._alpaca_secret:
+            try:
+                headers = {
+                    "APCA-API-KEY-ID": self._alpaca_key,
+                    "APCA-API-SECRET-KEY": self._alpaca_secret,
+                }
+                resp = requests.get(
+                    self._ALPACA_NEWS_URL,
+                    params={
+                        "symbols": symbol,
+                        "start": since,
+                        "limit": 20,
+                        "sort": "desc",
+                    },
+                    headers=headers,
+                    timeout=10,
+                )
+                data = resp.json() if resp.ok else {}
+                items = data.get("news", [])
+                return [
+                    f"{item.get('headline', '')}. {item.get('summary', '')}"
+                    for item in items
+                    if item.get("headline") or item.get("summary")
+                ]
+            except Exception:
+                pass  # fall through to NewsAPI
+
+        if self._news_key:
+            try:
+                resp = requests.get(
+                    "https://newsapi.org/v2/everything",
+                    params={
+                        "q": symbol,
+                        "from": since,
+                        "sortBy": "publishedAt",
+                        "language": "en",
+                        "apiKey": self._news_key,
+                        "pageSize": 10,
+                    },
+                    timeout=10,
+                )
+                articles = resp.json().get("articles", []) if resp.ok else []
+                return [
+                    f"{a.get('title', '')}. {a.get('description', '')}"
+                    for a in articles
+                ]
+            except Exception:
+                return []
+
+        return []
 
     def _fetch_earnings_blocks(self, symbols: list[str]) -> set[str]:
         if not self._alpaca_key or not self._alpaca_secret:

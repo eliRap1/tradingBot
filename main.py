@@ -22,8 +22,10 @@ Optional - run walk-forward optimisation before live trading:
 """
 
 import os
+import signal
 import sys
 import socket
+import threading
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -33,6 +35,9 @@ from utils import load_config, setup_logger
 from live_trading import ensure_live_trading_mode
 
 log = setup_logger("main")
+_shutdown_press_count = 0
+_shutdown_lock = threading.Lock()
+_force_exit_timer = None
 
 
 def _check_ib_gateway(host: str, port: int, timeout: float = 4.0) -> bool:
@@ -42,6 +47,42 @@ def _check_ib_gateway(host: str, port: int, timeout: float = 4.0) -> bool:
             return True
     except OSError:
         return False
+
+
+def _schedule_forced_exit(timeout_sec: float = 5.0):
+    """Force process exit if graceful shutdown stalls."""
+    global _force_exit_timer
+    if _force_exit_timer is not None:
+        return
+
+    def _force_exit():
+        log.error("Forced exit after shutdown timeout")
+        os._exit(130)
+
+    timer = threading.Timer(timeout_sec, _force_exit)
+    timer.daemon = True
+    timer.start()
+    _force_exit_timer = timer
+
+
+def _build_interrupt_handler(bot):
+    """Return a Ctrl+C handler with hard-exit fallback."""
+    def _handle_interrupt(signum, frame):
+        global _shutdown_press_count
+        with _shutdown_lock:
+            _shutdown_press_count += 1
+            press_count = _shutdown_press_count
+
+        if press_count == 1:
+            log.warning("Interrupt received; shutting down")
+            threading.Thread(target=bot.shutdown, name="shutdown-handler", daemon=True).start()
+            _schedule_forced_exit()
+            raise KeyboardInterrupt
+
+        log.error("Second interrupt received; forcing exit")
+        os._exit(130)
+
+    return _handle_interrupt
 
 
 def main():
@@ -82,7 +123,20 @@ def main():
     # 3. Start the coordinator
     from coordinator import Coordinator
     bot = Coordinator()
-    bot.run()
+    _handle_interrupt = _build_interrupt_handler(bot)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _handle_interrupt)
+    previous_sigbreak = None
+    if hasattr(signal, "SIGBREAK"):
+        previous_sigbreak = signal.getsignal(signal.SIGBREAK)
+        signal.signal(signal.SIGBREAK, _handle_interrupt)
+
+    try:
+        bot.run()
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        if previous_sigbreak is not None:
+            signal.signal(signal.SIGBREAK, previous_sigbreak)
 
 
 if __name__ == "__main__":

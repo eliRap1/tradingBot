@@ -5,7 +5,10 @@ These are the "free win rate" improvements - they don't make winners bigger,
 they just cut out trades that are statistically more likely to lose.
 """
 
+import math
+import os
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -82,6 +85,122 @@ SECTOR_ETF_MAP = {
 MAX_PER_SECTOR = 2
 
 
+@dataclass(frozen=True)
+class RegimeGuardDecision:
+    mode: str
+    size_mult: float
+    max_positions: int
+    min_score: float
+    min_agreeing: int
+    reason: str
+
+
+def compute_regime_guard_decision(
+    trades: list[dict],
+    config: dict,
+    base_max_positions: int | None = None,
+    base_min_score: float | None = None,
+    base_min_agreeing: int | None = None,
+    trading_mode: str | None = None,
+) -> RegimeGuardDecision:
+    """Return the current portfolio-level regime guard decision.
+
+    This function is intentionally pure so live trading and backtesting can
+    share the same guard policy.
+    """
+    signals_cfg = config.get("signals", {})
+    if base_max_positions is None:
+        base_max_positions = signals_cfg.get("max_positions", 7)
+    if base_min_score is None:
+        base_min_score = signals_cfg.get("min_composite_score", 0.23)
+    if base_min_agreeing is None:
+        base_min_agreeing = signals_cfg.get("min_agreeing_strategies", 3)
+    base_max_positions = int(base_max_positions)
+    base_min_score = float(base_min_score)
+    base_min_agreeing = int(base_min_agreeing)
+
+    def normal(reason: str) -> RegimeGuardDecision:
+        return RegimeGuardDecision(
+            mode="normal",
+            size_mult=1.0,
+            max_positions=base_max_positions,
+            min_score=base_min_score,
+            min_agreeing=base_min_agreeing,
+            reason=reason,
+        )
+
+    guard_cfg = config.get("filters", {}).get("regime_guard", {})
+    if not guard_cfg.get("enabled", True):
+        return normal("regime_guard disabled")
+    if guard_cfg.get("paper_only", False) and str(trading_mode or "").lower() == "live":
+        return normal("regime_guard paper_only in live mode")
+
+    lookback = int(guard_cfg.get("lookback_trades", 20))
+    min_trades = int(guard_cfg.get("min_trades", 8))
+    recent_wr_trades = int(guard_cfg.get("recent_wr_trades", 5))
+    recent = list(trades or [])[-lookback:]
+    if len(recent) < min_trades:
+        return normal(f"only {len(recent)}/{min_trades} closed trades")
+
+    pnls = [float(t.get("pnl", 0.0) or 0.0) for t in recent]
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss = abs(sum(p for p in pnls if p < 0))
+    rolling_pf = float("inf") if gross_loss <= 1e-9 else gross_profit / gross_loss
+
+    wr_sample = pnls[-recent_wr_trades:] if len(pnls) >= recent_wr_trades else pnls
+    recent_wr = (sum(1 for p in wr_sample if p > 0) / len(wr_sample)) if wr_sample else 1.0
+
+    caution_pf = float(guard_cfg.get("caution_pf", 1.3))
+    defensive_pf = float(guard_cfg.get("defensive_pf", 1.0))
+    defensive_recent_wr = float(guard_cfg.get("defensive_recent_wr", 0.30))
+    reason = (
+        f"rolling_pf={rolling_pf:.2f} over {len(recent)} trades, "
+        f"recent_wr={recent_wr:.0%} over {len(wr_sample)} trades"
+    )
+
+    if rolling_pf < defensive_pf or recent_wr < defensive_recent_wr:
+        max_positions = (
+            0 if base_max_positions <= 0 else max(
+                1,
+                math.ceil(base_max_positions * float(guard_cfg.get("defensive_max_positions_mult", 0.50))),
+            )
+        )
+        return RegimeGuardDecision(
+            mode="defensive",
+            size_mult=float(guard_cfg.get("defensive_size_mult", 0.50)),
+            max_positions=max_positions,
+            min_score=round(base_min_score + float(guard_cfg.get("defensive_min_score_add", 0.04)), 3),
+            min_agreeing=max(
+                int(guard_cfg.get("defensive_min_agreeing", 5)),
+                base_min_agreeing + int(guard_cfg.get("defensive_min_agreeing_add", 2)),
+            ),
+            reason=reason,
+        )
+
+    if rolling_pf < caution_pf:
+        max_positions = (
+            0 if base_max_positions <= 0 else max(
+                1,
+                math.ceil(base_max_positions * float(guard_cfg.get("caution_max_positions_mult", 0.75))),
+            )
+        )
+        return RegimeGuardDecision(
+            mode="caution",
+            size_mult=float(guard_cfg.get("caution_size_mult", 0.75)),
+            max_positions=max_positions,
+            min_score=round(base_min_score + float(guard_cfg.get("caution_min_score_add", 0.02)), 3),
+            min_agreeing=base_min_agreeing + int(guard_cfg.get("caution_min_agreeing_add", 1)),
+            reason=reason,
+        )
+
+    return normal(reason)
+
+
+def sector_cap_for(universe_size: int) -> int:
+    """Scale sector cap with universe size. 20 syms -> 2, 35 -> 3, 75 -> 5."""
+    return max(2, math.ceil(universe_size / 15))
+
+
 class SmartFilters:
     def __init__(self, tracker=None, config: dict = None):
         self.tracker = tracker
@@ -91,6 +210,7 @@ class SmartFilters:
         self._corr_cache_ttl = (config or {}).get("filters", {}).get(
             "correlation_cache_minutes", 30
         ) * 60
+        self.corr_size_mult: dict[str, float] = {}
 
     def filter_gaps(self, opportunities: list, bars: dict,
                     max_gap_pct: float = 0.02) -> list:
@@ -120,7 +240,9 @@ class SmartFilters:
         return filtered
 
     def filter_sector_cap(self, opportunities: list,
-                          held_symbols: list[str]) -> list:
+                          held_symbols: list[str],
+                          universe_size: int | None = None) -> list:
+        cap = sector_cap_for(universe_size) if universe_size else MAX_PER_SECTOR
         sector_count = {}
         for sym in held_symbols:
             sector = SECTOR_MAP.get(sym, "other")
@@ -130,8 +252,8 @@ class SmartFilters:
         for opp in opportunities:
             sector = SECTOR_MAP.get(opp.symbol, "other")
             current = sector_count.get(sector, 0)
-            if current >= MAX_PER_SECTOR:
-                log.info(f"SECTOR CAP: Skipping {opp.symbol} - already {current} positions in '{sector}'")
+            if current >= cap:
+                log.info(f"SECTOR CAP: Skipping {opp.symbol} - already {current} positions in '{sector}' (cap={cap})")
             else:
                 filtered.append(opp)
                 sector_count[sector] = current + 1
@@ -223,6 +345,15 @@ class SmartFilters:
     def get_corr_size_mult(self, symbol: str) -> float:
         return self.corr_size_mult.get(symbol, 1.0)
 
+    def get_regime_guard_decision(self) -> RegimeGuardDecision:
+        trades = self.tracker.trades if self.tracker is not None else []
+        trading_mode = os.getenv("TRADING_MODE", "paper").lower()
+        return compute_regime_guard_decision(
+            trades,
+            self.config,
+            trading_mode=trading_mode,
+        )
+
     def get_loss_cooldown_mult(self) -> float:
         if self.tracker is None or not self.tracker.trades:
             return 1.0
@@ -240,4 +371,11 @@ class SmartFilters:
         if consecutive_losses >= 3:
             log.warning(f"COOLDOWN: {consecutive_losses} consecutive losses - 50% size")
             return 0.5
+        if consecutive_losses >= 2:
+            log.warning(f"COOLDOWN: {consecutive_losses} consecutive losses - 75% size")
+            return 0.75
         return 1.0
+
+    def get_regime_throttle_mult(self, lookback: int = 20) -> float:
+        """Compatibility wrapper for older callers that only use size."""
+        return self.get_regime_guard_decision().size_mult

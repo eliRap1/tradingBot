@@ -6,32 +6,32 @@ import json
 import os
 
 _STOCK_WEIGHTS = {
-    "momentum": 0.20,
-    "mean_reversion": 0.15,
-    "breakout": 0.20,
-    "supertrend": 0.20,
-    "stoch_rsi": 0.15,
-    "vwap_reclaim": 0.10,
-    "gap": 0.10,
-    "liquidity_sweep": 0.20,
+    "time_series_momentum": 0.24,
+    "relative_strength_rotation": 0.20,
+    "donchian_breakout": 0.18,
+    "momentum": 0.12,
+    "supertrend": 0.10,
+    "breakout": 0.08,
+    "liquidity_sweep": 0.05,
+    "dol": 0.03,
+    "mean_reversion": 0.02,
+    "gap": 0.02,
 }
 
 _CRYPTO_WEIGHTS = {
-    "momentum": 0.25,
-    "breakout": 0.25,
-    "supertrend": 0.25,
-    "stoch_rsi": 0.25,
-    "liquidity_sweep": 0.25,
+    "time_series_momentum": 0.35,
+    "donchian_breakout": 0.25,
+    "relative_strength_rotation": 0.15,
+    "momentum": 0.15,
+    "supertrend": 0.10,
 }
 
 _FUTURES_WEIGHTS = {
-    "momentum": 0.20,
-    "breakout": 0.20,
-    "supertrend": 0.25,
-    "stoch_rsi": 0.15,
-    "vwap_reclaim": 0.10,
-    "liquidity_sweep": 0.25,
-    "futures_trend": 0.30,
+    "time_series_momentum": 0.35,
+    "donchian_breakout": 0.25,
+    "futures_trend": 0.20,
+    "supertrend": 0.12,
+    "momentum": 0.08,
 }
 
 
@@ -67,6 +67,30 @@ class StrategyRouter:
         except Exception:
             return {}
 
+    def _apply_strategy_filters(
+        self,
+        weights: dict[str, float],
+        instrument_type: str,
+        regime: str | None = None,
+    ) -> dict[str, float]:
+        filters = self._config.get("optimization", {}).get("strategy_filters", {})
+        cfg = filters.get(instrument_type, {})
+        if regime:
+            regime_cfg = cfg.get("regimes", {}).get(regime, {})
+        else:
+            regime_cfg = {}
+        enabled = regime_cfg.get("enabled", cfg.get("enabled"))
+        disabled = set(regime_cfg.get("disabled", cfg.get("disabled", [])))
+        result = dict(weights)
+        if enabled:
+            allowed = set(enabled)
+            result = {k: v for k, v in result.items() if k in allowed}
+        if disabled:
+            result = {k: v for k, v in result.items() if k not in disabled}
+        if not result:
+            return {}
+        return _normalize(result)
+
     def get_strategies(
         self,
         instrument_type: str,
@@ -74,15 +98,19 @@ class StrategyRouter:
         regime: str | None = None,
     ) -> dict[str, float]:
         if instrument_type == "crypto":
-            return dict(self._crypto_weights)
+            return self._apply_strategy_filters(self._crypto_weights, "crypto", regime)
         if instrument_type == "futures":
-            return dict(self._futures_weights)
+            return self._apply_strategy_filters(self._futures_weights, "futures", regime)
 
         if sector and sector in self._sector_weights:
             sector_map = self._sector_weights[sector]
             if regime and regime in sector_map:
-                return dict(sector_map[regime])
+                filtered = self._apply_strategy_filters(sector_map[regime], "stock", regime)
+                if filtered:
+                    return filtered
             if "_fallback" in sector_map:
-                return dict(sector_map["_fallback"])
+                filtered = self._apply_strategy_filters(sector_map["_fallback"], "stock", regime)
+                if filtered:
+                    return filtered
 
-        return dict(self._stock_weights)
+        return self._apply_strategy_filters(self._stock_weights, "stock", regime)

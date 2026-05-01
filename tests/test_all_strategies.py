@@ -29,6 +29,7 @@ from strategies.stoch_rsi import StochRSIStrategy
 from strategies.vwap_reclaim import VWAPReclaimStrategy
 from strategies.gap import GapStrategy
 from strategies.liquidity_sweep import LiquiditySweepStrategy
+from strategies.dol import DOLStrategy
 
 
 @pytest.fixture
@@ -47,6 +48,7 @@ def all_8_strategies(config):
         "vwap_reclaim": VWAPReclaimStrategy(config),
         "gap": GapStrategy(config),
         "liquidity_sweep": LiquiditySweepStrategy(config),
+        "dol": DOLStrategy(config),
     }
 
 

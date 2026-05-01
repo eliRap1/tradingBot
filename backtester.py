@@ -19,14 +19,21 @@ from datetime import datetime
 
 from strategies import ALL_STRATEGIES
 from strategy_selector import select_strategies
+from strategy_router import StrategyRouter
+from instrument_classifier import InstrumentClassifier
+from filters import SECTOR_MAP, compute_regime_guard_decision
 from candles import detect_patterns, bullish_score
 from trend import get_trend_context
 from risk import RiskManager
 from signals import Opportunity
 from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS
 from utils import setup_logger
+from performance import apr_pct, profit_usd
+import ta as _ta_root
 
 log = setup_logger("backtester")
+
+CROSS_SECTIONAL_STRATEGIES = {"relative_strength_rotation"}
 
 
 # ── Slippage Model ──────────────────────────────────────────
@@ -40,6 +47,7 @@ class SlippageModel:
 
     def __init__(self, config: dict):
         bt_cfg = config.get("backtest", {})
+        self._config = bt_cfg
         self.base_slippage_pct = bt_cfg.get("slippage_pct", 0.001)
         self.spread_pct = bt_cfg.get("spread_pct", 0.0005)
         self.crypto_slippage_pct = bt_cfg.get("crypto_slippage_pct", 0.002)
@@ -48,14 +56,22 @@ class SlippageModel:
         self.commission_per_share = bt_cfg.get("commission_per_share", 0.0)
 
     def get_fill_price(self, price: float, side: str, volume: int,
-                       qty: int, is_crypto: bool = False) -> float:
+                       qty: float, is_crypto: bool = False,
+                       asset_type: str | None = None) -> float:
         """
         Calculate realistic fill price including slippage and spread.
         Uses higher costs for crypto due to wider Alpaca spreads.
         """
-        participation = qty / max(volume, 1)
-        if is_crypto:
+        asset_type = asset_type or ("crypto" if is_crypto else "stock")
+        participation = float(qty) / max(float(volume), 1.0)
+        if asset_type == "crypto":
             impact = self.crypto_slippage_pct + self.crypto_spread_pct
+        elif asset_type == "futures":
+            bt_cfg = getattr(self, "_config", {})
+            impact = (
+                bt_cfg.get("futures_slippage_pct", self.base_slippage_pct)
+                + bt_cfg.get("futures_spread_pct", self.spread_pct)
+            )
         else:
             impact = self.base_slippage_pct + self.spread_pct
         if self.volume_impact and participation > 0.01:
@@ -66,8 +82,8 @@ class SlippageModel:
         else:
             return price * (1 - impact)
 
-    def get_commission(self, qty: int) -> float:
-        return self.commission_per_share * qty
+    def get_commission(self, qty: float) -> float:
+        return self.commission_per_share * float(qty)
 
 
 # ── Data Classes ────────────────────────────────────────────
@@ -76,7 +92,7 @@ class SlippageModel:
 class Position:
     symbol: str
     side: str       # "buy" or "sell"
-    qty: int
+    qty: float
     entry_price: float
     stop_loss: float
     take_profit: float
@@ -88,7 +104,7 @@ class Position:
 class BacktestTrade:
     symbol: str
     side: str
-    qty: int
+    qty: float
     entry_price: float
     exit_price: float
     entry_date: str
@@ -105,6 +121,8 @@ class BacktestResult:
     trades: list
     equity_curve: list         # [(date, equity), ...]
     total_return_pct: float
+    profit_usd: float
+    apr_pct: float
     sharpe_ratio: float
     max_drawdown_pct: float
     win_rate: float
@@ -140,6 +158,188 @@ class Backtester:
         self.min_agreeing = config["signals"]["min_agreeing_strategies"]
         self.max_positions = config["signals"]["max_positions"]
 
+        # StrategyRouter: per-sector/regime weights from research/sector_weights.json
+        # Falls back to select_strategies when sector missing or no router weights.
+        self.router = StrategyRouter(config)
+        self.clf = InstrumentClassifier(config)
+        self._use_router = bool(self.router._sector_weights)
+
+    def _regime_label(self, hist: pd.DataFrame) -> str:
+        """Lightweight regime label for router lookup: bull/bear + trending/choppy."""
+        if len(hist) < 50:
+            return "bull_choppy"
+        close = hist["close"]
+        ema50 = close.ewm(span=50, min_periods=20).mean().iloc[-1]
+        bull = close.iloc[-1] > ema50
+        try:
+            adx = _ta_root.trend.ADXIndicator(
+                high=hist["high"], low=hist["low"], close=close, window=14
+            ).adx().iloc[-1]
+            trending = adx is not None and adx >= 20.0
+        except Exception:
+            trending = False
+        tail = "trending" if trending else "choppy"
+        head = "bull" if bull else "bear"
+        return f"{head}_{tail}"
+
+    def _router_weights(self, sym: str, hist: pd.DataFrame) -> dict | None:
+        """Return router weights for symbol, or None to fall back."""
+        instr = self.clf.classify(sym)
+        if instr != "stock":
+            weights = self.router.get_strategies(instr, None, self._regime_label(hist))
+            return weights if weights else None
+        if not self._use_router:
+            return None
+        sector = SECTOR_MAP.get(sym, "other")
+        regime = self._regime_label(hist)
+        weights = self.router.get_strategies(instr, sector, regime)
+        # Empty dict = no data for that (sector, regime) cell -> fall back
+        return weights if weights else None
+
+    def _regime_guard(self, trades: list[BacktestTrade]):
+        stock_cfg = self._asset_risk_cfg("stock")
+        guard_trades = [{"pnl": t.pnl} for t in trades]
+        return compute_regime_guard_decision(
+            guard_trades,
+            self.config,
+            base_max_positions=int(stock_cfg.get("max_positions", self.max_positions)),
+            base_min_score=float(stock_cfg.get("min_score", self.min_score)),
+            base_min_agreeing=int(stock_cfg.get("min_agreeing", self.min_agreeing)),
+        )
+
+    def _futures_root(self, symbol: str) -> str:
+        sym = symbol.upper()
+        for contract in self.config.get("futures", {}).get("contracts", []):
+            root = str(contract.get("root", "")).upper()
+            if root and sym.startswith(root):
+                return root
+        return sym
+
+    def _asset_risk_cfg(self, asset_type: str) -> dict:
+        return self.config.get("risk", {}).get("asset_overrides", {}).get(asset_type, {})
+
+    def _risk_value(self, asset_type: str, key: str, default_key: str | None = None):
+        asset_cfg = self._asset_risk_cfg(asset_type)
+        if key in asset_cfg:
+            return asset_cfg[key]
+        return self.config.get("risk", {}).get(default_key or key)
+
+    def _contract_multiplier(self, symbol: str, asset_type: str | None = None) -> float:
+        asset_type = asset_type or self.clf.classify(symbol)
+        if asset_type != "futures":
+            return float(self._asset_risk_cfg(asset_type).get("contract_multiplier", 1.0))
+        cfg = self._asset_risk_cfg("futures")
+        multipliers = cfg.get("contract_multipliers", {})
+        return float(multipliers.get(self._futures_root(symbol), cfg.get("contract_multiplier", 1.0)))
+
+    def _allow_fractional_qty(self, asset_type: str) -> bool:
+        cfg = self._asset_risk_cfg(asset_type)
+        return bool(cfg.get("allow_fractional_qty", asset_type == "crypto"))
+
+    def _min_qty(self, asset_type: str) -> float:
+        return float(self._asset_risk_cfg(asset_type).get("min_qty", 0.000001 if asset_type == "crypto" else 1.0))
+
+    def _asset_position_count(self, positions: dict[str, Position], asset_type: str) -> int:
+        return sum(1 for open_sym in positions if self.clf.classify(open_sym) == asset_type)
+
+    def _asset_slots_available(self, positions: dict[str, Position], asset_type: str, regime_guard) -> int:
+        if asset_type == "stock":
+            max_positions = regime_guard.max_positions
+        else:
+            max_positions = int(
+                self._asset_risk_cfg(asset_type).get(
+                    "max_positions",
+                    self.config.get("signals", {}).get("max_crypto_positions", 3)
+                    if asset_type == "crypto" else self.max_positions,
+                )
+            )
+        return max(0, max_positions - self._asset_position_count(positions, asset_type))
+
+    def _volatility_size_mult(self, hist: pd.DataFrame, asset_type: str) -> float:
+        cfg = self._asset_risk_cfg(asset_type)
+        vol_cfg = cfg.get("volatility_target", self.config.get("risk", {}).get("volatility_target", {}))
+        if not vol_cfg or not vol_cfg.get("enabled", True):
+            return 1.0
+        lookback = int(vol_cfg.get("lookback_bars", 20))
+        if len(hist) < lookback + 2:
+            return 1.0
+        returns = hist["close"].pct_change().dropna().tail(lookback)
+        realized = float(returns.std() * math.sqrt(252)) if len(returns) > 1 else 0.0
+        if not np.isfinite(realized) or realized <= 0:
+            return 1.0
+        target = float(vol_cfg.get("target_annual_vol", 0.25))
+        mult = target / realized
+        return max(float(vol_cfg.get("min_mult", 0.35)), min(float(vol_cfg.get("max_mult", 1.50)), mult))
+
+    def _round_qty(self, qty: float, asset_type: str) -> float:
+        if self._allow_fractional_qty(asset_type):
+            decimals = int(self._asset_risk_cfg(asset_type).get("qty_decimals", 8))
+            return round(max(0.0, qty), decimals)
+        return float(int(qty))
+
+    def _score_strategy(self, strat_name: str, strat, sym: str, hist: pd.DataFrame,
+                        date, bars_dict: dict[str, pd.DataFrame],
+                        positions: dict[str, Position], cache: dict) -> float:
+        if strat_name in CROSS_SECTIONAL_STRATEGIES:
+            if strat_name not in cache:
+                histories = {}
+                for other_sym, other_df in bars_dict.items():
+                    if other_sym in positions:
+                        continue
+                    other_hist = other_df.loc[other_df.index <= date]
+                    if len(other_hist) >= 30:
+                        histories[other_sym] = other_hist
+                cache[strat_name] = strat.generate_signals(histories)
+            return float(cache[strat_name].get(sym, 0.0) or 0.0)
+        result = strat.generate_signals({sym: hist})
+        return float(result.get(sym, 0.0) or 0.0)
+
+    def _crypto_regime_allows_long(
+        self,
+        sym: str,
+        hist: pd.DataFrame,
+        date,
+        bars_dict: dict[str, pd.DataFrame],
+    ) -> bool:
+        cfg = self._asset_risk_cfg("crypto").get("regime_filter", {})
+        if not cfg.get("enabled", False):
+            return True
+
+        ema_period = int(cfg.get("ema_period", 20))
+        lookback = int(cfg.get("return_lookback_bars", 20))
+        min_len = max(ema_period, lookback) + 1
+        if len(hist) < min_len:
+            return False
+
+        def above_ema(df: pd.DataFrame) -> bool:
+            close = df["close"]
+            ema = close.ewm(span=ema_period, min_periods=max(2, ema_period // 2)).mean().iloc[-1]
+            return float(close.iloc[-1]) > float(ema)
+
+        def ret_ok(df: pd.DataFrame) -> bool:
+            if len(df) <= lookback:
+                return False
+            close = df["close"]
+            base = float(close.iloc[-lookback - 1])
+            if base <= 0:
+                return False
+            ret = float(close.iloc[-1]) / base - 1.0
+            return ret >= float(cfg.get("min_benchmark_return", 0.0))
+
+        if cfg.get("require_symbol_above_ema", True) and not above_ema(hist):
+            return False
+
+        benchmark = str(cfg.get("benchmark_symbol", "BTC/USD"))
+        bench_df = bars_dict.get(benchmark)
+        if bench_df is None and benchmark != sym:
+            return False
+        bench_hist = hist if benchmark == sym else bench_df.loc[bench_df.index <= date]
+        if len(bench_hist) < min_len:
+            return False
+        if cfg.get("require_benchmark_above_ema", True) and not above_ema(bench_hist):
+            return False
+        return ret_ok(bench_hist)
+
     def run(self, bars_dict: dict[str, pd.DataFrame],
             min_bars: int = 50) -> BacktestResult:
         """
@@ -169,6 +369,7 @@ class Backtester:
 
         total_signals_found = 0
         progress_interval = max(1, len(all_dates) // 10)
+        last_guard_mode = ""
 
         # Bar-by-bar simulation
         for i in range(min_bars, len(all_dates)):
@@ -197,56 +398,74 @@ class Backtester:
 
                 exit_price = None
                 exit_reason = None
-                _crypto = sym in CRYPTO_SYMBOLS
+                asset_type = self.clf.classify(sym)
+                multiplier = self._contract_multiplier(sym, asset_type)
 
                 if pos.side == "buy":
                     # Stop loss hit? (low goes below stop)
                     if bar_low <= pos.stop_loss:
                         if bar_open <= pos.stop_loss:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "sell", bar_vol, pos.qty, _crypto)
+                                bar_open, "sell", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.stop_loss, "sell", bar_vol, pos.qty, _crypto)
+                                pos.stop_loss, "sell", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         exit_reason = "stop_loss"
 
                     elif bar_high >= pos.take_profit:
                         if bar_open >= pos.take_profit:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "sell", bar_vol, pos.qty, _crypto)
+                                bar_open, "sell", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.take_profit, "sell", bar_vol, pos.qty, _crypto)
+                                pos.take_profit, "sell", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         exit_reason = "take_profit"
 
                 else:  # short
                     if bar_high >= pos.stop_loss:
                         if bar_open >= pos.stop_loss:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "buy", bar_vol, pos.qty, _crypto)
+                                bar_open, "buy", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.stop_loss, "buy", bar_vol, pos.qty, _crypto)
+                                pos.stop_loss, "buy", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         exit_reason = "stop_loss"
 
                     elif bar_low <= pos.take_profit:
                         if bar_open <= pos.take_profit:
                             exit_price = self.slippage.get_fill_price(
-                                bar_open, "buy", bar_vol, pos.qty, _crypto)
+                                bar_open, "buy", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         else:
                             exit_price = self.slippage.get_fill_price(
-                                pos.take_profit, "buy", bar_vol, pos.qty, _crypto)
+                                pos.take_profit, "buy", bar_vol, pos.qty,
+                                is_crypto=asset_type == "crypto",
+                                asset_type=asset_type)
                         exit_reason = "take_profit"
 
                 if exit_price is not None:
                     if pos.side == "buy":
-                        pnl = (exit_price - pos.entry_price) * pos.qty
+                        pnl = (exit_price - pos.entry_price) * pos.qty * multiplier
                     else:
-                        pnl = (pos.entry_price - exit_price) * pos.qty
+                        pnl = (pos.entry_price - exit_price) * pos.qty * multiplier
 
                     commission = self.slippage.get_commission(pos.qty) * 2
                     pnl -= commission
-                    pnl_pct = pnl / (pos.entry_price * pos.qty) if pos.entry_price > 0 else 0
+                    notional = pos.entry_price * pos.qty * multiplier
+                    pnl_pct = pnl / notional if notional > 0 else 0
 
                     trades.append(BacktestTrade(
                         symbol=sym, side=pos.side, qty=pos.qty,
@@ -266,6 +485,14 @@ class Backtester:
             for sym in symbols_to_close:
                 del positions[sym]
 
+            regime_guard = self._regime_guard(trades)
+            if regime_guard.mode != last_guard_mode:
+                log.info(
+                    f"Backtest regime guard: {last_guard_mode or 'initial'} -> "
+                    f"{regime_guard.mode} ({regime_guard.reason})"
+                )
+                last_guard_mode = regime_guard.mode
+
             # ── 2. Generate signals (NO look-ahead) ─────────
             if len(positions) >= self.max_positions:
                 equity_curve.append((str(date), equity))
@@ -274,6 +501,7 @@ class Backtester:
 
             # Run strategies on historical bars only (bars up to and including current)
             signals_by_sym = {}
+            strategy_result_cache = {}
             for sym, df in bars_dict.items():
                 if sym in positions:
                     continue
@@ -283,8 +511,13 @@ class Backtester:
                 if len(hist) < 30:
                     continue
 
-                # Strategy selection based on historical data
-                selection = select_strategies(hist, sym)
+                # Strategy selection: prefer per-sector router weights, fall
+                # back to regime-based select_strategies when no router data.
+                router_w = self._router_weights(sym, hist)
+                if router_w:
+                    selection = {"strategies": router_w, "regime": "router"}
+                else:
+                    selection = select_strategies(hist, sym)
 
                 # Run strategies — track both bullish and bearish agreement
                 weighted_sum = 0.0
@@ -300,8 +533,10 @@ class Backtester:
                     if not strat:
                         continue
 
-                    result = strat.generate_signals({sym: hist})
-                    score = result.get(sym, 0.0)
+                    score = self._score_strategy(
+                        strat_name, strat, sym, hist, date,
+                        bars_dict, positions, strategy_result_cache,
+                    )
                     strat_scores[strat_name] = score
                     weighted_sum += score * weight
                     total_weight += weight
@@ -315,9 +550,24 @@ class Backtester:
                     continue
 
                 composite = weighted_sum / total_weight
+                asset_type = self.clf.classify(sym)
+                asset_cfg = self._asset_risk_cfg(asset_type)
+                if asset_type == "stock":
+                    min_score = regime_guard.min_score
+                    min_agreeing = regime_guard.min_agreeing
+                elif asset_type == "crypto":
+                    min_score = float(asset_cfg.get("min_score", self.config["signals"].get("min_crypto_score", self.min_score)))
+                    min_agreeing = int(asset_cfg.get("min_agreeing", self.config["signals"].get("min_crypto_agreeing", 2)))
+                else:
+                    min_score = float(asset_cfg.get("min_score", self.min_score))
+                    min_agreeing = int(asset_cfg.get("min_agreeing", self.min_agreeing))
 
                 # Check long signal
-                if num_bullish >= self.min_agreeing and composite >= self.min_score:
+                long_allowed = (
+                    asset_type != "crypto"
+                    or self._crypto_regime_allows_long(sym, hist, date, bars_dict)
+                )
+                if num_bullish >= min_agreeing and composite >= min_score and long_allowed:
                     signals_by_sym[sym] = {
                         "score": composite,
                         "direction": "buy",
@@ -327,7 +577,11 @@ class Backtester:
                     }
                     total_signals_found += 1
                 # Check short signal
-                elif num_bearish >= self.min_agreeing and composite <= -self.min_score:
+                elif (
+                    bool(asset_cfg.get("allow_shorts", asset_type != "stock"))
+                    and num_bearish >= min_agreeing
+                    and composite <= -min_score
+                ):
                     signals_by_sym[sym] = {
                         "score": composite,
                         "direction": "sell",
@@ -342,8 +596,14 @@ class Backtester:
             sorted_signals = sorted(signals_by_sym.items(),
                                     key=lambda x: abs(x[1]["score"]), reverse=True)
 
-            slots = self.max_positions - len(positions)
-            for sym, sig in sorted_signals[:slots]:
+            global_slots = self.max_positions - len(positions)
+            for sym, sig in sorted_signals:
+                if global_slots <= 0:
+                    break
+                asset_type_for_slot = self.clf.classify(sym)
+                if self._asset_slots_available(positions, asset_type_for_slot, regime_guard) <= 0:
+                    continue
+
                 hist = sig["hist"]
                 bar = bars_dict[sym].loc[date] if date in bars_dict[sym].index else None
                 if bar is None:
@@ -363,52 +623,72 @@ class Backtester:
                 if atr_val <= 0:
                     continue
 
-                sl_mult = self.config["risk"]["stop_loss_atr_mult"]
-                tp_mult = self.config["risk"]["take_profit_atr_mult"]
+                asset_cfg = self._asset_risk_cfg(asset_type_for_slot)
+                multiplier = self._contract_multiplier(sym, asset_type_for_slot)
+                sl_mult = float(asset_cfg.get("stop_loss_atr_mult", self.config["risk"]["stop_loss_atr_mult"]))
+                tp_mult = float(asset_cfg.get("take_profit_atr_mult", self.config["risk"]["take_profit_atr_mult"]))
 
                 if direction == "sell":
                     # SHORT: stop above, target below
                     stop_loss = bar_close + (atr_val * sl_mult)
                     take_profit = bar_close - (atr_val * tp_mult)
-                    risk_per_share = stop_loss - bar_close
+                    risk_per_share = (stop_loss - bar_close) * multiplier
                     reward = bar_close - take_profit
                 else:
                     # LONG: stop below, target above
                     stop_loss = bar_close - (atr_val * sl_mult)
                     take_profit = bar_close + (atr_val * tp_mult)
-                    risk_per_share = bar_close - stop_loss
+                    risk_per_share = (bar_close - stop_loss) * multiplier
                     reward = take_profit - bar_close
 
                 if risk_per_share <= 0:
                     continue
 
                 # R:R filter
-                rr = reward / risk_per_share
-                if rr < self.config["risk"]["min_risk_reward"]:
+                rr = (reward * multiplier) / risk_per_share
+                min_rr = float(asset_cfg.get("min_risk_reward", self.config["risk"]["min_risk_reward"]))
+                if rr < min_rr:
                     continue
 
                 # Position sizing
-                max_risk = equity * self.config["risk"]["max_portfolio_risk_pct"]
-                qty = int(max_risk / risk_per_share)
-                max_pos_value = equity * self.config["risk"]["max_position_pct"]
-                qty = min(qty, int(max_pos_value / bar_close))
+                risk_pct = float(asset_cfg.get("max_portfolio_risk_pct", self.config["risk"]["max_portfolio_risk_pct"]))
+                max_risk = equity * risk_pct
+                qty_by_risk = max_risk / risk_per_share
+                max_pos_pct = float(asset_cfg.get("max_position_pct", self.config["risk"]["max_position_pct"]))
+                leverage = float(asset_cfg.get("leverage", self.config["risk"].get("leverage", 1.0)))
+                max_pos_value = equity * max_pos_pct * leverage
+                qty_by_notional = max_pos_value / max(bar_close * multiplier, 1e-9)
+                qty = min(qty_by_risk, qty_by_notional)
+                qty *= self._volatility_size_mult(hist, asset_type_for_slot)
+                if asset_type_for_slot == "stock":
+                    qty *= regime_guard.size_mult
+                qty = self._round_qty(qty, asset_type_for_slot)
 
-                if qty <= 0:
+                if qty < self._min_qty(asset_type_for_slot):
                     continue
 
                 # Simulate fill with slippage (crypto gets wider spreads)
                 fill_price = self.slippage.get_fill_price(
                     bar_close, direction, bar_vol, qty,
-                    is_crypto=sym in CRYPTO_SYMBOLS)
+                    is_crypto=asset_type_for_slot == "crypto",
+                    asset_type=asset_type_for_slot)
+                entry_price = round(fill_price, 2)
+                if direction == "sell":
+                    stop_loss = entry_price + (atr_val * sl_mult)
+                    take_profit = entry_price - (atr_val * tp_mult)
+                else:
+                    stop_loss = entry_price - (atr_val * sl_mult)
+                    take_profit = entry_price + (atr_val * tp_mult)
 
                 positions[sym] = Position(
                     symbol=sym, side=direction, qty=qty,
-                    entry_price=round(fill_price, 2),
+                    entry_price=entry_price,
                     stop_loss=round(stop_loss, 2),
                     take_profit=round(take_profit, 2),
                     entry_bar=i,
                     entry_date=str(date),
                 )
+                global_slots -= 1
 
             # ── 4. Update equity curve ──────────────────────
             # Mark-to-market open positions
@@ -416,10 +696,12 @@ class Backtester:
             for sym, pos in positions.items():
                 if sym in bars_dict and date in bars_dict[sym].index:
                     current = float(bars_dict[sym].loc[date, "close"])
+                    asset_type = self.clf.classify(sym)
+                    multiplier = self._contract_multiplier(sym, asset_type)
                     if pos.side == "buy":
-                        mtm += (current - pos.entry_price) * pos.qty
+                        mtm += (current - pos.entry_price) * pos.qty * multiplier
                     else:
-                        mtm += (pos.entry_price - current) * pos.qty
+                        mtm += (pos.entry_price - current) * pos.qty * multiplier
 
             equity_curve.append((str(date), round(mtm, 2)))
             daily_returns.append(
@@ -431,10 +713,13 @@ class Backtester:
         for sym, pos in list(positions.items()):
             if sym in bars_dict and last_date in bars_dict[sym].index:
                 exit_price = float(bars_dict[sym].loc[last_date, "close"])
+                asset_type = self.clf.classify(sym)
+                multiplier = self._contract_multiplier(sym, asset_type)
                 if pos.side == "buy":
-                    pnl = (exit_price - pos.entry_price) * pos.qty
+                    pnl = (exit_price - pos.entry_price) * pos.qty * multiplier
                 else:
-                    pnl = (pos.entry_price - exit_price) * pos.qty
+                    pnl = (pos.entry_price - exit_price) * pos.qty * multiplier
+                notional = pos.entry_price * pos.qty * multiplier
 
                 trades.append(BacktestTrade(
                     symbol=sym, side=pos.side, qty=pos.qty,
@@ -443,11 +728,14 @@ class Backtester:
                     entry_date=pos.entry_date,
                     exit_date=str(last_date),
                     pnl=round(pnl, 2),
-                    pnl_pct=round(pnl / (pos.entry_price * pos.qty), 4),
+                    pnl_pct=round(pnl / notional, 4) if notional > 0 else 0.0,
                     bars_held=len(all_dates) - pos.entry_bar,
                     exit_reason="end_of_data",
                 ))
                 equity += pnl
+
+        if equity_curve:
+            equity_curve[-1] = (str(last_date), round(equity, 2))
 
         # ── Calculate metrics ───────────────────────────────
         return self._calculate_result(trades, equity_curve, daily_returns)
@@ -467,7 +755,10 @@ class Backtester:
         total_pnl = sum(pnls)
         gross_profit = sum(wins) if wins else 0.0
         gross_loss = abs(sum(losses)) if losses else 0.0
-        total_return = total_pnl / self.initial_equity
+        ending_equity = float(equity_curve[-1][1]) if equity_curve else self.initial_equity + total_pnl
+        total_profit = profit_usd(equity_curve, self.initial_equity) if equity_curve else total_pnl
+        total_return = (ending_equity - self.initial_equity) / self.initial_equity
+        annual_return_pct = apr_pct(equity_curve, self.initial_equity) if equity_curve else 0.0
 
         # Win rate
         win_rate = len(wins) / n if n > 0 else 0.0
@@ -515,6 +806,8 @@ class Backtester:
             } for t in trades],
             equity_curve=equity_curve,
             total_return_pct=round(total_return * 100, 2),
+            profit_usd=round(total_profit, 2),
+            apr_pct=annual_return_pct,
             sharpe_ratio=round(sharpe, 2),
             max_drawdown_pct=round(max_dd * 100, 2),
             win_rate=round(win_rate * 100, 1),
@@ -535,6 +828,8 @@ class Backtester:
         log.info(f"Total Trades: {r.total_trades}")
         log.info(f"Win Rate: {r.win_rate}%")
         log.info(f"Total Return: {r.total_return_pct}%")
+        log.info(f"Profit: ${r.profit_usd:+,.2f}")
+        log.info(f"APR: {r.apr_pct}%")
         log.info(f"Sharpe Ratio: {r.sharpe_ratio}")
         log.info(f"Max Drawdown: {r.max_drawdown_pct}%")
         log.info(f"Profit Factor: {r.profit_factor}")
@@ -560,6 +855,7 @@ class Backtester:
     def _empty_result(self, equity_curve: list = None) -> BacktestResult:
         return BacktestResult(
             trades=[], equity_curve=equity_curve or [], total_return_pct=0.0,
+            profit_usd=0.0, apr_pct=0.0,
             sharpe_ratio=0.0, max_drawdown_pct=0.0, win_rate=0.0,
             profit_factor=0.0, expectancy=0.0, total_trades=0,
             avg_bars_held=0.0, commission_total=0.0,

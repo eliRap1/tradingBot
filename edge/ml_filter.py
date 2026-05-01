@@ -14,7 +14,7 @@ REGIME_MAP = {"bull_trending": 3, "bull_choppy": 2, "bear_trending": 1, "bear_ch
 SESSION_MAP = {"open": 0, "mid": 1, "close": 2}
 STRATEGY_NAMES = [
     "momentum", "mean_reversion", "breakout", "supertrend",
-    "stoch_rsi", "vwap_reclaim", "gap", "liquidity_sweep",
+    "stoch_rsi", "vwap_reclaim", "gap", "liquidity_sweep", "dol",
 ]
 
 

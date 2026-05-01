@@ -7,6 +7,10 @@ from .vwap_reclaim import VWAPReclaimStrategy
 from .gap import GapStrategy
 from .liquidity_sweep import LiquiditySweepStrategy
 from .futures_trend import FuturesTrendStrategy
+from .dol import DOLStrategy
+from .time_series_momentum import TimeSeriesMomentumStrategy
+from .donchian_breakout import DonchianBreakoutStrategy
+from .relative_strength_rotation import RelativeStrengthRotationStrategy
 
 ALL_STRATEGIES = {
     "momentum": MomentumStrategy,
@@ -18,4 +22,8 @@ ALL_STRATEGIES = {
     "gap": GapStrategy,
     "liquidity_sweep": LiquiditySweepStrategy,
     "futures_trend": FuturesTrendStrategy,
+    "dol": DOLStrategy,
+    "time_series_momentum": TimeSeriesMomentumStrategy,
+    "donchian_breakout": DonchianBreakoutStrategy,
+    "relative_strength_rotation": RelativeStrengthRotationStrategy,
 }

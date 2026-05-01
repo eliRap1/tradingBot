@@ -1,24 +1,23 @@
+# Environment / secrets
 .env
-logs/
+*.env
+*.env.*
+
+# Python
 __pycache__/
 *.pyc
 .venv/
+
+# Logs / runtime state
+logs/
 state.json
 trades.json
 pending_signals.json
--e 
-# Environment files
-*.env
-*.env.*
--e 
-# Environment files
-*.env
-*.env.*
--e 
-# Environment files
-*.env
-*.env.*
--e 
-# Environment files
-*.env
-*.env.*
+*.db
+
+# Backtest output dumps
+ab_*.txt
+oos_*.txt
+walkforward*.txt
+full_*.txt
+*_out.txt

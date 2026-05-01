@@ -33,7 +33,7 @@ FEATURE_FILE = os.path.join(os.path.dirname(__file__), "ml_features.json")
 
 STRATEGY_NAMES = [
     "momentum", "mean_reversion", "breakout", "supertrend",
-    "stoch_rsi", "vwap_reclaim", "gap", "liquidity_sweep",
+    "stoch_rsi", "vwap_reclaim", "gap", "liquidity_sweep", "dol",
 ]
 
 REGIME_MAP = {"bull": 2, "chop": 1, "bear": 0}
