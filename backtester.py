@@ -22,6 +22,7 @@ from strategy_selector import select_strategies
 from strategy_router import StrategyRouter
 from instrument_classifier import InstrumentClassifier
 from filters import SECTOR_MAP, compute_regime_guard_decision
+from edge.regime_gate import is_chop_or_panic
 from candles import detect_patterns, bullish_score
 from trend import get_trend_context
 from risk import RiskManager
@@ -55,12 +56,22 @@ class SlippageModel:
         self.volume_impact = bt_cfg.get("volume_impact", True)
         self.commission_per_share = bt_cfg.get("commission_per_share", 0.0)
 
+        # Smart orders simulate limit @ midpoint fills (entry only).
+        # Round-trip cost drops because we earn half the spread on entry,
+        # but stop/TP fills (exits) still cross the spread.
+        exec_cfg = config.get("execution", {})
+        self.smart_orders = bool(exec_cfg.get("smart_orders", False))
+        self.smart_entry_discount = float(exec_cfg.get("smart_entry_discount", 0.6))
+
     def get_fill_price(self, price: float, side: str, volume: int,
                        qty: float, is_crypto: bool = False,
-                       asset_type: str | None = None) -> float:
+                       asset_type: str | None = None,
+                       is_entry: bool = False) -> float:
         """
         Calculate realistic fill price including slippage and spread.
         Uses higher costs for crypto due to wider Alpaca spreads.
+        When smart_orders + is_entry, scale impact down by smart_entry_discount
+        to model limit-at-midpoint entries (saves half-spread).
         """
         asset_type = asset_type or ("crypto" if is_crypto else "stock")
         participation = float(qty) / max(float(volume), 1.0)
@@ -76,6 +87,9 @@ class SlippageModel:
             impact = self.base_slippage_pct + self.spread_pct
         if self.volume_impact and participation > 0.01:
             impact += participation * 0.01
+
+        if self.smart_orders and is_entry and asset_type != "crypto":
+            impact *= self.smart_entry_discount
 
         if side == "buy":
             return price * (1 + impact)
@@ -341,12 +355,16 @@ class Backtester:
         return ret_ok(bench_hist)
 
     def run(self, bars_dict: dict[str, pd.DataFrame],
-            min_bars: int = 50) -> BacktestResult:
+            min_bars: int = 50,
+            benchmark_bars: pd.DataFrame | None = None) -> BacktestResult:
         """
         Run backtest on provided bars.
 
         bars_dict: {symbol: DataFrame with OHLCV}
         min_bars: minimum bars before starting to trade
+        benchmark_bars: optional SPY (or other index) DataFrame for the
+            leading regime gate (chop/panic kill-switch). Falls back to
+            bars_dict.get("SPY") if not provided.
         """
         # Find the common date range
         all_dates = set()
@@ -493,6 +511,19 @@ class Backtester:
                 )
                 last_guard_mode = regime_guard.mode
 
+            # Leading regime gate (SPY ADX + vol). Skip new entries on chop/panic.
+            bench_df = benchmark_bars if benchmark_bars is not None else bars_dict.get("SPY")
+            if bench_df is not None:
+                bench_hist = bench_df.loc[bench_df.index <= date]
+                blocked, gate_reason = is_chop_or_panic(bench_hist, self.config)
+                if blocked:
+                    self._gate_block_count = getattr(self, "_gate_block_count", 0) + 1
+                    equity_curve.append((str(date), equity))
+                    daily_returns.append(
+                        (equity - prev_equity) / prev_equity if prev_equity > 0 else 0
+                    )
+                    continue
+
             # ── 2. Generate signals (NO look-ahead) ─────────
             if len(positions) >= self.max_positions:
                 equity_curve.append((str(date), equity))
@@ -561,6 +592,12 @@ class Backtester:
                 else:
                     min_score = float(asset_cfg.get("min_score", self.min_score))
                     min_agreeing = int(asset_cfg.get("min_agreeing", self.min_agreeing))
+
+                # Cap min_agreeing by strategies available in the bucket.
+                # Sector-routed buckets sometimes hold only 1-2 strategies for
+                # a regime cell, which would make min_agreeing=3 unreachable.
+                bucket_size = sum(1 for w in selection["strategies"].values() if w > 0)
+                min_agreeing = min(min_agreeing, max(2, bucket_size))
 
                 # Check long signal
                 long_allowed = (
@@ -650,8 +687,30 @@ class Backtester:
                 if rr < min_rr:
                     continue
 
-                # Position sizing
-                risk_pct = float(asset_cfg.get("max_portfolio_risk_pct", self.config["risk"]["max_portfolio_risk_pct"]))
+                # Position sizing — base risk_pct, optionally Kelly-scaled.
+                base_risk_pct = float(asset_cfg.get("max_portfolio_risk_pct", self.config["risk"]["max_portfolio_risk_pct"]))
+                sizing_method = str(
+                    asset_cfg.get("sizing_method", self.config["risk"].get("sizing_method", "volatility_adjusted"))
+                ).lower()
+                risk_pct = base_risk_pct
+                if sizing_method in ("kelly", "kelly_fractional") and asset_type_for_slot == "stock":
+                    kelly_min = int(self.config["risk"].get("kelly_min_trades", 30))
+                    closed_pnls = [float(t.pnl) for t in trades if t.pnl != 0]
+                    if len(closed_pnls) >= kelly_min:
+                        wins = [p for p in closed_pnls if p > 0]
+                        losses = [abs(p) for p in closed_pnls if p < 0]
+                        if wins and losses:
+                            p_win = len(wins) / len(closed_pnls)
+                            avg_win = sum(wins) / len(wins)
+                            avg_loss = sum(losses) / len(losses)
+                            b = min(avg_win / avg_loss, 5.0) if avg_loss > 0 else 1.0
+                            kelly_f = p_win - ((1.0 - p_win) / b) if b > 0 else 0.0
+                            kelly_f *= float(self.config["risk"].get("kelly_fraction", 0.5))
+                            if kelly_f > 0:
+                                risk_pct = min(kelly_f, base_risk_pct * 2.0)
+                            else:
+                                # Negative-edge: skip trade entirely
+                                continue
                 max_risk = equity * risk_pct
                 qty_by_risk = max_risk / risk_per_share
                 max_pos_pct = float(asset_cfg.get("max_position_pct", self.config["risk"]["max_position_pct"]))
@@ -667,11 +726,13 @@ class Backtester:
                 if qty < self._min_qty(asset_type_for_slot):
                     continue
 
-                # Simulate fill with slippage (crypto gets wider spreads)
+                # Simulate fill with slippage (crypto gets wider spreads).
+                # Entry: smart_orders model midpoint fill (cheaper).
                 fill_price = self.slippage.get_fill_price(
                     bar_close, direction, bar_vol, qty,
                     is_crypto=asset_type_for_slot == "crypto",
-                    asset_type=asset_type_for_slot)
+                    asset_type=asset_type_for_slot,
+                    is_entry=True)
                 entry_price = round(fill_price, 2)
                 if direction == "sell":
                     stop_loss = entry_price + (atr_val * sl_mult)
@@ -818,6 +879,9 @@ class Backtester:
             commission_total=round(total_comm, 2),
         )
 
+        gate_blocks = getattr(self, "_gate_block_count", 0)
+        if gate_blocks:
+            log.info(f"Regime gate blocked entries on {gate_blocks} bars")
         self._log_result(result)
         return result
 

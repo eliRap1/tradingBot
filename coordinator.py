@@ -41,6 +41,7 @@ from edge.insider_flow import InsiderFlow
 from edge.relative_strength import RelativeStrength
 from edge.market_calendar import MarketCalendar
 from edge.volume_gate import VolumeGate
+from edge.regime_gate import is_chop_or_panic
 
 log = setup_logger("coordinator")
 
@@ -439,6 +440,8 @@ class Coordinator:
             "vol_block": 0,
             "vol_surge_boost": 0,
             "vol_below_penalty": 0,
+            "regime_gate_block": 0,
+            "earnings_block": 0,
         }
 
         # 0a. Check if we should skip this cycle entirely.
@@ -886,6 +889,19 @@ class Coordinator:
             self._log_edge_summary()
             return
 
+        # Leading regime gate: block new entries on chop (low SPY ADX) or
+        # panic (high realized vol). Independent from PF-based regime guard
+        # which is lagging. Exits and management still run.
+        spy_df_live = self.edge_cross_asset.get_spy_df()
+        gate_blocked, gate_reason = is_chop_or_panic(spy_df_live, self.config)
+        if gate_blocked:
+            log.warning(f"REGIME GATE BLOCK: {gate_reason} — no new entries this cycle")
+            self._edge_counts["regime_gate_block"] += 1
+            self.portfolio.tracker.log_stats()
+            self._log_watcher_status()
+            self._log_edge_summary()
+            return
+
         # Half-day early close: skip entry loop, let exits/management run
         if cal_sig.early_close:
             self.portfolio.tracker.log_stats()
@@ -958,7 +974,7 @@ class Coordinator:
             if edge_cfg.get("earnings_avoidance", True):
                 earnings_block_days = edge_cfg.get("earnings_block_days", 1)
                 if days_to_earn is not None and 0 <= days_to_earn <= earnings_block_days:
-                    self._edge_counts["earnings_block"] = self._edge_counts.get("earnings_block", 0) + 1
+                    self._edge_counts["earnings_block"] += 1
                     log.info(
                         f"EARNINGS BLOCK: {sym} earnings in {days_to_earn}d "
                         f"(threshold {earnings_block_days}d) - entry skipped"

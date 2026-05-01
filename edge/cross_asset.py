@@ -42,6 +42,11 @@ class CrossAssetEngine:
         self.ttl_sec = ttl_sec
         self._cached = CrossAssetSignals()
         self._cached_at = 0.0
+        self._spy_df = None
+
+    def get_spy_df(self):
+        """Return last cached SPY DataFrame (used by regime_gate)."""
+        return self._spy_df
 
     def get_signals(self) -> CrossAssetSignals:
         if time.time() - self._cached_at < self.ttl_sec:
@@ -49,6 +54,7 @@ class CrossAssetEngine:
 
         bars = self.data.get_bars(_FETCH_TICKERS, timeframe="1Day", days=80)
         spy_df = bars.get("SPY")
+        self._spy_df = spy_df
 
         breadth = self._compute_breadth(bars)
         bond_trend = self._bond_trend(bars.get("TLT"))

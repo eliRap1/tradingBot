@@ -28,7 +28,11 @@ def fetch_bars(symbols, days, timeframe="1Day", warmup=60):
     broker, data, cfg = _connect()
     bars = {}
     total = days + warmup
-    for i, sym in enumerate(symbols, 1):
+    # Always include SPY benchmark for regime_gate (live regime kill-switch)
+    fetch_list = list(symbols)
+    if "SPY" not in fetch_list:
+        fetch_list = ["SPY"] + fetch_list
+    for i, sym in enumerate(fetch_list, 1):
         for attempt in range(3):
             try:
                 if not broker._ib.isConnected():
@@ -45,7 +49,7 @@ def fetch_bars(symbols, days, timeframe="1Day", warmup=60):
                 print(f"  {sym} attempt {attempt + 1} failed: {e}")
                 time.sleep(1)
         if i % 10 == 0:
-            print(f"  fetched {i}/{len(symbols)} (got {len(bars)} OK)")
+            print(f"  fetched {i}/{len(fetch_list)} (got {len(bars)} OK)")
         time.sleep(0.4)
     try: broker._ib.disconnect()
     except Exception: pass
@@ -90,6 +94,11 @@ def split_bars(bars, pct):
     return is_bars, oos_bars
 
 
+def pop_benchmark(bars: dict, ticker: str = "SPY"):
+    """Remove ticker from bars dict and return its DataFrame (or None)."""
+    return bars.pop(ticker, None)
+
+
 def make_date_aligned_folds(bars, folds, min_bars=30):
     """Split a mixed-asset bar set into calendar-aligned folds."""
     starts = [df.index.min() for df in bars.values() if df is not None and len(df) >= min_bars]
@@ -127,9 +136,9 @@ def make_date_aligned_folds(bars, folds, min_bars=30):
     return result
 
 
-def run(label, bars, config):
+def run(label, bars, config, benchmark=None):
     bt = Backtester(config, initial_equity=100000)
-    r = bt.run(bars)
+    r = bt.run(bars, benchmark_bars=benchmark)
     return result_row(r, label)
 
 
@@ -168,13 +177,15 @@ def main():
     print(f"Got bars for {len(bars)} symbols\n")
 
     is_bars, oos_bars = split_bars(bars, args.oos_pct)
+    is_bench = pop_benchmark(is_bars)
+    oos_bench = pop_benchmark(oos_bars)
     lens_is = [len(b) for b in is_bars.values()]
     lens_oos = [len(b) for b in oos_bars.values()]
     print(f"IS bars per sym avg={sum(lens_is)/max(1,len(lens_is)):.0f}  "
           f"OOS bars per sym avg={sum(lens_oos)/max(1,len(lens_oos)):.0f}\n")
 
-    is_res = run("IS", copy.deepcopy(is_bars), config)
-    oos_res = run("OOS", copy.deepcopy(oos_bars), config)
+    is_res = run("IS", copy.deepcopy(is_bars), config, benchmark=is_bench)
+    oos_res = run("OOS", copy.deepcopy(oos_bars), config, benchmark=oos_bench)
 
     print()
     _row(is_res)

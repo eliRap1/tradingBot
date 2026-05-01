@@ -8,14 +8,14 @@ import copy
 
 from utils import load_config
 from backtester import Backtester
-from oos_harness import fetch_bars, make_date_aligned_folds
+from oos_harness import fetch_bars, make_date_aligned_folds, pop_benchmark
 from asset_universe import symbols_for_assets
 from performance import result_row
 
 
-def run_fold(label, bars, config):
+def run_fold(label, bars, config, benchmark=None):
     bt = Backtester(config, initial_equity=100000)
-    r = bt.run(bars)
+    r = bt.run(bars, benchmark_bars=benchmark)
     return result_row(r, label)
 
 
@@ -56,7 +56,9 @@ def main():
 
     results = []
     for i, fold_bars in enumerate(fold_sets):
-        res = run_fold(f"fold{i+1}", copy.deepcopy(fold_bars), config)
+        fold_copy = copy.deepcopy(fold_bars)
+        fold_bench = pop_benchmark(fold_copy)
+        res = run_fold(f"fold{i+1}", fold_copy, config, benchmark=fold_bench)
         results.append(res)
 
     print()

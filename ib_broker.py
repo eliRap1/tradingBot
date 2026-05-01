@@ -330,11 +330,40 @@ class IBBroker(BaseBroker):
                 _apply_tif(o)
             return o
 
+        # Smart-order entry: limit @ NBBO midpoint with small offset toward
+        # the touch (favors fast fills while still saving the half-spread).
+        # Only for stocks; crypto/futures keep market entries.
+        exec_cfg = (self._config or {}).get("execution", {})
+        smart_orders_enabled = bool(exec_cfg.get("smart_orders", False))
+        limit_offset_pct = float(exec_cfg.get("limit_offset_pct", 0.0002))
+
+        def _make_smart_entry(side: str, qty):
+            """Limit order at NBBO midpoint (with small offset). Falls back to market."""
+            if asset != "stock":
+                return _make_market(side, qty)
+            try:
+                quote = self.get_quote(req.symbol)
+            except Exception:
+                quote = None
+            if not quote or not quote.bid or not quote.ask:
+                return _make_market(side, qty)
+            mid = (float(quote.bid) + float(quote.ask)) / 2.0
+            if side == "BUY":
+                limit_px = round(mid * (1.0 + limit_offset_pct), 2)
+            else:
+                limit_px = round(mid * (1.0 - limit_offset_pct), 2)
+            o = LimitOrder(side, qty, limit_px)
+            _apply_tif(o)
+            return o
+
         if req.take_profit and req.stop_loss:
             tp_side = "SELL" if ib_side == "BUY" else "BUY"
 
             # Place parent first (transmit=False); IB assigns orderId via nextOrderId
-            parent_order = _make_market(ib_side, order_qty)
+            parent_order = (
+                _make_smart_entry(ib_side, order_qty) if smart_orders_enabled
+                else _make_market(ib_side, order_qty)
+            )
             parent_order.transmit = False
             parent_trade = self._ib.placeOrder(contract, parent_order)
             parent_id = parent_trade.order.orderId
@@ -367,9 +396,12 @@ class IBBroker(BaseBroker):
                 status="submitted",
             )
         else:
-            order = _make_market(ib_side, order_qty)
+            order = (
+                _make_smart_entry(ib_side, order_qty) if smart_orders_enabled
+                else _make_market(ib_side, order_qty)
+            )
             trade = self._ib.placeOrder(contract, order)
-            log.info(f"IB MARKET: {ib_side} {req.qty} {req.symbol}")
+            log.info(f"IB {order.orderType}: {ib_side} {req.qty} {req.symbol}")
             self._invalidate_position_cache()
             return Order(
                 id=str(trade.order.orderId),

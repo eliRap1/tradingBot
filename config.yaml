@@ -325,9 +325,9 @@ risk:
   second_partial_r: 2.5
   second_partial_pct: 0.30
   daily_loss_limit_pct: 0.025      # 2.5% daily loss limit - tighter (was 3%)
-  sizing_method: "volatility_adjusted"  # Volatility-adjusted sizing
-  kelly_fraction: 0.5
-  kelly_min_trades: 30
+  sizing_method: "kelly_fractional"     # kelly|kelly_fractional|volatility_adjusted (kelly path active once kelly_min_trades closed)
+  kelly_fraction: 0.5                   # half-Kelly (DD safety vs full Kelly)
+  kelly_min_trades: 30                  # below this many closed trades fall back to base risk_pct
   max_pct_of_adv: 0.01             # Cap order notional at 1% of 20d avg daily $vol (slippage guard)
   volatility_target:
     enabled: true
@@ -337,7 +337,7 @@ risk:
     max_mult: 1.50
   asset_overrides:
     stock:
-      max_positions: 0
+      max_positions: 7
       max_position_pct: 0.08
       max_portfolio_risk_pct: 0.015
       min_risk_reward: 2.5
@@ -410,9 +410,10 @@ risk:
         require_benchmark_above_ema: true
 
 execution:
-  smart_orders: false            # set true to use limit orders with fallback
-  limit_offset_pct: 0.0002      # 2 bps better than market
-  limit_timeout_sec: 30          # fall back to market after 30s
+  smart_orders: true             # use limit @ NBBO midpoint for stock entries (saves ~half-spread)
+  limit_offset_pct: 0.0002       # 2 bps better than market when crossing
+  limit_timeout_sec: 30          # fall back to market after 30s without fill (live only)
+  smart_entry_discount: 0.6      # backtest: scale entry impact to model midpoint fill
 
 filters:
   max_correlation: 0.70         # block if correlation > 70%
@@ -505,6 +506,15 @@ edge:
   volume_below_mult: 0.80         # below-avg size multiplier
   volume_surge_mult: 1.15         # surge size boost
   volume_block_on_weak: true      # hard-block entries with weak vol
+  # Leading regime gate. Stays generous on routine chop (ADX threshold low)
+  # because the existing PF-based regime_guard already throttles via min_score.
+  # Hard-blocks only on tail risk: panic vol or SPY trend break below EMA50.
+  regime_gate:
+    enabled: false                # tunable; default off — measure impact via A/B
+    spy_adx_window: 14
+    spy_adx_threshold: 12.0       # only extreme chop (ADX 14<12 ~ dead market)
+    spy_vol_panic_pct: 35.0       # SPY 20d annualized vol > this = panic, block
+    require_above_ema50: true     # require SPY > EMA50 — blocks bear regimes
 
 sector_regime:
   enabled: true           # set false to disable sector layer entirely
@@ -565,6 +575,10 @@ optimization:
   max_param_combinations: 200
   strategy_filters:
     stock:
+      # The router-side filter strips the sector_weights buckets down
+      # to a single strategy, which forces the backtester to fall back
+      # to regime-based select_strategies (broad 9-strat roster). That
+      # fallback is the well-validated path on daily IB bars.
       enabled: ["relative_strength_rotation"]
       disabled: ["time_series_momentum", "donchian_breakout", "momentum", "supertrend", "futures_trend", "mean_reversion", "gap"]
     futures:

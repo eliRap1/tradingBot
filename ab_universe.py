@@ -17,7 +17,7 @@ def _connect():
     config = load_config()
     cfg = dict(config)
     cfg["ib"] = dict(cfg.get("ib", {}))
-    cfg["ib"]["client_id"] = 98
+    cfg["ib"]["client_id"] = 200
     broker = IBBroker(cfg)
     data = IBDataFetcher(broker._ib, broker._contracts, cfg)
     return broker, data, cfg
@@ -51,9 +51,9 @@ def fetch_bars(symbols, days, timeframe="1Day", warmup=60):
     return bars
 
 
-def run(label, bars, config):
+def run(label, bars, config, benchmark=None):
     bt = Backtester(config, initial_equity=100000)
-    result = bt.run(bars)
+    result = bt.run(bars, benchmark_bars=benchmark)
     return {
         "label": label,
         "universe": len(bars),
@@ -88,18 +88,21 @@ def main():
     large_syms = config["screener"]["universe_full"][:args.large]
 
     all_syms = list(dict.fromkeys(large_syms + small_syms))
+    if "SPY" not in all_syms:
+        all_syms = ["SPY"] + all_syms
     print(f"A/B UNIVERSE: small={len(small_syms)} vs large={len(large_syms)} "
-          f"(fetching union of {len(all_syms)}) {args.days}d {args.timeframe}")
+          f"(fetching union of {len(all_syms)}, +SPY benchmark) {args.days}d {args.timeframe}")
 
     bars = fetch_bars(all_syms, args.days, timeframe=args.timeframe)
     print(f"Got bars for {len(bars)} symbols")
 
+    benchmark = bars.get("SPY")
     small_bars = {s: bars[s] for s in small_syms if s in bars}
     large_bars = {s: bars[s] for s in large_syms if s in bars}
     print(f"small_bars={len(small_bars)}  large_bars={len(large_bars)}")
 
-    small_res = run("small_universe", copy.deepcopy(small_bars), config)
-    large_res = run("large_universe", copy.deepcopy(large_bars), config)
+    small_res = run("small_universe", copy.deepcopy(small_bars), config, benchmark=benchmark)
+    large_res = run("large_universe", copy.deepcopy(large_bars), config, benchmark=benchmark)
 
     print()
     row(small_res)
