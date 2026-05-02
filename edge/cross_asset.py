@@ -20,7 +20,7 @@ _SECTOR_ETFS: dict[str, str] = {
     "XLU": "utility",
 }
 
-_FETCH_TICKERS = ["SPY", "TLT", "QQQ", "IWM", "RSP", "UUP"] + list(_SECTOR_ETFS)
+_FETCH_TICKERS = ["SPY", "TLT", "QQQ", "IWM", "RSP", "UUP", "HYG", "IEF"] + list(_SECTOR_ETFS)
 
 
 @dataclass
@@ -34,6 +34,9 @@ class CrossAssetSignals:
     sector_momentum: dict = field(default_factory=dict)  # {sector: leading/neutral/lagging}
     nq_overnight_move: float = 0.0
     size_multiplier: float = 1.0
+    # Intermarket ratios
+    credit_spread_signal: str = "neutral"   # tightening / neutral / widening (HYG/IEF)
+    cyclical_defensive_signal: str = "neutral"  # risk_on / neutral / risk_off (XLY/XLP)
 
 
 class CrossAssetEngine:
@@ -64,6 +67,10 @@ class CrossAssetEngine:
         vix_regime, vix_term, vix_mult = self._vix_proxy(spy_df)
         dxy_trend = self._dxy_trend(bars.get("UUP"))
         sector_mom = self._sector_momentum(bars, spy_df)
+        credit_signal = self._credit_spread_signal(bars.get("HYG"), bars.get("IEF"))
+        cyc_def_signal = self._cyclical_defensive_signal(
+            bars.get("XLY"), bars.get("XLP")
+        )
 
         # --- Size multiplier ---
         mult = 1.0
@@ -91,6 +98,13 @@ class CrossAssetEngine:
         # DXY: strong USD hurts EM/commodities but is usually neutral for US equities
         # No size change — used as ML feature only
 
+        # Credit spread: widening = risk-off
+        if credit_signal == "widening":
+            mult *= 0.85
+        # Cyclical/defensive ratio: defensive leadership = risk-off
+        if cyc_def_signal == "risk_off":
+            mult *= 0.90
+
         mult = max(0.15, min(1.25, mult))
 
         self._cached = CrossAssetSignals(
@@ -103,6 +117,8 @@ class CrossAssetEngine:
             sector_momentum=sector_mom,
             nq_overnight_move=round(nq_move, 4),
             size_multiplier=round(mult, 3),
+            credit_spread_signal=credit_signal,
+            cyclical_defensive_signal=cyc_def_signal,
         )
         self._cached_at = time.time()
         return self._cached
@@ -175,6 +191,46 @@ class CrossAssetEngine:
             return "strong"
         if price < ema_val * 0.995:
             return "weak"
+        return "neutral"
+
+    def _credit_spread_signal(self, hyg_df, ief_df) -> str:
+        """HYG/IEF ratio falling = credit widening = risk-off."""
+        if hyg_df is None or ief_df is None:
+            return "neutral"
+        if len(hyg_df) < 21 or len(ief_df) < 21:
+            return "neutral"
+        try:
+            today = float(hyg_df["close"].iloc[-1] / ief_df["close"].iloc[-1])
+            base = float(hyg_df["close"].iloc[-20] / ief_df["close"].iloc[-20])
+            if base == 0:
+                return "neutral"
+            chg = (today - base) / base
+        except Exception:
+            return "neutral"
+        if chg > 0.01:
+            return "tightening"
+        if chg < -0.01:
+            return "widening"
+        return "neutral"
+
+    def _cyclical_defensive_signal(self, xly_df, xlp_df) -> str:
+        """XLY/XLP ratio: cyclicals leading defensives = risk-on."""
+        if xly_df is None or xlp_df is None:
+            return "neutral"
+        if len(xly_df) < 21 or len(xlp_df) < 21:
+            return "neutral"
+        try:
+            today = float(xly_df["close"].iloc[-1] / xlp_df["close"].iloc[-1])
+            base = float(xly_df["close"].iloc[-20] / xlp_df["close"].iloc[-20])
+            if base == 0:
+                return "neutral"
+            chg = (today - base) / base
+        except Exception:
+            return "neutral"
+        if chg > 0.015:
+            return "risk_on"
+        if chg < -0.015:
+            return "risk_off"
         return "neutral"
 
     def _sector_momentum(self, bars: dict, spy_df) -> dict:

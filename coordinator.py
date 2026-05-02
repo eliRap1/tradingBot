@@ -1147,6 +1147,25 @@ class Coordinator:
                     contributing = [s for s, v in watcher.state.strategy_scores.items()
                                     if abs(v) > 0.1]
                     norm_sym = _normalize_symbol(order.symbol)
+                    from filters import SECTOR_MAP as _SM
+                    sector_mom_map = getattr(edge_cross_asset, "sector_momentum", {}) or {}
+                    sym_sector = _SM.get(norm_sym, "")
+                    edge_snapshot = {
+                        "rs_score": round(rs_sig.rank_pct * 100, 2) if rs_sig else None,
+                        "vol_ratio": round(vol_sig.ratio, 3) if vol_sig else None,
+                        "ml_prob": round(ml_conf, 3),
+                        "vix_regime": getattr(edge_cross_asset, "vix_regime", None),
+                        "bond_trend": getattr(edge_cross_asset, "bond_trend", None),
+                        "dxy_trend": getattr(edge_cross_asset, "dxy_trend", None),
+                        "insider_cluster": bool(getattr(insider_sig, "cluster", False)),
+                        "gap_pct": round(gap_sig.gap_pct, 4) if gap_sig else None,
+                        "news_score": round(news_score, 3),
+                        "sector_momentum": sector_mom_map.get(sym_sector, "neutral"),
+                        "spread_pct": round(micro.spread_pct, 5),
+                        "composite_score": round(watcher.state.composite_score, 3),
+                        "confluence": int(watcher.state.num_agreeing),
+                        "regime": watcher.state.regime,
+                    }
                     self.portfolio.position_meta.setdefault(norm_sym, {}).update({
                         "strategies": contributing,
                         "entry_price": order.entry_price,
@@ -1154,6 +1173,7 @@ class Coordinator:
                         "stop_loss": order.stop_loss,
                         "original_qty": order.qty,
                         "side": order.side,
+                        "edge_snapshot": edge_snapshot,
                     })
                     self.portfolio._save_meta()
                     log.info(

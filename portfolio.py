@@ -357,6 +357,7 @@ class PortfolioManager:
                     exit_price=pos["current_price"],
                     reason=partial["reason"],
                     risk_dollars=self.position_meta.get(sym, {}).get("initial_risk", 0.0) * (qty / self.position_meta.get(sym, {}).get("original_qty", pos["qty"])),
+                    edge_snapshot=self.position_meta.get(sym, {}).get("edge_snapshot"),
                 )
             except Exception as e:
                 log.error(f"Failed partial exit for {sym}: {e}")
@@ -415,6 +416,7 @@ class PortfolioManager:
                         reason=reason,
                         risk_dollars=risk_dollars,
                         strategies=meta.get("strategies", []),
+                        edge_snapshot=meta.get("edge_snapshot"),
                     )
 
                 # Pop meta AFTER using it
