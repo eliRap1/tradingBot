@@ -51,6 +51,11 @@ class PortfolioManager:
             migrated_meta[_normalize_symbol(k)] = v
         self.position_meta = migrated_meta
 
+        # Recently-closed symbols (cooldown to defend against broker
+        # state lag re-presenting closed position to bot loop).
+        # {symbol: unix_ts_until_which_to_skip}
+        self._recently_closed: dict[str, float] = {}
+
     def set_position_risk(self, symbol: str, entry_price: float, stop_loss: float, qty: float):
         """Persist entry metadata needed for later R-multiple and exit logic."""
         sym = _normalize_symbol(symbol)
@@ -78,10 +83,20 @@ class PortfolioManager:
 
     def get_current_positions(self) -> dict:
         """Get current positions as {symbol: position_info}."""
+        import time as _time
         positions = {}
+        # Garbage-collect cooldown set
+        now_ts = _time.time()
+        self._recently_closed = {s: t for s, t in self._recently_closed.items() if t > now_ts}
         for pos in self.broker.get_positions():
             sym = _normalize_symbol(pos.symbol)
             qty = float(pos.qty)
+            # Skip closed/zero-qty positions broker may still return briefly
+            if qty == 0:
+                continue
+            # Skip recently-closed symbols (defend against broker state lag)
+            if sym in self._recently_closed or pos.symbol in self._recently_closed:
+                continue
             avg_price = float(pos.avg_price)
             market_value = float(pos.market_value)
             # Derive current_price from market_value/qty; fall back to avg_price if qty=0
@@ -418,6 +433,24 @@ class PortfolioManager:
                         strategies=meta.get("strategies", []),
                         edge_snapshot=meta.get("edge_snapshot"),
                     )
+
+                # Mark position as closed in DB so the next cycle does not
+                # re-record this same exit. The broker has already closed it
+                # above; we synchronize our local state immediately.
+                try:
+                    self.tracker._db.delete_position(sym)
+                    self.tracker._db.delete_position(raw_sym)
+                except Exception:
+                    pass
+
+                # Cooldown: if broker still reports this symbol as a position
+                # for a few cycles (state lag), skip it instead of re-recording.
+                import time as _time
+                cooldown_sec = float(self.config.get("execution", {}).get(
+                    "post_close_cooldown_sec", 90.0))
+                expiry = _time.time() + cooldown_sec
+                self._recently_closed[sym] = expiry
+                self._recently_closed[raw_sym] = expiry
 
                 # Pop meta AFTER using it
                 self.position_meta.pop(sym, None)

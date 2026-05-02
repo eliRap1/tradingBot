@@ -30,10 +30,16 @@ class TradeTracker:
                      reason: str = "", risk_dollars: float = 0.0,
                      strategies: list[str] | None = None,
                      edge_snapshot: dict | None = None):
-        """Record a completed (closed) trade."""
+        """Record a completed (closed) trade.
+
+        Direction comes from `side`; magnitude comes from `|qty|`. This
+        avoids sign bugs when callers pass signed qty for shorts (e.g.
+        broker returning -14 for a 14-contract short).
+        """
         is_long = side in ("buy", "long")
-        pnl = (exit_price - entry_price) * qty if is_long else \
-              (entry_price - exit_price) * qty
+        qty_abs = abs(qty) if qty is not None else 0
+        pnl = (exit_price - entry_price) * qty_abs if is_long else \
+              (entry_price - exit_price) * qty_abs
         pnl_pct = (exit_price - entry_price) / entry_price if is_long and entry_price else \
                   (entry_price - exit_price) / entry_price if entry_price else 0.0
         r_multiple = pnl / risk_dollars if risk_dollars > 0 else None
