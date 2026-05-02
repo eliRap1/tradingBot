@@ -28,7 +28,8 @@ class TradeTracker:
     def record_trade(self, symbol: str, side: str, qty: int,
                      entry_price: float, exit_price: float,
                      reason: str = "", risk_dollars: float = 0.0,
-                     strategies: list[str] | None = None):
+                     strategies: list[str] | None = None,
+                     edge_snapshot: dict | None = None):
         """Record a completed (closed) trade."""
         is_long = side in ("buy", "long")
         pnl = (exit_price - entry_price) * qty if is_long else \
@@ -50,6 +51,7 @@ class TradeTracker:
             "reason": reason,
             "strategies": strategies or [],
             "closed_at": datetime.now().isoformat(),
+            "edge_snapshot": edge_snapshot,
         }
         self._db.record_trade(**trade)
         self.trades = self._db.get_trades()

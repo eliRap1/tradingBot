@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS trades (
     r_multiple REAL,
     strategies TEXT,
     opened_at TEXT,
-    closed_at TEXT
+    closed_at TEXT,
+    edge_snapshot TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bot_state (
@@ -87,7 +88,13 @@ class StateDB:
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_CREATE_SQL)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self):
+        cols = [r["name"] for r in self._conn.execute("PRAGMA table_info(trades)").fetchall()]
+        if "edge_snapshot" not in cols:
+            self._conn.execute("ALTER TABLE trades ADD COLUMN edge_snapshot TEXT")
 
     def _encode_json(self, value: Any) -> str:
         return json.dumps(value)
@@ -223,8 +230,12 @@ class StateDB:
         closed_at: str = "",
         pnl_pct: float | None = None,
         r_multiple: float | None = None,
+        edge_snapshot=None,
     ):
         strategies_json = strategies if isinstance(strategies, str) else self._encode_json(strategies or [])
+        edge_json = edge_snapshot if isinstance(edge_snapshot, str) else (
+            self._encode_json(edge_snapshot) if edge_snapshot is not None else None
+        )
         if pnl_pct is None:
             is_long = side in ("buy", "long")
             pnl_pct = ((exit_price - entry_price) / entry_price) if is_long and entry_price else (
@@ -237,8 +248,9 @@ class StateDB:
             self._conn.execute(
                 """INSERT INTO trades (
                     symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, reason,
-                    risk_dollars, r_multiple, strategies, opened_at, closed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    risk_dollars, r_multiple, strategies, opened_at, closed_at,
+                    edge_snapshot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     symbol,
                     side,
@@ -253,6 +265,7 @@ class StateDB:
                     strategies_json,
                     opened_at,
                     closed_at,
+                    edge_json,
                 ),
             )
             self._conn.commit()
@@ -263,6 +276,7 @@ class StateDB:
         for row in rows:
             trade = dict(row)
             trade["strategies"] = self._decode_json(trade.get("strategies"), [])
+            trade["edge_snapshot"] = self._decode_json(trade.get("edge_snapshot"), {})
             result.append(trade)
         return result
 
