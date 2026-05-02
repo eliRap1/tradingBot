@@ -597,7 +597,8 @@ class Backtester:
                 # Sector-routed buckets sometimes hold only 1-2 strategies for
                 # a regime cell, which would make min_agreeing=3 unreachable.
                 bucket_size = sum(1 for w in selection["strategies"].values() if w > 0)
-                min_agreeing = min(min_agreeing, max(2, bucket_size))
+                if bucket_size:
+                    min_agreeing = min(min_agreeing, bucket_size)
 
                 # Check long signal
                 long_allowed = (
