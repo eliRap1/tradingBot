@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from utils import setup_logger
@@ -245,6 +246,32 @@ class StateDB:
             r_multiple = (pnl / risk_dollars) if risk_dollars else None
 
         with self._lock:
+            # Idempotency guard: refuse INSERT if same (symbol, side, |qty|,
+            # entry, exit) already recorded within last 60 minutes. Defends
+            # against the phantom-record bug where broker state lag caused the
+            # bot to re-detect an already-closed position and re-call
+            # record_trade each cycle.
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=60)
+            cutoff_iso = cutoff.isoformat()
+            qty_abs = abs(qty) if qty is not None else 0
+            dup = self._conn.execute(
+                """SELECT id, closed_at FROM trades
+                   WHERE symbol = ? AND side = ? AND ABS(qty) = ?
+                     AND ROUND(entry_price, 2) = ROUND(?, 2)
+                     AND ROUND(exit_price, 2) = ROUND(?, 2)
+                     AND closed_at IS NOT NULL AND closed_at >= ?
+                   ORDER BY id DESC LIMIT 1""",
+                (symbol, side, qty_abs, entry_price, exit_price, cutoff_iso),
+            ).fetchone()
+            if dup is not None:
+                log.warning(
+                    f"record_trade: duplicate within 60min skipped "
+                    f"(existing id={dup['id']} closed={dup['closed_at']}; "
+                    f"new symbol={symbol} side={side} qty={qty} "
+                    f"entry={entry_price} exit={exit_price})"
+                )
+                return None
+
             self._conn.execute(
                 """INSERT INTO trades (
                     symbol, side, qty, entry_price, exit_price, pnl, pnl_pct, reason,

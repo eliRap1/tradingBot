@@ -390,6 +390,26 @@ class PortfolioManager:
                 self.broker.close_position(raw_sym)
                 log.info(f"Closed position: {sym}")
 
+                # Verify broker has actually closed it before recording.
+                # Defends against silent-fail close (paper IB drops orders,
+                # async settlement still pending, partial fill, etc.) which
+                # caused the phantom-record bug.
+                still_open = False
+                try:
+                    for _p in self.broker.get_positions():
+                        if _normalize_symbol(_p.symbol) == sym and float(_p.qty) != 0:
+                            still_open = True
+                            break
+                except Exception as _e:
+                    log.warning(f"close-verify failed for {sym}: {_e}")
+                if still_open:
+                    log.error(
+                        f"close_position({raw_sym}) did NOT clear broker position "
+                        f"— skipping record_trade to avoid phantom row. "
+                        f"Investigate broker / order rejection."
+                    )
+                    continue
+
                 # Clean up both watermark dicts (try both formats)
                 self.high_watermarks.pop(sym, None)
                 self.high_watermarks.pop(raw_sym, None)

@@ -134,6 +134,38 @@ def test_zero_qty_position_skipped(tmp_path, monkeypatch):
         assert "CLM6" not in positions
 
 
+def test_idempotent_record_trade_skips_dup_within_60min(tmp_path, monkeypatch):
+    """Second record_trade with same (symbol, side, |qty|, entry, exit)
+    inside 60min must be silently skipped (returns None, DB unchanged)."""
+    monkeypatch.setenv("BOT_STATE_DB", str(tmp_path / "test.db"))
+    trades_file = str(tmp_path / "trades.json")
+    with patch("tracker.TRADES_FILE", trades_file):
+        t = TradeTracker()
+        t.record_trade("CLM6", "short", -14, 104989.06, 102460.0,
+                       reason="trailing_stop", risk_dollars=1000.0)
+        t.record_trade("CLM6", "short", -14, 104989.06, 102460.0,
+                       reason="trailing_stop", risk_dollars=1000.0)
+        t.record_trade("CLM6", "short", -14, 104989.06, 102460.0,
+                       reason="trailing_stop", risk_dollars=1000.0)
+        # 3 calls, only 1 row should exist
+        rows = t._db.get_trades()
+        assert len(rows) == 1, f"expected 1 idempotent row, got {len(rows)}"
+
+
+def test_idempotent_allows_distinct_trades_same_symbol(tmp_path, monkeypatch):
+    """Different exit_price = different real exit; both rows preserved."""
+    monkeypatch.setenv("BOT_STATE_DB", str(tmp_path / "test.db"))
+    trades_file = str(tmp_path / "trades.json")
+    with patch("tracker.TRADES_FILE", trades_file):
+        t = TradeTracker()
+        t.record_trade("CLM6", "short", -14, 104989.06, 102460.0,
+                       reason="trailing_stop")
+        t.record_trade("CLM6", "short", -14, 104989.06, 102200.0,  # diff exit
+                       reason="stop_loss")
+        rows = t._db.get_trades()
+        assert len(rows) == 2
+
+
 def test_cooldown_garbage_collected_after_expiry(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_STATE_DB", str(tmp_path / "test.db"))
     monkeypatch.chdir(tmp_path)
