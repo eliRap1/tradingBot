@@ -651,25 +651,19 @@ class Coordinator:
                         )
                 self.portfolio.execute_partial_exits(partial_exits, positions)
             if to_close:
-                # Send Discord exit alerts before closing
-                for sym in to_close:
-                    pos = positions.get(sym)
-                    if pos:
-                        meta = self.portfolio.position_meta.get(sym, {})
-                        is_long = pos.get("side", "long") == "long"
-                        pnl = pos.get("unrealized_pl", 0.0)
-                        if is_long:
-                            pnl_pct = (pos["current_price"] - pos["entry_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0
-                        else:
-                            pnl_pct = (pos["entry_price"] - pos["current_price"]) / pos["entry_price"] if pos["entry_price"] > 0 else 0
-                        reason = "trailing_stop" if pnl > 0 else "stop_loss"
-                        self.alerts.send_exit_alert(
-                            symbol=sym, side=pos.get("side", "long"),
-                            entry_price=pos["entry_price"],
-                            exit_price=pos["current_price"],
-                            pnl=pnl, pnl_pct=pnl_pct, reason=reason,
-                        )
-                self.portfolio.execute_exits(to_close, positions)
+                # Send Discord alerts ONLY for exits that actually recorded
+                # (close-verify and 60-min idempotency may reject some).
+                recorded_exits = self.portfolio.execute_exits(to_close, positions) or []
+                for ex in recorded_exits:
+                    self.alerts.send_exit_alert(
+                        symbol=ex["symbol"],
+                        side=ex["side"],
+                        entry_price=ex["entry_price"],
+                        exit_price=ex["exit_price"],
+                        pnl=ex["pnl"],
+                        pnl_pct=ex["pnl_pct"],
+                        reason=ex["reason"],
+                    )
                 positions = self.portfolio.get_current_positions()
                 held_symbols = list(positions.keys())
 

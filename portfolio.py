@@ -377,8 +377,14 @@ class PortfolioManager:
             except Exception as e:
                 log.error(f"Failed partial exit for {sym}: {e}")
 
-    def execute_exits(self, symbols_to_close: list[str], positions: dict = None):
-        """Close positions for given symbols and record trades."""
+    def execute_exits(self, symbols_to_close: list[str], positions: dict = None) -> list[dict]:
+        """Close positions for given symbols and record trades.
+
+        Returns list of dicts describing exits that were actually recorded
+        (not skipped by close-verify or idempotency). Caller can use this
+        for Discord alerts so phantom-detected exits don't spam users.
+        """
+        recorded: list[dict] = []
         for raw_sym in symbols_to_close:
             sym = _normalize_symbol(raw_sym)
             try:
@@ -442,6 +448,7 @@ class PortfolioManager:
                         reason = "stop_loss"
 
                     risk_dollars = meta.get("initial_risk", 0.0)
+                    pre_count = len(self.tracker.trades)
                     self.tracker.record_trade(
                         symbol=sym,
                         side=pos["side"],
@@ -453,6 +460,30 @@ class PortfolioManager:
                         strategies=meta.get("strategies", []),
                         edge_snapshot=meta.get("edge_snapshot"),
                     )
+                    # Detect whether the row actually inserted (idempotency
+                    # guard may have rejected as a 60-min duplicate).
+                    if len(self.tracker.trades) > pre_count:
+                        is_long = pos.get("side", "long") == "long"
+                        if is_long:
+                            pnl_pct = ((pos["current_price"] - pos["entry_price"]) /
+                                       pos["entry_price"]) if pos["entry_price"] else 0
+                        else:
+                            pnl_pct = ((pos["entry_price"] - pos["current_price"]) /
+                                       pos["entry_price"]) if pos["entry_price"] else 0
+                        recorded.append({
+                            "symbol": sym,
+                            "side": pos["side"],
+                            "entry_price": pos["entry_price"],
+                            "exit_price": pos["current_price"],
+                            "pnl": pos.get("unrealized_pl", 0.0),
+                            "pnl_pct": pnl_pct,
+                            "reason": reason,
+                        })
+                    else:
+                        log.warning(
+                            f"execute_exits: record_trade skipped {sym} (idempotency); "
+                            f"NOT alerting Discord."
+                        )
 
                 # Mark position as closed in DB so the next cycle does not
                 # re-record this same exit. The broker has already closed it
@@ -479,6 +510,7 @@ class PortfolioManager:
 
         self._save_watermarks()
         self._save_meta()
+        return recorded
 
     def log_portfolio_status(self, positions: dict):
         """Log current portfolio state with visual formatting."""
