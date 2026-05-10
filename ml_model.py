@@ -5,7 +5,7 @@ Takes raw strategy scores + market features as input, predicts probability
 of a profitable trade. Trained on closed trade history with strategy attribution.
 
 Features:
-  - Per-strategy score (8 features, one per strategy)
+  - Per-strategy score (9 features, one per strategy)
   - Composite score
   - Number of agreeing strategies
   - Market regime (encoded)
@@ -22,14 +22,12 @@ Usage:
 """
 
 import os
-import json
 import numpy as np
 from utils import setup_logger
 
 log = setup_logger("ml_model")
 
 MODEL_FILE = os.path.join(os.path.dirname(__file__), "ml_model.bin")
-FEATURE_FILE = os.path.join(os.path.dirname(__file__), "ml_features.json")
 
 STRATEGY_NAMES = [
     "momentum", "mean_reversion", "breakout", "supertrend",
