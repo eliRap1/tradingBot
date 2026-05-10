@@ -116,10 +116,7 @@ class MarketCalendar:
             cur = cur.fromordinal(cur.toordinal() + 1)
         if post_count <= self.tom_post_days:
             return True
-        # Days until month end
-        next_month = (d.replace(day=28) + (d.replace(day=28) - d.replace(day=1))).replace(day=1) \
-            if False else None  # placeholder
-        # Simpler: walk forward to first day of next month
+        # Walk forward to first day of next month
         from datetime import date as _date
         if d.month == 12:
             first_next = _date(d.year + 1, 1, 1)
