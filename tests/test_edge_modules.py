@@ -208,15 +208,19 @@ class TestNewsSentimentEngine:
         assert engine.get_blocked_symbols(["AAPL", "MSFT"]) == set()
 
     def test_earnings_cache_populates_days(self, monkeypatch):
+        from datetime import datetime, timedelta
         monkeypatch.setenv("ALPACA_API_KEY", "k")
         monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
         engine = NewsSentimentEngine({"edge": {"earnings_avoidance": True}})
+
+        # Use a date 3 days from today so d < 30 always holds regardless of run date
+        future_date = (datetime.utcnow() + timedelta(days=3)).strftime("%Y-%m-%d")
 
         class _Resp:
             def json(self):
                 return {
                     "announcements": [
-                        {"symbol": "AAPL", "announcement_date": "2026-04-17"}
+                        {"symbol": "AAPL", "announcement_date": future_date}
                     ]
                 }
 
