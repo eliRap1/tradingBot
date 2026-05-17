@@ -1156,7 +1156,7 @@ class Coordinator:
                         "news_score": round(news_score, 3),
                         "sector_momentum": sector_mom_map.get(sym_sector, "neutral"),
                         "spread_pct": round(micro.spread_pct, 5),
-                        "composite_score": round(watcher.state.composite_score, 3),
+                        "composite_score": round(watcher.state.score, 3),
                         "confluence": int(watcher.state.num_agreeing),
                         "regime": watcher.state.regime,
                     }
@@ -1294,7 +1294,7 @@ class Coordinator:
             statuses[s] = statuses.get(s, 0) + 1
 
         signals = [f"{w.symbol}({w.state.score:+.2f})" for w in watchers_snapshot
-                   if w.state.score > 0.2]
+                   if abs(w.state.score) > 0.2]
         pending = [w.symbol for w in watchers_snapshot if w.state.status == "pending"]
         errors  = [w.symbol for w in watchers_snapshot if w.state.status == "error"]
 
