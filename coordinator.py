@@ -1294,7 +1294,7 @@ class Coordinator:
             statuses[s] = statuses.get(s, 0) + 1
 
         signals = [f"{w.symbol}({w.state.score:+.2f})" for w in watchers_snapshot
-                   if w.state.score > 0.2]
+                   if abs(w.state.score) > 0.2]
         pending = [w.symbol for w in watchers_snapshot if w.state.status == "pending"]
         errors  = [w.symbol for w in watchers_snapshot if w.state.status == "error"]
 
