@@ -10,6 +10,7 @@ Improvements:
 - Trade recording for performance tracking
 """
 
+import threading
 from datetime import datetime
 from ib_data import IB_CRYPTO_SYMBOLS as CRYPTO_SYMBOLS
 from utils import setup_logger
@@ -34,6 +35,7 @@ class PortfolioManager:
         self.config = config
         self.broker = broker
         self.tracker = TradeTracker()
+        self._state_lock = threading.Lock()  # serializes _save_meta/_save_watermarks
 
         # Restore watermarks from persisted state
         state = load_state()
@@ -71,15 +73,17 @@ class PortfolioManager:
         self._save_meta()
 
     def _save_meta(self):
-        state = load_state()
-        state["position_meta"] = self.position_meta
-        save_state(state)
+        with self._state_lock:
+            state = load_state()
+            state["position_meta"] = self.position_meta
+            save_state(state)
 
     def _save_watermarks(self):
-        state = load_state()
-        state["high_watermarks"] = self.high_watermarks
-        state["low_watermarks"] = self.low_watermarks
-        save_state(state)
+        with self._state_lock:
+            state = load_state()
+            state["high_watermarks"] = self.high_watermarks
+            state["low_watermarks"] = self.low_watermarks
+            save_state(state)
 
     def get_current_positions(self) -> dict:
         """Get current positions as {symbol: position_info}."""
@@ -291,14 +295,14 @@ class PortfolioManager:
 
             # === TRAILING STOP (direction-aware) ===
             if not breakeven_triggered and sym not in to_close:
-                if is_long and current_price <= trail_price and pos["unrealized_pl"] > 0:
+                if is_long and current_price <= trail_price:
                     log.info(
                         f"TRAILING STOP: {sym} (long) price={current_price:.2f} "
                         f"trail={trail_price:.2f} hwm={watermark:.2f} "
                         f"P&L=${pos['unrealized_pl']:.2f}"
                     )
                     to_close.append(sym)
-                elif not is_long and current_price >= trail_price and pos["unrealized_pl"] > 0:
+                elif not is_long and current_price >= trail_price:
                     log.info(
                         f"TRAILING STOP: {sym} (short) price={current_price:.2f} "
                         f"trail={trail_price:.2f} lwm={watermark:.2f} "

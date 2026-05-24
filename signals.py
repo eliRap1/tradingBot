@@ -73,6 +73,10 @@ def aggregate_signals(all_signals: dict[str, dict[str, float]],
             continue
 
         if composite >= min_score:
+            # TODO(audit): direction is hardcoded to "buy" — aggregate_signals() never
+            # returns short opportunities. Short signals require negative composite scores
+            # and a separate min_score threshold; fix by computing direction from
+            # composite sign and adding a negative-score path.
             composites.append(Opportunity(
                 symbol=sym,
                 score=composite,

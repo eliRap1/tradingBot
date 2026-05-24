@@ -46,6 +46,11 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
     st_line = np.zeros(n)
     direction = np.zeros(n, dtype=int)
 
+    # Guard: need at least period+1 bars to seed the loop
+    if n <= period:
+        return (pd.Series(st_line, index=df.index),
+                pd.Series(direction, index=df.index))
+
     # Initialize
     st_line[period] = upper_band[period]
     direction[period] = 1  # start bearish
