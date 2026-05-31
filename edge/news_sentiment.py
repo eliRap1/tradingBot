@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -54,8 +54,8 @@ class NewsSentimentEngine:
         dt = self._earnings_dates.get(symbol)
         if dt is None:
             return 99
-        delta = (dt.date() - datetime.utcnow().date()).days
-        return abs(delta)
+        delta = (dt.date() - datetime.now(timezone.utc).date()).days
+        return delta
 
     def score_symbol_news(self, symbol: str) -> float:
         """Composite sentiment score for recent headlines on `symbol`.
