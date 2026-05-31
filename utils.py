@@ -144,5 +144,7 @@ def setup_logger(name: str, log_dir: str = "logs") -> logging.Logger:
 
 
 def load_config(path: str = "config.yaml") -> dict:
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
     with open(path, "r") as f:
         return yaml.safe_load(f)
