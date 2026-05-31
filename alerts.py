@@ -605,6 +605,15 @@ class DiscordBot:
 
                     safe_content = message.content.encode("ascii", errors="replace").decode("ascii")
                     log.debug(f"Discord message from {message.author}: '{safe_content}'")
+
+                    _WRITE_PREFIXES = ("!buy", "!pause", "!resume", "!ibcheck", "!clearcontract")
+                    if any(message.content.strip().lower().startswith(p) for p in _WRITE_PREFIXES):
+                        cfg_alerts = self.coordinator.config.get("alerts", {}) if self.coordinator else {}
+                        allowed = cfg_alerts.get("allowed_discord_user_ids", [])
+                        if allowed and str(message.author.id) not in {str(uid) for uid in allowed}:
+                            await message.channel.send("❌ Not authorised.")
+                            return
+
                     if message.content.strip().lower() in ("!stat", "!stats", "!status"):
                         # Get equity first so APR uses real starting equity
                         eq = 100_000.0
