@@ -239,6 +239,9 @@ class RegimeFilter:
             "spy_trend": "neutral",
             "spy_rsi": 50.0,
             "breadth_pct": 50.0,
+            "hmm_regime": None,
+            "hmm_confidence": None,
+            "atr_regime": "normal",
             "description": "UNKNOWN - SPY data unavailable, cautious mode",
         }
 
