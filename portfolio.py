@@ -290,15 +290,19 @@ class PortfolioManager:
                     breakeven_triggered = True
 
             # === TRAILING STOP (direction-aware) ===
+            # NOTE: fire the trailing stop regardless of current unrealized P&L sign.
+            # The old guard `pos["unrealized_pl"] > 0` caused the stop to be skipped
+            # when a position was at breakeven or a small loss after having been in
+            # profit — exactly the scenario where a trailing stop matters most.
             if not breakeven_triggered and sym not in to_close:
-                if is_long and current_price <= trail_price and pos["unrealized_pl"] > 0:
+                if is_long and current_price <= trail_price:
                     log.info(
                         f"TRAILING STOP: {sym} (long) price={current_price:.2f} "
                         f"trail={trail_price:.2f} hwm={watermark:.2f} "
                         f"P&L=${pos['unrealized_pl']:.2f}"
                     )
                     to_close.append(sym)
-                elif not is_long and current_price >= trail_price and pos["unrealized_pl"] > 0:
+                elif not is_long and current_price >= trail_price:
                     log.info(
                         f"TRAILING STOP: {sym} (short) price={current_price:.2f} "
                         f"trail={trail_price:.2f} lwm={watermark:.2f} "
