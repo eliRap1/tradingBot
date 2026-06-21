@@ -347,6 +347,7 @@ class PortfolioManager:
                         pass
 
         self._save_watermarks()
+        self._save_meta()
         return to_close, partial_exits
 
     def execute_partial_exits(self, partial_exits: list[dict], positions: dict):
