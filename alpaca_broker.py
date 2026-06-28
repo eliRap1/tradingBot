@@ -449,6 +449,16 @@ class AlpacaBroker(BaseBroker):
                         type="limit", limit_price=round(take_profit, 2),
                         time_in_force="gtc"
                     )
+                    # OCO failed — place a separate stop so the position is not left unprotected
+                    try:
+                        self.api.submit_order(
+                            symbol=symbol, qty=qty, side=tp_side,
+                            type="stop", stop_price=round(stop_loss, 2),
+                            time_in_force="gtc"
+                        )
+                        log.warning(f"OCO fallback: separate SL stop placed for {symbol} @ ${stop_loss:.2f}")
+                    except Exception as sl_ex:
+                        log.error(f"OCO fallback SL also failed for {symbol}: {sl_ex}")
                 return {"method": "limit", "fill_price": fill_price, "symbol": symbol}
             else:
                 try:
