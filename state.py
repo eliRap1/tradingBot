@@ -49,10 +49,9 @@ def load_state() -> dict:
             f"Loaded state: peak_equity=${state.get('peak_equity', 0):,.2f}, "
             f"{len(state.get('high_watermarks', {}))} watermarks"
         )
-        return state
-    except Exception as e:
-        log.error(f"Failed to load state DB: {e} - starting fresh")
-        return dict(_DEFAULTS)
+    except Exception:
+        pass
+    return state
 
 
 def save_state(state: dict):
