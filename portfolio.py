@@ -203,7 +203,11 @@ class PortfolioManager:
             if partial_enabled and not meta.get("partial_done", False):
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
-                if initial_risk > 0 and qty > 1:
+                # Crypto uses fractional quantities; stocks need >= 2 shares so
+                # the partial (50%) leaves at least 1 share remaining.
+                _is_crypto_pos = sym in CRYPTO_SYMBOLS or raw_sym in CRYPTO_SYMBOLS
+                _min_qty = 0.0 if _is_crypto_pos else 2.0
+                if initial_risk > 0 and qty > _min_qty:
                     original_qty = meta.get("original_qty", qty)
                     risk_per_share = initial_risk / original_qty if original_qty > 0 else 0
                     if is_long:
@@ -238,7 +242,9 @@ class PortfolioManager:
             if second_partial_enabled and meta.get("partial_done") and not meta.get("second_partial_done", False):
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
-                if initial_risk > 0 and qty > 1:
+                _is_crypto_pos2 = sym in CRYPTO_SYMBOLS or raw_sym in CRYPTO_SYMBOLS
+                _min_qty2 = 0.0 if _is_crypto_pos2 else 2.0
+                if initial_risk > 0 and qty > _min_qty2:
                     # Use saved original_qty for accurate R-multiple
                     original_qty = meta.get("original_qty", qty)
                     risk_per_share = initial_risk / original_qty if original_qty > 0 else 0
