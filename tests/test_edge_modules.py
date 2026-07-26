@@ -208,22 +208,26 @@ class TestNewsSentimentEngine:
         assert engine.get_blocked_symbols(["AAPL", "MSFT"]) == set()
 
     def test_earnings_cache_populates_days(self, monkeypatch):
+        from datetime import datetime, timedelta
         monkeypatch.setenv("ALPACA_API_KEY", "k")
         monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
         engine = NewsSentimentEngine({"edge": {"earnings_avoidance": True}})
+
+        # Use a date 1 day from now so the test never goes stale.
+        near_date = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
 
         class _Resp:
             def json(self):
                 return {
                     "announcements": [
-                        {"symbol": "AAPL", "announcement_date": "2026-04-17"}
+                        {"symbol": "AAPL", "announcement_date": near_date}
                     ]
                 }
 
         with patch("edge.news_sentiment.requests.get", return_value=_Resp()):
             blocked = engine.get_blocked_symbols(["AAPL", "MSFT"])
         assert "AAPL" in blocked
-        # days_to_earnings relative to today should be small int
+        # days_to_earnings relative to today should be small int (earnings tomorrow)
         d = engine.get_days_to_earnings("AAPL")
         assert isinstance(d, int) and d < 30
 
