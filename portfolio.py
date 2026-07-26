@@ -540,8 +540,8 @@ class PortfolioManager:
                 except Exception:
                     days_held = ""
 
-            cur = pos.get("current_price") or pos.get("avg_price", 0)
-            entry = pos.get("avg_price", 0)
+            cur = pos.get("current_price") or pos.get("entry_price", 0)
+            entry = pos.get("entry_price", 0)
             qty = pos.get("qty", 0)
             pl = pos.get("unrealized_pl", 0)
             pct = (pl / (abs(entry * qty) or 1)) * 100
