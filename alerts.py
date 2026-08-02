@@ -603,6 +603,14 @@ class DiscordBot:
                     if message.author == client.user:
                         return
 
+                    # Gate destructive commands to the configured owner IDs.
+                    # Set DISCORD_OWNER_IDS to a comma-separated list of Discord
+                    # user ID integers (e.g. "123456789,987654321"). When unset,
+                    # all users can issue control commands (backwards-compat).
+                    _owner_ids_raw = os.getenv("DISCORD_OWNER_IDS", "")
+                    _owner_ids = {s.strip() for s in _owner_ids_raw.split(",") if s.strip()}
+                    _is_authorized = not _owner_ids or str(message.author.id) in _owner_ids
+
                     safe_content = message.content.encode("ascii", errors="replace").decode("ascii")
                     log.debug(f"Discord message from {message.author}: '{safe_content}'")
                     if message.content.strip().lower() in ("!stat", "!stats", "!status"):
@@ -718,14 +726,17 @@ class DiscordBot:
                                 await message.channel.send(f"No bad-contract cache found for `{sym}`.")
 
                     elif message.content.strip().lower().startswith("!buy"):
-                        parts = message.content.strip().split()
-                        symbol = parts[1].upper() if len(parts) > 1 else "BTC/USD"
-                        try:
-                            notional = float(parts[2]) if len(parts) > 2 else 1.0
-                        except ValueError:
-                            notional = 1.0
-                        msg = self._submit_test_buy(symbol=symbol, notional_usd=notional)
-                        await message.channel.send(msg)
+                        if not _is_authorized:
+                            await message.channel.send("❌ Not authorized.")
+                        else:
+                            parts = message.content.strip().split()
+                            symbol = parts[1].upper() if len(parts) > 1 else "BTC/USD"
+                            try:
+                                notional = float(parts[2]) if len(parts) > 2 else 1.0
+                            except ValueError:
+                                notional = 1.0
+                            msg = self._submit_test_buy(symbol=symbol, notional_usd=notional)
+                            await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!positions":
                         msg = self._positions_message()
@@ -823,7 +834,9 @@ class DiscordBot:
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!pause":
-                        if coordinator:
+                        if not _is_authorized:
+                            await message.channel.send("❌ Not authorized.")
+                        elif coordinator:
                             coordinator._trading_paused = True
                             await message.channel.send("⏸ **Trading PAUSED** — no new entries until `!resume`")
                             log.info("Trading paused via Discord !pause command")
@@ -831,7 +844,9 @@ class DiscordBot:
                             await message.channel.send("❌ Coordinator not connected.")
 
                     elif message.content.strip().lower() == "!resume":
-                        if coordinator:
+                        if not _is_authorized:
+                            await message.channel.send("❌ Not authorized.")
+                        elif coordinator:
                             coordinator._trading_paused = False
                             await message.channel.send("▶ **Trading RESUMED** — new entries enabled")
                             log.info("Trading resumed via Discord !resume command")
