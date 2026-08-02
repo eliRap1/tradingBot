@@ -444,11 +444,24 @@ class AlpacaBroker(BaseBroker):
                         stop_loss={"stop_price": round(stop_loss, 2)}
                     )
                 except Exception:
-                    self.api.submit_order(
-                        symbol=symbol, qty=qty, side=tp_side,
-                        type="limit", limit_price=round(take_profit, 2),
-                        time_in_force="gtc"
-                    )
+                    # OCO not supported — submit TP limit and stop-loss separately
+                    try:
+                        self.api.submit_order(
+                            symbol=symbol, qty=qty, side=tp_side,
+                            type="limit", limit_price=round(take_profit, 2),
+                            time_in_force="gtc"
+                        )
+                    except Exception as tp_err:
+                        log.critical(f"OCO FALLBACK TP FAILED: {symbol} {tp_err}")
+                    sl_side = tp_side
+                    try:
+                        self.api.submit_order(
+                            symbol=symbol, qty=qty, side=sl_side,
+                            type="stop", stop_price=round(stop_loss, 2),
+                            time_in_force="gtc"
+                        )
+                    except Exception as sl_err:
+                        log.critical(f"OCO FALLBACK SL FAILED: {symbol} — position UNPROTECTED: {sl_err}")
                 return {"method": "limit", "fill_price": fill_price, "symbol": symbol}
             else:
                 try:
