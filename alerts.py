@@ -598,6 +598,10 @@ class DiscordBot:
                     log.info(f"Discord bot connected as {client.user}")
                     log.info(f"Discord bot intents: message_content={client.intents.message_content}")
 
+                _allowed_ids_raw = os.getenv("DISCORD_ALLOWED_USER_IDS", "")
+                _allowed_ids = {s.strip() for s in _allowed_ids_raw.split(",") if s.strip()}
+                _WRITE_CMDS = {"!buy", "!pause", "!resume", "!clear"}
+
                 @client.event
                 async def on_message(message):
                     if message.author == client.user:
@@ -605,6 +609,16 @@ class DiscordBot:
 
                     safe_content = message.content.encode("ascii", errors="replace").decode("ascii")
                     log.debug(f"Discord message from {message.author}: '{safe_content}'")
+
+                    cmd = message.content.strip().lower().split()[0] if message.content.strip() else ""
+                    if cmd in _WRITE_CMDS:
+                        if not _allowed_ids:
+                            await message.channel.send("❌ Set `DISCORD_ALLOWED_USER_IDS` to enable write commands.")
+                            return
+                        if str(message.author.id) not in _allowed_ids:
+                            await message.channel.send("❌ Not authorized.")
+                            log.warning(f"Unauthorized Discord command '{cmd}' from {message.author} ({message.author.id})")
+                            return
                     if message.content.strip().lower() in ("!stat", "!stats", "!status"):
                         # Get equity first so APR uses real starting equity
                         eq = 100_000.0
