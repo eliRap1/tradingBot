@@ -227,7 +227,7 @@ class IBDataFetcher(BaseDataFetcher):
                 if (ticker.last and ticker.last > 0) or (ticker.bid and ticker.bid > 0):
                     break
                 time.sleep(0.1)
-            for attr in ("last", "close", "bid"):
+            for attr in ("last", "bid", "ask", "close"):
                 val = getattr(ticker, attr, None)
                 if val and float(val) > 0:
                     return float(val)
