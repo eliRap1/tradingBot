@@ -375,12 +375,15 @@ class Coordinator:
                 # Check close buffer
                 next_close = clock.next_close
                 buffer = self.config["schedule"]["market_close_buffer_min"]
-                if hasattr(next_close, 'timestamp'):
+                if next_close is None:
+                    # clock returned no close time (out-of-hours or holiday) — skip buffer check
+                    close_ts = None
+                elif hasattr(next_close, 'timestamp'):
                     close_ts = next_close.timestamp()
                 else:
                     close_ts = next_close.replace(tzinfo=None).timestamp()
 
-                if time.time() > close_ts - (buffer * 60):
+                if close_ts is not None and time.time() > close_ts - (buffer * 60):
                     log.info("Too close to market close — stocks paused, crypto continues.")
                     self.stop_watchers(stocks_only=True)
                     # Don't wait — keep looping for crypto
@@ -1156,7 +1159,7 @@ class Coordinator:
                         "news_score": round(news_score, 3),
                         "sector_momentum": sector_mom_map.get(sym_sector, "neutral"),
                         "spread_pct": round(micro.spread_pct, 5),
-                        "composite_score": round(watcher.state.composite_score, 3),
+                        "composite_score": round(watcher.state.score, 3),
                         "confluence": int(watcher.state.num_agreeing),
                         "regime": watcher.state.regime,
                     }
