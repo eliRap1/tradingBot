@@ -718,14 +718,27 @@ class DiscordBot:
                                 await message.channel.send(f"No bad-contract cache found for `{sym}`.")
 
                     elif message.content.strip().lower().startswith("!buy"):
-                        parts = message.content.strip().split()
-                        symbol = parts[1].upper() if len(parts) > 1 else "BTC/USD"
-                        try:
-                            notional = float(parts[2]) if len(parts) > 2 else 1.0
-                        except ValueError:
-                            notional = 1.0
-                        msg = self._submit_test_buy(symbol=symbol, notional_usd=notional)
-                        await message.channel.send(msg)
+                        # Security: only the designated operator may trigger live orders.
+                        # Set DISCORD_OPERATOR_ID in .env to the numeric Discord user ID.
+                        operator_id = os.getenv("DISCORD_OPERATOR_ID", "")
+                        if not operator_id or str(message.author.id) != operator_id:
+                            await message.channel.send(
+                                "❌ `!buy` is restricted to the bot operator."
+                            )
+                            log.warning(
+                                "!buy rejected: unauthorized user %s (id=%s)",
+                                message.author,
+                                message.author.id,
+                            )
+                        else:
+                            parts = message.content.strip().split()
+                            symbol = parts[1].upper() if len(parts) > 1 else "BTC/USD"
+                            try:
+                                notional = float(parts[2]) if len(parts) > 2 else 1.0
+                            except ValueError:
+                                notional = 1.0
+                            msg = self._submit_test_buy(symbol=symbol, notional_usd=notional)
+                            await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!positions":
                         msg = self._positions_message()
