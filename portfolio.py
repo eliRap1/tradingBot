@@ -203,7 +203,12 @@ class PortfolioManager:
             if partial_enabled and not meta.get("partial_done", False):
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
-                if initial_risk > 0 and qty > 1:
+                is_crypto = sym in CRYPTO_SYMBOLS or raw_sym in CRYPTO_SYMBOLS
+                # For stocks: require > 1 share so the partial order is at least 1 share.
+                # For crypto: fractional quantities are valid (e.g. 0.15 BTC); use a tiny
+                # minimum instead of the integer guard that would block all sub-1 BTC positions.
+                min_partial_qty = 0.000001 if is_crypto else 1
+                if initial_risk > 0 and qty > min_partial_qty:
                     original_qty = meta.get("original_qty", qty)
                     risk_per_share = initial_risk / original_qty if original_qty > 0 else 0
                     if is_long:
@@ -212,7 +217,6 @@ class PortfolioManager:
                         current_r = (entry_price - current_price) / risk_per_share if risk_per_share > 0 else 0
 
                     if current_r >= partial_r:
-                        is_crypto = sym in CRYPTO_SYMBOLS
                         close_qty = qty * partial_pct if is_crypto else max(1, int(qty * partial_pct))
                         partial_exits.append({
                             "symbol": sym,
@@ -238,7 +242,9 @@ class PortfolioManager:
             if second_partial_enabled and meta.get("partial_done") and not meta.get("second_partial_done", False):
                 initial_risk = meta.get("initial_risk", 0.0)
                 qty = pos["qty"]
-                if initial_risk > 0 and qty > 1:
+                is_crypto = sym in CRYPTO_SYMBOLS or raw_sym in CRYPTO_SYMBOLS
+                min_partial_qty = 0.000001 if is_crypto else 1
+                if initial_risk > 0 and qty > min_partial_qty:
                     # Use saved original_qty for accurate R-multiple
                     original_qty = meta.get("original_qty", qty)
                     risk_per_share = initial_risk / original_qty if original_qty > 0 else 0
@@ -248,7 +254,6 @@ class PortfolioManager:
                         current_r = (entry_price - current_price) / risk_per_share if risk_per_share > 0 else 0
 
                     if current_r >= second_partial_r:
-                        is_crypto = sym in CRYPTO_SYMBOLS
                         close_qty = qty * second_partial_pct if is_crypto else max(1, int(qty * second_partial_pct))
                         if close_qty < qty:  # Don't close everything
                             partial_exits.append({
