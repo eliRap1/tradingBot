@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pickle
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 
@@ -98,7 +99,7 @@ class MLSignalFilter:
                 auc = float(roc_auc_score(y_test, self.model.predict(X_test)))
             except Exception:
                 auc = 0.0
-        self.meta = MLMetadata(n_samples=len(X), auc=auc, train_date=os.path.basename(__file__))
+        self.meta = MLMetadata(n_samples=len(X), auc=auc, train_date=datetime.now().isoformat())
         self._last_train_n = len(X)
         os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
         with open(MODEL_PATH, "wb") as f:
