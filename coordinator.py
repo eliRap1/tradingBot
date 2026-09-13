@@ -1102,6 +1102,12 @@ class Coordinator:
 
             for order in orders:
                 try:
+                    # Re-check rate limit per order so a burst of signals in one
+                    # cycle cannot exceed MAX_ORDERS_PER_HOUR by bypassing the
+                    # pre-loop guard that was already satisfied.
+                    if not self._check_order_rate_limit():
+                        log.critical("ORDER RATE LIMIT HIT mid-cycle — stopping further entries")
+                        break
                     use_smart = self.config.get("execution", {}).get("smart_orders", False)
 
                     if use_smart:
