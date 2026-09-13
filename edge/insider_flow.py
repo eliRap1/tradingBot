@@ -20,6 +20,8 @@ import requests
 
 
 _EDGAR_ATOM = "https://www.sec.gov/cgi-bin/browse-edgar"
+# TODO: replace placeholder email with a real contact address —
+# SEC EDGAR requires a valid email in the User-Agent (https://www.sec.gov/os/accessing-edgar-data)
 _USER_AGENT = "tradingBot insider-flow-edge contact@example.com"
 # Transaction codes in Form 4: P = open-market purchase, S = sale
 _BUY_CODES = {"P"}
