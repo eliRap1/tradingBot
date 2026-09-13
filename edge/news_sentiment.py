@@ -45,11 +45,13 @@ class NewsSentimentEngine:
         return set(blocked)
 
     def get_days_to_earnings(self, symbol: str) -> int:
-        """Return calendar days to the nearest known earnings event.
+        """Return absolute calendar days to the nearest known earnings event.
 
         Returns 99 if no earnings data is available for the symbol.
-        A value of 0 means earnings are today; negative values mean
-        earnings were in the past window (still within block period).
+        A value of 0 means earnings are today; positive values indicate
+        the number of days before (future) or after (past) the event —
+        abs() is applied so the caller's threshold check works symmetrically
+        in both directions.
         """
         dt = self._earnings_dates.get(symbol)
         if dt is None:
