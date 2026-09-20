@@ -76,6 +76,9 @@ def aggregate_signals(all_signals: dict[str, dict[str, float]],
             composites.append(Opportunity(
                 symbol=sym,
                 score=composite,
+                # TODO: this function is currently unused in the live path (coordinator
+                # uses watcher signals directly). If ever re-enabled, direction must be
+                # derived from composite sign: "buy" if composite >= 0 else "sell".
                 direction="buy",
                 strategy_scores=strategy_scores,
                 num_agreeing=num_agreeing
