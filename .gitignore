@@ -14,6 +14,7 @@ state.json
 trades.json
 pending_signals.json
 *.db
+*.bak
 
 # Backtest output dumps
 ab_*.txt

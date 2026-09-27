@@ -154,7 +154,7 @@ class RiskManager:
                 max_risk_dollars = equity * adjusted_risk_pct
                 log.debug(f"{opp.symbol}: vol_factor={vol_factor:.2f} risk_pct={adjusted_risk_pct:.3f}")
                 
-            elif sizing_method == "kelly" and tracker_stats:
+            elif sizing_method in ("kelly", "kelly_fractional") and tracker_stats:
                 # Kelly Criterion: f* = p - q/b
                 kelly_min_trades = self.cfg.get("kelly_min_trades", 30)
                 total_trades = tracker_stats.get("total_trades", 0)
