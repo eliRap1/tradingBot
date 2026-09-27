@@ -129,7 +129,7 @@ class LiveTradingManager:
         self._cached_status = None
         
     def get_market_status(self) -> MarketStatus:
-        """Get current market status from Alpaca."""
+        """Get current market status from Interactive Brokers."""
         # Cache for 1 minute to reduce API calls
         now = datetime.now()
         if (self._last_market_check and 
@@ -145,7 +145,7 @@ class LiveTradingManager:
                 next_open=clock.next_open,
                 next_close=clock.next_close,
                 session=self._determine_session(clock),
-                crypto_open=True,  # Crypto always open on Alpaca
+                crypto_open=True,  # Crypto always open (24/7)
             )
             
             self._cached_status = status
