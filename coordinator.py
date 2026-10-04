@@ -567,7 +567,7 @@ class Coordinator:
         if self._ml_train_counter % 50 == 1:
             self.ml_model.train(self.portfolio.tracker.trades)
 
-        # 2c. Update alpha decay factors and distribute to watchers
+        # 2d. Update alpha decay factors and distribute to watchers
         decay_factors = self.portfolio.tracker.get_strategy_alpha_decay()
         if decay_factors:
             decaying = {s: f for s, f in decay_factors.items() if f < 0.8}
@@ -1156,7 +1156,7 @@ class Coordinator:
                         "news_score": round(news_score, 3),
                         "sector_momentum": sector_mom_map.get(sym_sector, "neutral"),
                         "spread_pct": round(micro.spread_pct, 5),
-                        "composite_score": round(watcher.state.composite_score, 3),
+                        "composite_score": round(watcher.state.score, 3),
                         "confluence": int(watcher.state.num_agreeing),
                         "regime": watcher.state.regime,
                     }
