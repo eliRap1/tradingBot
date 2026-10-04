@@ -48,8 +48,9 @@ class NewsSentimentEngine:
         """Return calendar days to the nearest known earnings event.
 
         Returns 99 if no earnings data is available for the symbol.
-        A value of 0 means earnings are today; negative values mean
-        earnings were in the past window (still within block period).
+        A value of 0 means earnings are today. abs() is applied so both
+        upcoming and past earnings dates return a positive day count,
+        making the earnings block symmetric around the event date.
         """
         dt = self._earnings_dates.get(symbol)
         if dt is None:
