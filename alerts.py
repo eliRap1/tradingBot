@@ -22,6 +22,7 @@ import requests
 import nest_asyncio
 nest_asyncio.apply()
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from utils import setup_logger
 
 log = setup_logger("alerts")
@@ -146,8 +147,7 @@ class AlertManager:
             return
 
         try:
-            # Israel is UTC+3 (IDT, daylight saving most of the year)
-            israel_tz = timezone(timedelta(hours=3))
+            israel_tz = ZoneInfo("Asia/Jerusalem")
 
             if hasattr(next_open, 'astimezone'):
                 israel_time = next_open.astimezone(israel_tz)
@@ -332,9 +332,13 @@ class DiscordBot:
         self._client = None
         self._stop_event = threading.Event()
         self.token = os.getenv("DISCORD_BOT_TOKEN", "")
+        owner_id_raw = os.getenv("DISCORD_OWNER_ID", "")
+        self.owner_id = int(owner_id_raw) if owner_id_raw.isdigit() else None
 
         if not self.token:
             log.info("DISCORD_BOT_TOKEN not set — !stat command disabled")
+        if not self.owner_id:
+            log.warning("DISCORD_OWNER_ID not set — trade commands (!buy, !pause, !resume, !clearcontract) will be disabled")
 
     def start(self):
         """Start the Discord bot in a background thread."""
@@ -699,6 +703,9 @@ class DiscordBot:
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower().startswith("!clearcontract"):
+                        if not self.owner_id or message.author.id != self.owner_id:
+                            await message.channel.send("⛔ Not authorised.")
+                            return
                         parts = message.content.strip().split()
                         if len(parts) < 2:
                             await message.channel.send("Usage: `!clearcontract SYMBOL`")
@@ -718,6 +725,9 @@ class DiscordBot:
                                 await message.channel.send(f"No bad-contract cache found for `{sym}`.")
 
                     elif message.content.strip().lower().startswith("!buy"):
+                        if not self.owner_id or message.author.id != self.owner_id:
+                            await message.channel.send("⛔ Not authorised.")
+                            return
                         parts = message.content.strip().split()
                         symbol = parts[1].upper() if len(parts) > 1 else "BTC/USD"
                         try:
@@ -823,6 +833,9 @@ class DiscordBot:
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!pause":
+                        if not self.owner_id or message.author.id != self.owner_id:
+                            await message.channel.send("⛔ Not authorised.")
+                            return
                         if coordinator:
                             coordinator._trading_paused = True
                             await message.channel.send("⏸ **Trading PAUSED** — no new entries until `!resume`")
@@ -831,6 +844,9 @@ class DiscordBot:
                             await message.channel.send("❌ Coordinator not connected.")
 
                     elif message.content.strip().lower() == "!resume":
+                        if not self.owner_id or message.author.id != self.owner_id:
+                            await message.channel.send("⛔ Not authorised.")
+                            return
                         if coordinator:
                             coordinator._trading_paused = False
                             await message.channel.send("▶ **Trading RESUMED** — new entries enabled")

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
-import pickle
 from dataclasses import dataclass
 
 import numpy as np
 
 from state_db import StateDB
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "research", "ml_filter.pkl")
+# LightGBM's native text format — not executable, unlike pickle.
+MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "research", "ml_filter.lgb")
+_META_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "research", "ml_filter.meta.json")
 
 REGIME_MAP = {"bull_trending": 3, "bull_choppy": 2, "bear_trending": 1, "bear_choppy": 0}
 SESSION_MAP = {"open": 0, "mid": 1, "close": 2}
@@ -40,10 +43,11 @@ class MLSignalFilter:
         if not os.path.exists(MODEL_PATH):
             return
         try:
-            with open(MODEL_PATH, "rb") as f:
-                data = pickle.load(f)
-            self.model = data.get("model")
-            self.meta = data.get("meta", MLMetadata())
+            import lightgbm as lgb
+            self.model = lgb.Booster(model_file=MODEL_PATH)
+            if os.path.exists(_META_PATH):
+                with open(_META_PATH) as f:
+                    self.meta = MLMetadata(**json.load(f))
         except Exception:
             self.model = None
 
@@ -101,8 +105,9 @@ class MLSignalFilter:
         self.meta = MLMetadata(n_samples=len(X), auc=auc, train_date=os.path.basename(__file__))
         self._last_train_n = len(X)
         os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump({"model": self.model, "meta": self.meta}, f)
+        self.model.save_model(MODEL_PATH)
+        with open(_META_PATH, "w") as f:
+            json.dump(dataclasses.asdict(self.meta), f)
         return True
 
     def predict_quality(self, features: dict | None = None) -> float:
