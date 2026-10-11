@@ -291,14 +291,14 @@ class PortfolioManager:
 
             # === TRAILING STOP (direction-aware) ===
             if not breakeven_triggered and sym not in to_close:
-                if is_long and current_price <= trail_price and pos["unrealized_pl"] > 0:
+                if is_long and current_price <= trail_price:
                     log.info(
                         f"TRAILING STOP: {sym} (long) price={current_price:.2f} "
                         f"trail={trail_price:.2f} hwm={watermark:.2f} "
                         f"P&L=${pos['unrealized_pl']:.2f}"
                     )
                     to_close.append(sym)
-                elif not is_long and current_price >= trail_price and pos["unrealized_pl"] > 0:
+                elif not is_long and current_price >= trail_price:
                     log.info(
                         f"TRAILING STOP: {sym} (short) price={current_price:.2f} "
                         f"trail={trail_price:.2f} lwm={watermark:.2f} "
