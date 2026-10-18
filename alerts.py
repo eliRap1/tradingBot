@@ -22,6 +22,11 @@ import requests
 import nest_asyncio
 nest_asyncio.apply()
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _ISRAEL_TZ = _ZoneInfo("Asia/Jerusalem")
+except Exception:
+    _ISRAEL_TZ = None  # fallback to fixed offset below
 from utils import setup_logger
 
 log = setup_logger("alerts")
@@ -146,8 +151,9 @@ class AlertManager:
             return
 
         try:
-            # Israel is UTC+3 (IDT, daylight saving most of the year)
-            israel_tz = timezone(timedelta(hours=3))
+            # Use IANA timezone so DST is handled automatically (UTC+3 summer, UTC+2 winter).
+            # Falls back to a fixed UTC+3 offset if zoneinfo is unavailable.
+            israel_tz = _ISRAEL_TZ if _ISRAEL_TZ is not None else timezone(timedelta(hours=3))
 
             if hasattr(next_open, 'astimezone'):
                 israel_time = next_open.astimezone(israel_tz)
