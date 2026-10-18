@@ -28,23 +28,23 @@ def _get_db() -> StateDB:
 
 def load_state() -> dict:
     """Load saved state from SQLite, with one-time JSON migration."""
-    db = _get_db()
-    watermarks = db.get_watermarks()
-    positions = {pos["symbol"]: pos for pos in db.get_all_positions()}
-    state = dict(_DEFAULTS)
-    state["peak_equity"] = db.get_state("peak_equity", _DEFAULTS["peak_equity"])
-    state["high_watermarks"] = {
-        symbol: row["high_watermark"]
-        for symbol, row in watermarks.items()
-        if row.get("high_watermark") is not None
-    }
-    state["low_watermarks"] = {
-        symbol: row["low_watermark"]
-        for symbol, row in watermarks.items()
-        if row.get("low_watermark") is not None
-    }
-    state["position_meta"] = positions
     try:
+        db = _get_db()
+        watermarks = db.get_watermarks()
+        positions = {pos["symbol"]: pos for pos in db.get_all_positions()}
+        state = dict(_DEFAULTS)
+        state["peak_equity"] = db.get_state("peak_equity", _DEFAULTS["peak_equity"])
+        state["high_watermarks"] = {
+            symbol: row["high_watermark"]
+            for symbol, row in watermarks.items()
+            if row.get("high_watermark") is not None
+        }
+        state["low_watermarks"] = {
+            symbol: row["low_watermark"]
+            for symbol, row in watermarks.items()
+            if row.get("low_watermark") is not None
+        }
+        state["position_meta"] = positions
         log.info(
             f"Loaded state: peak_equity=${state.get('peak_equity', 0):,.2f}, "
             f"{len(state.get('high_watermarks', {}))} watermarks"
