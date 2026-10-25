@@ -57,7 +57,7 @@ def _is_cme_futures_open() -> bool:
     """
     now = datetime.now(ET)
     wd = now.weekday()   # 0=Mon … 6=Sun
-    h, m = now.hour, now.minute
+    h = now.hour
 
     # Saturday: always closed
     if wd == 5:
@@ -460,7 +460,7 @@ def ensure_live_trading_mode() -> bool:
     """Return True when TRADING_MODE is paper or live (not backtest)."""
     mode = os.getenv("TRADING_MODE", "paper").lower()
     if mode == "backtest":
-        log.error("TRADING_MODE=backtest -- not suitable for live trading\!")
+        log.error("TRADING_MODE=backtest -- not suitable for live trading!")
         return False
     if mode not in ("paper", "live"):
         log.warning(f"Unrecognised TRADING_MODE='{mode}' -- defaulting to paper")
