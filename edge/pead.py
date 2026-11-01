@@ -206,8 +206,10 @@ class PEADEdge:
             if not items:
                 return None
             it = items[0]
-            actual = float(it.get("actual_eps") or 0.0) or None
-            consensus = float(it.get("consensus_eps") or 0.0) or None
+            _a = it.get("actual_eps")
+            _c = it.get("consensus_eps")
+            actual = None if _a is None else float(_a)
+            consensus = None if _c is None else float(_c)
             report_str = it.get("report_date") or it.get("date") or ""
             try:
                 report_date = datetime.fromisoformat(report_str.replace("Z", "+00:00"))
