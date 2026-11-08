@@ -375,10 +375,7 @@ class Coordinator:
                 # Check close buffer
                 next_close = clock.next_close
                 buffer = self.config["schedule"]["market_close_buffer_min"]
-                if hasattr(next_close, 'timestamp'):
-                    close_ts = next_close.timestamp()
-                else:
-                    close_ts = next_close.replace(tzinfo=None).timestamp()
+                close_ts = next_close.timestamp()
 
                 if time.time() > close_ts - (buffer * 60):
                     log.info("Too close to market close — stocks paused, crypto continues.")
