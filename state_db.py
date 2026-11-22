@@ -162,10 +162,11 @@ class StateDB:
             self._conn.commit()
 
     def get_position(self, symbol: str) -> dict | None:
-        row = self._conn.execute(
-            "SELECT * FROM positions WHERE symbol = ?",
-            (symbol,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM positions WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
         return self._normalize_position_row(row)
 
     def delete_position(self, symbol: str):
@@ -174,7 +175,8 @@ class StateDB:
             self._conn.commit()
 
     def get_all_positions(self) -> list[dict]:
-        rows = self._conn.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
         return [self._normalize_position_row(row) for row in rows]
 
     def upsert_watermark(self, symbol: str, high: float | None = None, low: float | None = None):
@@ -213,7 +215,8 @@ class StateDB:
             self._conn.commit()
 
     def get_watermarks(self) -> dict[str, dict]:
-        rows = self._conn.execute("SELECT * FROM watermarks").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM watermarks").fetchall()
         return {row["symbol"]: dict(row) for row in rows}
 
     def record_trade(
@@ -298,7 +301,8 @@ class StateDB:
             self._conn.commit()
 
     def get_trades(self) -> list[dict]:
-        rows = self._conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
         result = []
         for row in rows:
             trade = dict(row)
@@ -316,10 +320,11 @@ class StateDB:
             self._conn.commit()
 
     def get_state(self, key: str, default: Any = None) -> Any:
-        row = self._conn.execute(
-            "SELECT value FROM bot_state WHERE key = ?",
-            (key,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (key,),
+            ).fetchone()
         if row is None:
             return default
         return self._decode_json(row["value"], default)
@@ -333,10 +338,11 @@ class StateDB:
             self._conn.commit()
 
     def get_pending_signal(self, symbol: str) -> bool:
-        row = self._conn.execute(
-            "SELECT prev_signal FROM pending_signals WHERE symbol = ?",
-            (symbol,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT prev_signal FROM pending_signals WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
         return bool(row["prev_signal"]) if row else False
 
     def migrate_from_json(self):

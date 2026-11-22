@@ -97,7 +97,7 @@ class RiskManager:
 
             # Calculate ATR for stop/target placement
             atr = self._get_atr(df)
-            if atr is None or atr <= 0:
+            if atr is None or not (atr > 0):  # also catches NaN (NaN > 0 is False)
                 continue
 
             # Direction: positive score = long, negative = short
@@ -328,4 +328,8 @@ class RiskManager:
             high=df["high"], low=df["low"], close=df["close"],
             window=period
         ).average_true_range()
-        return atr.iloc[-1]
+        val = atr.iloc[-1]
+        import math
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return None
+        return val
