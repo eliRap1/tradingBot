@@ -332,6 +332,16 @@ class DiscordBot:
         self._client = None
         self._stop_event = threading.Event()
         self.token = os.getenv("DISCORD_BOT_TOKEN", "")
+        # Privileged commands (!buy, !pause, !resume, !clearcontract) only run
+        # for this Discord user ID. Set DISCORD_OWNER_ID in .env to your user ID
+        # (right-click your name in Discord → Copy User ID, with Developer Mode on).
+        # Without it, all write commands are disabled for everyone.
+        raw_owner = os.getenv("DISCORD_OWNER_ID", "").strip()
+        self._owner_id: int | None = int(raw_owner) if raw_owner.isdigit() else None
+        if not self._owner_id:
+            log.warning(
+                "DISCORD_OWNER_ID not set — privileged commands (!buy !pause !resume !clearcontract) disabled"
+            )
 
         if not self.token:
             log.info("DISCORD_BOT_TOKEN not set — !stat command disabled")
@@ -699,6 +709,9 @@ class DiscordBot:
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower().startswith("!clearcontract"):
+                        if self._owner_id and message.author.id != self._owner_id:
+                            await message.channel.send("❌ Not authorised.")
+                            return
                         parts = message.content.strip().split()
                         if len(parts) < 2:
                             await message.channel.send("Usage: `!clearcontract SYMBOL`")
@@ -718,6 +731,9 @@ class DiscordBot:
                                 await message.channel.send(f"No bad-contract cache found for `{sym}`.")
 
                     elif message.content.strip().lower().startswith("!buy"):
+                        if self._owner_id and message.author.id != self._owner_id:
+                            await message.channel.send("❌ Not authorised.")
+                            return
                         parts = message.content.strip().split()
                         symbol = parts[1].upper() if len(parts) > 1 else "BTC/USD"
                         try:
@@ -823,6 +839,9 @@ class DiscordBot:
                         await message.channel.send(msg)
 
                     elif message.content.strip().lower() == "!pause":
+                        if self._owner_id and message.author.id != self._owner_id:
+                            await message.channel.send("❌ Not authorised.")
+                            return
                         if coordinator:
                             coordinator._trading_paused = True
                             await message.channel.send("⏸ **Trading PAUSED** — no new entries until `!resume`")
@@ -831,6 +850,9 @@ class DiscordBot:
                             await message.channel.send("❌ Coordinator not connected.")
 
                     elif message.content.strip().lower() == "!resume":
+                        if self._owner_id and message.author.id != self._owner_id:
+                            await message.channel.send("❌ Not authorised.")
+                            return
                         if coordinator:
                             coordinator._trading_paused = False
                             await message.channel.send("▶ **Trading RESUMED** — new entries enabled")
